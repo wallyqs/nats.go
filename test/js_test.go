@@ -5990,3 +5990,72 @@ func TestJetStreamStreamAndConsumerDescription(t *testing.T) {
 		t.Fatalf("Invalid description: %q vs %q", consDesc, ci.Config.Description)
 	}
 }
+
+func TestJetStreamAssertConsumerConfig(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"test"},
+	})
+	if err != nil {
+		t.Fatalf("Error adding stream: %v", err)
+	}
+
+	t.Run("ack wait mismatch", func(t *testing.T) {
+		ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:        "dur",
+			DeliverSubject: "foo",
+			AckWait:        5 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("Error adding consumer: %v", err)
+		}
+		defer js.DeleteConsumer("TEST", "dur")
+
+		t.Logf(">>>>> %+v", ci)
+		_, err = js.SubscribeSync("test",
+			nats.Durable("dur"),
+			nats.AckWait(2*time.Second),
+		)
+		if err == nil {
+			t.Errorf("Unexpected success")
+		}
+		t.Logf(">>> %v", err)
+	})
+
+	t.Run("ack wait mismatch from default", func(t *testing.T) {
+		ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
+			Durable:        "dur1",
+			DeliverSubject: "foo",
+		})
+		if err != nil {
+			t.Fatalf("Error adding consumer: %v", err)
+		}
+		t.Logf(">>>>> %+v", ci)
+		_, err = js.SubscribeSync("test",
+			nats.Durable("dur1"),
+			nats.AckWait(30*time.Second),
+		)
+		if err == nil {
+			t.Errorf("Unexpected success")
+		}
+		t.Logf(">>> %v", err)
+	})
+}

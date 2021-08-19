@@ -1154,6 +1154,16 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 
 		switch {
 		case info != nil:
+			fmt.Printf("..... cons: %+v\n", info)
+			fmt.Printf("..... opts: %+v\n", o.cfg)
+			if o.cfg != nil {
+				if o.cfg.AckWait != info.Config.AckWait {
+					got := info.Config.AckWait
+					expected := o.cfg.AckWait
+					return nil, fmt.Errorf("nats: mismatch in consumer config: AckWait is %v, but option is %v", got, expected)
+				}
+			}
+
 			deliver, err = processConsInfo(info, isPullMode, subj, queue)
 			if err != nil {
 				return nil, err
