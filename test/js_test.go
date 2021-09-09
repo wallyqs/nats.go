@@ -4498,6 +4498,250 @@ func testJetStreamMirror_Source(t *testing.T, nodes ...*jsServer) {
 	})
 }
 
+func TestJetStream_PullSubscribeMaxWaiting(t *testing.T) {
+	nodes := []int{1, 3}
+	replicas := []int{1, 3}
+
+	for _, n := range nodes {
+		for _, r := range replicas {
+			if r > 1 && n == 1 {
+				continue
+			}
+			t.Run(fmt.Sprintf("psub n=%d r=%d", n, r), func(t *testing.T) {
+				name := fmt.Sprintf("PSUBMAX%d%d", n, r)
+				stream := &nats.StreamConfig{
+					Name:     name,
+					Replicas: n,
+				}
+				withJSClusterAndStream(t, name, n, stream, testJetStream_PullSubscribeMaxWaiting)
+			})
+		}
+	}
+}
+
+func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ...*jsServer) {
+	srv := srvs[0]
+	nc, err := nats.Connect(srv.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create pull subscriber with a lower max waiting limit.
+	sub, err := js.PullSubscribe(subject, "durable", nats.PullMaxWaiting(5))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Delay for a bit the first message being received.
+	go func() {
+		time.AfterFunc(200*time.Millisecond, func() {
+			js.Publish(subject, []byte("hello"))
+		})
+	}()
+
+	msgs, err := sub.Fetch(2, nats.MaxWait(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Expected one message to be delivered, got: %v", len(msgs))
+	}
+	msg := msgs[0]
+	expected := "hello"
+	got := string(msg.Data)
+	if got != expected {
+		t.Errorf("Expected: %v, got: %v", expected, got)
+	}
+
+	info, err := sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumWaiting != 1 {
+		t.Errorf("Expected 1 pending requests, got: %v", info.NumWaiting)
+	}
+
+	// Make a few requests to start getting 408 Request Timeout errors.
+	for i := 0; i < 4; i++ {
+		msgs, err = sub.Fetch(2, nats.MaxWait(200*time.Millisecond))
+		if err == nil {
+			t.Error("Unexpected success")
+		}
+		if len(msgs) != 0 {
+			t.Error("Expected no messages")
+		}
+
+		// There should be a maximum number of waiting requests now.
+		info, err = sub.ConsumerInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumWaiting != i+2 {
+			t.Errorf("Expected %v pending requests, got: %v", i+2, info.NumWaiting)
+		}
+	}
+
+	// There should be a maximum number of waiting requests now.
+	info, err = sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumWaiting != 5 {
+		t.Errorf("Expected 5 pending requests, got: %v", info.NumWaiting)
+	}
+
+	// Making an extra request will expire some of the old requests.
+	msgs, err = sub.Fetch(2, nats.MaxWait(200*time.Millisecond))
+	if err == nil {
+		t.Error("Unexpected success")
+	}
+	if len(msgs) != 0 {
+		t.Error("Expected no messages")
+	}
+	info, err = sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumWaiting != 1 {
+		t.Errorf("Expected 1 pending requests, got: %v", info.NumWaiting)
+	}
+
+	// Send another message with a delay...
+	time.AfterFunc(200*time.Millisecond, func() {
+		js.Publish(subject, []byte("bar"))
+	})
+
+	// Fetch and wait...
+	msgs, err = sub.Fetch(1, nats.MaxWait(500*time.Millisecond))
+	if err != nil {
+		t.Error(err)
+	}
+	msg = msgs[0]
+	expected = "bar"
+	got = string(msg.Data)
+	if got != expected {
+		t.Errorf("Expected: %v, got: %v", expected, got)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("Expected one message to be delivered, got: %v", len(msgs))
+	}
+
+	// There should be no waiting pull requests since they got expired after fetch succeeded.
+	info, err = sub.ConsumerInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumWaiting != 0 {
+		t.Errorf("Expected no pending requests, got: %v", info.NumWaiting)
+	}
+
+	t.Run("blocking fetch requests", func(t *testing.T) {
+		// Create requests that take a longer time and will exhaust
+		// the number of waiting requests so that the rest will be blocked.
+		msgCh := make(chan *nats.Msg, 1)
+		for i := 0; i < 5; i++ {
+			go func() {
+				msgs, _ := sub.Fetch(2, nats.MaxWait(1*time.Second))
+				for _, msg := range msgs {
+					msgCh <- msg
+				}
+			}()
+		}
+		time.Sleep(200 * time.Millisecond)
+		info, err = sub.ConsumerInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumWaiting != 5 {
+			t.Errorf("Expected 5 pull requests, got: %v", info.NumWaiting)
+		}
+
+		// Send a couple of new messages...
+		js.Publish(subject, []byte("quux:0"))
+
+		ctx, done := context.WithTimeout(context.Background(), 2*time.Second)
+		defer done()
+
+		// Schedule a message to be sent after the original fetch requests are done.
+		time.AfterFunc(1200*time.Millisecond, func() {
+			js.Publish(subject, []byte("quux:1"))
+		})
+
+		var (
+			msgs = make([]*nats.Msg, 0)
+			errs = make([]error, 0)
+		)
+
+	Loop:
+		for {
+			select {
+			case <-ctx.Done():
+				break Loop
+			default:
+			}
+
+			// These will timeout until all the original blocking fetch requests are done.
+			m, err := sub.Fetch(1, nats.MaxWait(100*time.Millisecond))
+			if err != nil {
+				errs = append(errs, err)
+			}
+			for _, msg := range m {
+				msgs = append(msgs, msg)
+			}
+			if len(msgs) > 0 {
+				break Loop
+			}
+		}
+		if len(errs) == 0 {
+			t.Errorf("Expected at least an error, got: %v", len(errs))
+		}
+		if len(msgCh) != 1 {
+			t.Fatalf("Expected one message to be delivered, got: %v", len(msgCh))
+		}
+		if len(msgs) != 1 {
+			t.Fatalf("Expected one message to be delivered, got: %v", len(msgs))
+		}
+		for _, e := range errs {
+			if e != nats.ErrTimeout {
+				t.Errorf("Expected nats timeout, got: %v", e)
+			}
+		}
+
+		// Nothing pending at this point, all have expired.
+		info, err = sub.ConsumerInfo()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.NumWaiting != 0 {
+			t.Errorf("Expected 5 pull requests, got: %v", info.NumWaiting)
+		}
+
+		// First message
+		msg := <-msgCh
+
+		expected = "quux:0"
+		got = string(msg.Data)
+		if got != expected {
+			t.Errorf("Expected: %v, got: %v", expected, got)
+		}
+
+		// Second message received after the first set of goroutines have timed out,
+		// so that following fetch requests are unblocked.
+		msg = msgs[0]
+		expected = "quux:1"
+		got = string(msg.Data)
+		if got != expected {
+			t.Errorf("Expected: %v, got: %v", expected, got)
+		}
+	})
+}
+
 func TestJetStream_ClusterMultipleSubscribe(t *testing.T) {
 	nodes := []int{1, 3}
 	replicas := []int{1}
