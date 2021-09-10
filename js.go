@@ -2049,7 +2049,7 @@ var errNoMessages = errors.New("nats: no messages")
 // Returns if the given message is a user message or not, and if
 // `checkSts` is true, returns appropriate error based on the
 // content of the status (404, etc..)
-func checkMsg(msg *Msg, checkSts bool) (usrMsg bool, err error) {
+func checkMsg(msg *Msg, checkSts, cancelWhen408 bool) (usrMsg bool, err error) {
 	// Assume user message
 	usrMsg = true
 
@@ -2080,9 +2080,13 @@ func checkMsg(msg *Msg, checkSts bool) (usrMsg bool, err error) {
 	case reqTimeoutSts:
 		// Older servers may send a 408 when a request in the server was expired
 		// and interest is still found, which will be the case for our
-		// implementation. Regardless, ignore 408 errors, the caller will
-		// go back to wait for the next message.
-		err = nil
+		// implementation. Regardless, ignore 408 errors until receiving at least
+		// one message.
+		if !cancelWhen408 {
+			err = nil
+			return
+		}
+		fallthrough
 	default:
 		err = fmt.Errorf("nats: %s", msg.Header.Get(descrHdr))
 	}
@@ -2182,7 +2186,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 		// or status message, however, we don't care about values of status
 		// messages at this point in the Fetch() call, so checkMsg can't
 		// return an error.
-		if usrMsg, _ := checkMsg(msg, false); usrMsg {
+		if usrMsg, _ := checkMsg(msg, false, false); usrMsg {
 			msgs = append(msgs, msg)
 		}
 	}
@@ -2218,7 +2222,12 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 			if err == nil {
 				var usrMsg bool
 
-				usrMsg, err = checkMsg(msg, true)
+				// If we already got at least a message but we are prompted
+				// with a 408 status, then unblock the request and return
+				// the messages that have arrived already.
+				cancelWhen408 := len(msgs) >= 1
+
+				usrMsg, err = checkMsg(msg, true, cancelWhen408)
 				if err == nil && usrMsg {
 					msgs = append(msgs, msg)
 				} else if noWait && (err == errNoMessages) && len(msgs) == 0 {

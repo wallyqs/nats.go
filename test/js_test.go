@@ -4644,10 +4644,18 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 	t.Run("blocking fetch requests", func(t *testing.T) {
 		// Create requests that take a longer time and will exhaust
 		// the number of waiting requests so that the rest will be blocked.
-		msgCh := make(chan *nats.Msg, 1)
+		max := 5
+		msgCh := make(chan *nats.Msg, max)
+		errCh := make(chan error, max)
 		for i := 0; i < 5; i++ {
 			go func() {
-				msgs, _ := sub.Fetch(2, nats.MaxWait(1*time.Second))
+				// Can only have at most 5 inflight fetch requests so
+				// these will block until they receive at least a message
+				// and a 408 response status.
+				msgs, err := sub.Fetch(100, nats.MaxWait(30*time.Second))
+				if err != nil {
+					errCh <- err
+				}
 				for _, msg := range msgs {
 					msgCh <- msg
 				}
@@ -4658,19 +4666,22 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.NumWaiting != 5 {
-			t.Errorf("Expected 5 pull requests, got: %v", info.NumWaiting)
+		if info.NumWaiting != max {
+			t.Errorf("Expected %v pull requests, got: %v", max, info.NumWaiting)
 		}
 
-		// Send a couple of new messages...
-		js.Publish(subject, []byte("quux:0"))
+		// Send a couple of new messages that will be received
+		// by the first batch.
+		for i := 0; i < max; i++ {
+			js.Publish(subject, []byte(fmt.Sprintf("quux:%v", i)))
+		}
 
-		ctx, done := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx, done := context.WithTimeout(context.Background(), 3*time.Second)
 		defer done()
 
-		// Schedule a message to be sent after the original fetch requests are done.
-		time.AfterFunc(1200*time.Millisecond, func() {
-			js.Publish(subject, []byte("quux:1"))
+		// This message should be processed.
+		time.AfterFunc(500*time.Millisecond, func() {
+			js.Publish(subject, []byte("quux:5"))
 		})
 
 		var (
@@ -4701,11 +4712,8 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 		if len(errs) == 0 {
 			t.Errorf("Expected at least an error, got: %v", len(errs))
 		}
-		if len(msgCh) != 1 {
-			t.Fatalf("Expected one message to be delivered, got: %v", len(msgCh))
-		}
 		if len(msgs) != 1 {
-			t.Fatalf("Expected one message to be delivered, got: %v", len(msgs))
+			t.Fatalf("Expected one message to be delivered to recent fetch, got: %v", len(msgs))
 		}
 		for _, e := range errs {
 			if e != nats.ErrTimeout {
@@ -4718,26 +4726,40 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.NumWaiting != 0 {
-			t.Errorf("Expected 5 pull requests, got: %v", info.NumWaiting)
+		if info.NumWaiting != max {
+			t.Errorf("Expected max number of pull requests (%v), got: %v", max, info.NumWaiting)
+		}
+		if len(msgCh) != max {
+			t.Fatalf("Expected %v messages to be delivered on first set of fetch requests, got: %v", max, len(msgCh))
 		}
 
 		// First message
-		msg := <-msgCh
-
-		expected = "quux:0"
-		got = string(msg.Data)
-		if got != expected {
-			t.Errorf("Expected: %v, got: %v", expected, got)
+		for i := 0; i < max; i++ {
+			select {
+			case msg := <-msgCh:
+				expected = fmt.Sprintf("quux:%d", i)
+				got = string(msg.Data)
+				if got != expected {
+					t.Errorf("Expected: %v, got: %v", expected, got)
+				}
+			default:
+				t.Fatal("Unexpected blocking channel")
+			}
 		}
 
 		// Second message received after the first set of goroutines have timed out,
 		// so that following fetch requests are unblocked.
 		msg = msgs[0]
-		expected = "quux:1"
+		expected = "quux:5"
 		got = string(msg.Data)
 		if got != expected {
 			t.Errorf("Expected: %v, got: %v", expected, got)
+		}
+
+		select {
+		case err := <-errCh:
+			t.Errorf("Unexpected error: %v", err)
+		default:
 		}
 	})
 }
