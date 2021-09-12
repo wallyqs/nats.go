@@ -2190,6 +2190,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 			msgs = append(msgs, msg)
 		}
 	}
+	fetchID := nuid.Next()
 	if err == nil && len(msgs) < batch {
 		// For batch real size of 1, it does not make sense to set no_wait in
 		// the request.
@@ -2211,6 +2212,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 			nr.Batch = batch - len(msgs)
 			nr.Expires = expires
 			nr.NoWait = noWait
+			fmt.Printf("%v ::::::::: sending REQ: %+v\n", fetchID, nr)
 			req, _ := json.Marshal(nr)
 			return nc.PublishRequest(nms, rply, req)
 		}
