@@ -4710,7 +4710,10 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 					t.Errorf("Expected: %v, got: %v", 0, info.NumWaiting)
 				}
 			}
-			t.Logf("AAAAAAAAAAAAAAA: %v / %+v", len(m), info.NumWaiting)
+			// n, _, _ := sub.Pending()
+			// t.Logf("======WWWWWWWWWWWWW======= %v", n)
+
+			// t.Logf("AAAAAAAAAAAAAAA: %v / %+v", len(m), info.NumWaiting)
 			for _, msg := range m {
 				msgs = append(msgs, msg)
 			}
@@ -4822,7 +4825,7 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 		// }
 
 		// Request will linger and timeout since there are only 5 messages.
-		fmt.Println("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBB")
+		// fmt.Println("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBB")
 		msgs, err = sub.Fetch(6, nats.MaxWait(1*time.Second))
 		if err != nil {
 			t.Fatal(err)
@@ -4830,7 +4833,7 @@ func testJetStream_PullSubscribeMaxWaiting(t *testing.T, subject string, srvs ..
 		if len(msgs) != max {
 			t.Errorf("Expected at least %v, got %v", max, len(msgs))
 		}
-		fmt.Println("DONE: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBB")
+		// fmt.Println("DONE: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABBBBBBBBBBBBBB")
 		// time.Sleep(1*time.Second)
 		info, err = sub.ConsumerInfo()
 		if err != nil {
