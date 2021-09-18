@@ -3,9 +3,17 @@ module github.com/nats-io/nats.go
 go 1.16
 
 require (
-	github.com/golang/protobuf v1.4.2
+	github.com/golang/protobuf v1.5.2
 	github.com/nats-io/nats-server/v2 v2.4.1-0.20210902224824-3aa8e63b290a
 	github.com/nats-io/nkeys v0.3.0
 	github.com/nats-io/nuid v1.0.1
-	google.golang.org/protobuf v1.23.0
+	google.golang.org/protobuf v1.26.0
+	k8s.io/client-go v0.19.1
+)
+
+replace (
+	k8s.io/api => k8s.io/api v0.0.0-20210817200411-f6e49805ed5a
+	k8s.io/apimachinery => k8s.io/apimachinery v0.0.0-20210817200207-02cfb5391634
+	k8s.io/client-go => k8s.io/client-go v0.0.0-20210817200704-2961e1de2c13
+	k8s.io/code-generator => k8s.io/code-generator v0.0.0-20210817200016-7edd0050705a
 )
