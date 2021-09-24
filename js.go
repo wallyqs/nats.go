@@ -181,7 +181,7 @@ type JetStream interface {
 	PullSubscribe(subj, durable string, opts ...SubOpt) (*Subscription, error)
 }
 
-// JetStreamContext allows JetStream messaging and stream management.
+// JetStreamConsmtext allows JetStream messaging and stream management.
 type JetStreamContext interface {
 	JetStream
 	JetStreamManager

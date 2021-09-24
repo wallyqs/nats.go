@@ -726,7 +726,8 @@ func (js *js) DeleteStream(name string, opts ...JSOpt) error {
 }
 
 type apiMsgGetRequest struct {
-	Seq uint64 `json:"seq"`
+	Seq     uint64 `json:"seq,omitempty"`
+	LastFor string `json:"last_by_subj,omitempty"`
 }
 
 // RawStreamMsg is a raw message stored in JetStream.
