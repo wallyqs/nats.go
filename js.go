@@ -666,10 +666,14 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 	if m.Reply != _EMPTY_ {
 		return nil, errors.New("nats: reply subject should be empty")
 	}
+	reply := m.Reply
 	m.Reply = js.newAsyncReply()
+	defer func() { m.Reply = reply }()
+
 	if m.Reply == _EMPTY_ {
 		return nil, errors.New("nats: error creating async reply handler")
 	}
+
 	id := m.Reply[aReplyPreLen:]
 	paf := &pubAckFuture{msg: m, st: time.Now()}
 	numPending, maxPending := js.registerPAF(id, paf)
@@ -682,7 +686,6 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 			return nil, errors.New("nats: stalled with too many outstanding async published messages")
 		}
 	}
-
 	if err := js.nc.PublishMsg(m); err != nil {
 		js.clearPAF(id)
 		return nil, err
