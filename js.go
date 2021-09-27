@@ -177,6 +177,7 @@ type JetStream interface {
 type JetStreamContext interface {
 	JetStream
 	JetStreamManager
+	ObjectStore
 }
 
 // js is an internal struct from a JetStreamContext.
@@ -658,10 +659,14 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 	if m.Reply != _EMPTY_ {
 		return nil, errors.New("nats: reply subject should be empty")
 	}
+	reply := m.Reply
 	m.Reply = js.newAsyncReply()
+	defer func() { m.Reply = reply }()
+
 	if m.Reply == _EMPTY_ {
 		return nil, errors.New("nats: error creating async reply handler")
 	}
+
 	id := m.Reply[aReplyPreLen:]
 	paf := &pubAckFuture{msg: m, st: time.Now()}
 	numPending, maxPending := js.registerPAF(id, paf)
@@ -674,7 +679,6 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 			return nil, errors.New("nats: stalled with too many outstanding async published messages")
 		}
 	}
-
 	if err := js.nc.PublishMsg(m); err != nil {
 		js.clearPAF(id)
 		return nil, err
@@ -1632,7 +1636,7 @@ func (sub *Subscription) resetOrderedConsumer(sseq uint64) {
 func (sub *Subscription) checkForFlowControlResponse() string {
 	// Caller has verified that there is a sub.jsi and fc
 	jsi := sub.jsi
-	if jsi.fcd == sub.delivered {
+	if jsi.fcd > 0 && jsi.fcd <= sub.delivered {
 		fcr := jsi.fcr
 		jsi.fcr, jsi.fcd = _EMPTY_, 0
 		return fcr
@@ -1642,9 +1646,9 @@ func (sub *Subscription) checkForFlowControlResponse() string {
 
 // Record an inbound flow control message.
 // Runs under subscription lock
-func (sub *Subscription) scheduleFlowControlResponse(dfuture uint64, reply string) {
-	jsi := sub.jsi
-	jsi.fcr, jsi.fcd = reply, dfuture
+func (sub *Subscription) scheduleFlowControlResponse(reply string) {
+	dfuture := sub.delivered + uint64(sub.pMsgs)
+	sub.jsi.fcr, sub.jsi.fcd = reply, dfuture
 }
 
 // Checks for activity from our consumer.

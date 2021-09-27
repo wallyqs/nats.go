@@ -2815,11 +2815,12 @@ func (nc *Conn) processMsg(data []byte) {
 	} else if ctrlType == jsCtrlFC && m.Reply != _EMPTY_ {
 		// This is a flow control message.
 		// If we have no pending, go ahead and send in place.
-		if sub.pMsgs <= 0 {
+		const fcQueueThresh = 2 * 1024 * 1024 // Min threshold for queueing the flow control response.
+		if sub.pBytes <= fcQueueThresh {
 			fcReply = m.Reply
 		} else {
 			// Schedule a reply after the previous message is delivered.
-			sub.scheduleFlowControlResponse(sub.delivered+uint64(sub.pMsgs), m.Reply)
+			sub.scheduleFlowControlResponse(m.Reply)
 		}
 	}
 
