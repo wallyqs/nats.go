@@ -25,7 +25,7 @@ import (
 
 type KeyValue interface {
 	// Get returns the latest value for the key.
-	Get(key string) (value []byte, revision uint64, err error)
+	Get(key string) (entry KeyValueEntry, err error)
 	// Put will place the new value for the key into the store.
 	Put(key string, value []byte) (revision uint64, err error)
 	// Create will add the key/value pair iff it does not exist.
@@ -39,8 +39,8 @@ type KeyValue interface {
 	// Watch will invoke the callback for any keys that match keyPattern when they update.
 	Watch(keys string, cb KeyValueUpdate) (*Subscription, error)
 	// List will return all values for the key.
-	List(key string) ([]*KeyValueEntry, error)
-	// Bucket returns the current bucket name (JetStream stream).
+	List(key string) ([]KeyValueEntry, error)
+	// Bucket returns the current bucket name.
 	Bucket() string
 }
 
@@ -48,27 +48,48 @@ type KeyValue interface {
 type KeyValueConfig struct {
 	Bucket       string
 	Description  string
-	History      uint8
-	MaxMsgs      int64
-	MaxBytes     int64
-	MaxAge       time.Duration
 	MaxValueSize int32
+	History      uint8
+	TTL          time.Duration
+	MaxBytes     int64
 	Storage      StorageType
 	Replicas     int
 }
 
 // Used to watch all keys.
-const AllKeys = ">"
+const (
+	AllKeys = ">"
+	kvop    = "KV-Operation"
+	kvdel   = "DEL"
+)
 
-// Value is for listing all values with revisions.
-type KeyValueEntry struct {
-	Key      string
-	Data     []byte
-	Revision uint64
+type KeyValueOp uint8
+
+const (
+	KeyValuePut KeyValueOp = iota
+	KeyValueDelete
+)
+
+// Retrieved entry for Get or List or Watch.
+type KeyValueEntry interface {
+	// Bucket is the bucket the data was loaded from.
+	Bucket() string
+	// Key is the key that was retrieved.
+	Key() string
+	// Value is the retrieved value.
+	Value() []byte
+	// Revision is a unique sequence for this value.
+	Revision() uint64
+	// Created is the time the data was put in the bucket.
+	Created() time.Time
+	// Delta is distance from the latest value.
+	Delta() uint64
+	// Operation returns Update or Delete
+	Operation() KeyValueOp
 }
 
 // Callback handler for KeyValue updates.
-type KeyValueUpdate func(v *KeyValueEntry)
+type KeyValueUpdate func(v KeyValueEntry)
 
 // Errors
 var (
@@ -153,9 +174,8 @@ func (nc *Conn) AddKeyValue(cfg *KeyValueConfig, opts ...JSOpt) (KeyValue, error
 		Description:       cfg.Description,
 		Subjects:          []string{fmt.Sprintf(kvSubjectsTmpl, cfg.Bucket)},
 		MaxMsgsPerSubject: history,
-		MaxMsgs:           cfg.MaxMsgs,
 		MaxBytes:          cfg.MaxBytes,
-		MaxAge:            cfg.MaxAge,
+		MaxAge:            cfg.TTL,
 		MaxMsgSize:        cfg.MaxValueSize,
 		Storage:           cfg.Storage,
 		Replicas:          replicas,
@@ -175,6 +195,16 @@ func (nc *Conn) AddKeyValue(cfg *KeyValueConfig, opts ...JSOpt) (KeyValue, error
 	return kv, nil
 }
 
+// DeleteKeyValue will delete this KeyValue store (JetStream stream).
+func (nc *Conn) DeleteKeyValue(bucket string, opts ...JSOpt) error {
+	js, err := nc.JetStream(opts...)
+	if err != nil {
+		return err
+	}
+	stream := fmt.Sprintf(kvBucketNameTmpl, bucket)
+	return js.DeleteStream(stream, opts...)
+}
+
 type kvs struct {
 	name   string
 	stream string
@@ -183,41 +213,84 @@ type kvs struct {
 	js     *js
 }
 
-// Get returns the latest value for the key.
-func (kv *kvs) Get(key string) (value []byte, revision uint64, err error) {
-	// Build by hand since simple and avoids stdlib JSON.
-	var b strings.Builder
-	b.WriteString("{\"last_by_subj\":\"")
-	b.WriteString(kv.pre)
-	b.WriteString(key)
-	b.WriteString("\"}")
+// Underlying entry.
+type kve struct {
+	bucket   string
+	key      string
+	value    []byte
+	revision uint64
+	delta    uint64
+	created  time.Time
+	op       KeyValueOp
+}
 
+func (e *kve) Bucket() string        { return e.bucket }
+func (e *kve) Key() string           { return e.key }
+func (e *kve) Value() []byte         { return e.value }
+func (e *kve) Revision() uint64      { return e.revision }
+func (e *kve) Created() time.Time    { return e.created }
+func (e *kve) Delta() uint64         { return e.delta }
+func (e *kve) Operation() KeyValueOp { return e.op }
+
+// Get returns the latest value for the key.
+func (kv *kvs) Get(key string) (KeyValueEntry, error) {
 	o, cancel, err := getJSContextOpts(kv.js.opts)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	if cancel != nil {
 		defer cancel()
 	}
 
-	// Send request.
-	subj := kv.js.apiSubj(fmt.Sprintf(apiMsgGetT, kv.stream))
-	r, err := kv.nc.RequestWithContext(o.ctx, subj, []byte(b.String()))
+	var b strings.Builder
+	b.WriteString(kv.pre)
+	b.WriteString(key)
+
+	req, err := json.Marshal(&apiMsgGetRequest{LastFor: b.String()})
 	if err != nil {
-		return nil, 0, err
+		return nil, err
+	}
+
+	// Send request.
+	// FIXME(dlc) - Done b/c no "lastFor" support in normal get message atm.
+	subj := kv.js.apiSubj(fmt.Sprintf(apiMsgGetT, kv.stream))
+	r, err := kv.nc.RequestWithContext(o.ctx, subj, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// FIXME(dlc) - Be good to avoid stdlib JSON when possible.
 	// Maybe: https://github.com/goccy/go-json
 	var resp apiMsgGetResponse
 	if err := json.Unmarshal(r.Data, &resp); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	if resp.Error != nil {
-		return nil, 0, errors.New(resp.Error.Description)
+		return nil, errors.New(resp.Error.Description)
 	}
 
-	return resp.Message.Data, resp.Message.Sequence, nil
+	m := resp.Message
+	entry := &kve{
+		bucket:   kv.name,
+		key:      key,
+		value:    m.Data,
+		revision: m.Sequence,
+		created:  m.Time,
+	}
+
+	// Double check here that this is not a DEL Operation marker.
+	if len(m.Header) > 0 {
+		hdr, err := decodeHeadersMsg(m.Header)
+		if err != nil {
+			return nil, err
+		}
+		if hdr.Get(kvop) == kvdel {
+			entry.op = KeyValueDelete
+			return entry, ErrMSgNotFound
+		}
+	}
+
+	return entry, nil
 }
 
 // Put will place the new value for the key into the store.
@@ -235,7 +308,16 @@ func (kv *kvs) Put(key string, value []byte) (revision uint64, err error) {
 
 // Create will add the key/value pair iff it does not exist.
 func (kv *kvs) Create(key string, value []byte) (revision uint64, err error) {
-	return kv.Update(key, value, 0)
+	v, err := kv.Update(key, value, 0)
+	if err == nil {
+		return v, nil
+	}
+	// TODO(dlc) - Since we have tombstones for DEL ops for watchers, this could be from that
+	// so we need to double check.
+	if e, err := kv.Get(key); err == ErrMSgNotFound {
+		return kv.Update(key, value, e.Revision())
+	}
+	return 0, err
 }
 
 // Update will update the value iff the latest revision matches.
@@ -254,6 +336,17 @@ func (kv *kvs) Update(key string, value []byte, revision uint64) (uint64, error)
 	return pa.Sequence, err
 }
 
+// purgeRequest is optional request information to the purge API.
+// Subject will filter the purge request to only messages that match the subject, which can have wildcards.
+// Sequence will purge up to but not including this sequence and can be combined with subject filtering.
+// Keep will specify how many messages to keep. This can also be combined with subject filtering.
+// Note that Sequence and Keep are mutually exclusive, so both can not be set at the same time.
+type purgeRequest struct {
+	Sequence uint64 `json:"seq,omitempty"`
+	Subject  string `json:"filter,omitempty"`
+	Keep     uint64 `json:"keep,omitempty"`
+}
+
 // Delete the key and all revisions.
 func (kv *kvs) Delete(key string) error {
 	o, cancel, err := getJSContextOpts(kv.js.opts)
@@ -264,16 +357,25 @@ func (kv *kvs) Delete(key string) error {
 		defer cancel()
 	}
 
-	// Build by hand since simple and avoids stdlib JSON.
 	var b strings.Builder
-	b.WriteString("{\"filter\":\"")
 	b.WriteString(kv.pre)
 	b.WriteString(key)
-	b.WriteString("\"}")
+
+	// DEL op marker. For watch functionality.
+	m := Msg{Subject: b.String(), Header: Header{}}
+	m.Header.Set(kvop, kvdel)
+	paf, err := kv.js.PublishMsgAsync(&m)
+	if err != nil {
+		return err
+	}
+	preq, err := json.Marshal(&purgeRequest{Subject: b.String(), Keep: 1})
+	if err != nil {
+		return err
+	}
 
 	// Send request.
 	subj := kv.js.apiSubj(fmt.Sprintf(apiStreamPurgeT, kv.stream))
-	r, err := kv.nc.RequestWithContext(o.ctx, subj, []byte(b.String()))
+	r, err := kv.nc.RequestWithContext(o.ctx, subj, preq)
 	if err != nil {
 		return err
 	}
@@ -284,11 +386,18 @@ func (kv *kvs) Delete(key string) error {
 	if resp.Error != nil {
 		return errors.New(resp.Error.Description)
 	}
-	return nil
+
+	// Double check the pubAck future.
+	select {
+	case <-paf.Ok():
+		return nil
+	case err := <-paf.Err():
+		return err
+	}
 }
 
 // List will return all values for the key.
-func (kv *kvs) List(key string) ([]*KeyValueEntry, error) {
+func (kv *kvs) List(key string) ([]KeyValueEntry, error) {
 	o, cancel, err := getJSContextOpts(kv.js.opts)
 	if err != nil {
 		return nil, err
@@ -303,7 +412,7 @@ func (kv *kvs) List(key string) ([]*KeyValueEntry, error) {
 		defer cancel()
 	}
 
-	var vals []*KeyValueEntry
+	var vals []KeyValueEntry
 	done := make(chan error, 1)
 	cb := func(m *Msg) {
 		tokens, err := getMetadataFields(m.Reply)
@@ -315,12 +424,16 @@ func (kv *kvs) List(key string) ([]*KeyValueEntry, error) {
 				return
 			}
 			subj := m.Subject[len(kv.pre):]
-			vals = append(vals, &KeyValueEntry{
-				Key:      subj,
-				Data:     m.Data,
-				Revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
+			pending := tokens[ackNumPendingTokenPos]
+			vals = append(vals, &kve{
+				bucket:   kv.name,
+				key:      subj,
+				value:    m.Data,
+				revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
+				created:  time.Unix(0, parseNum(tokens[ackTimestampSeqTokenPos])),
+				delta:    uint64(parseNum(pending)),
 			})
-			if tokens[ackNumPendingTokenPos] == kvNoPending {
+			if pending == kvNoPending {
 				done <- nil
 			}
 		}
@@ -371,10 +484,20 @@ func (kv *kvs) Watch(keys string, cb KeyValueUpdate) (*Subscription, error) {
 			return
 		}
 		subj := m.Subject[len(kv.pre):]
-		cb(&KeyValueEntry{
-			Key:      subj,
-			Data:     m.Data,
-			Revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
+
+		var op KeyValueOp
+		if len(m.Header) > 0 && m.Header.Get(kvop) == kvdel {
+			op = KeyValueDelete
+		}
+
+		cb(&kve{
+			bucket:   kv.name,
+			key:      subj,
+			value:    m.Data,
+			revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
+			created:  time.Unix(0, parseNum(tokens[ackTimestampSeqTokenPos])),
+			delta:    uint64(parseNum(tokens[ackNumPendingTokenPos])),
+			op:       op,
 		})
 	}
 	// Used ordered consumer to deliver results.

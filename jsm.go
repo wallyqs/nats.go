@@ -752,7 +752,6 @@ type storedMsg struct {
 type apiMsgGetResponse struct {
 	apiResponse
 	Message *storedMsg `json:"message,omitempty"`
-	Success bool       `json:"success,omitempty"`
 }
 
 // GetMsg retrieves a raw stream message stored in JetStream by sequence number.
@@ -791,7 +790,7 @@ func (js *js) GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, err
 	msg := resp.Message
 
 	var hdr Header
-	if msg.Header != nil {
+	if len(msg.Header) > 0 {
 		hdr, err = decodeHeadersMsg(msg.Header)
 		if err != nil {
 			return nil, err

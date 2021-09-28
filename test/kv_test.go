@@ -14,9 +14,7 @@
 package test
 
 import (
-	"fmt"
 	"os"
-	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -46,30 +44,30 @@ func TestKeyValueBasics(t *testing.T) {
 		t.Fatalf("Expected 1 for the revision, got %d", r)
 	}
 	// Simple Get
-	v, r, err := kv.Get("name")
+	e, err := kv.Get("name")
 	expectOk(t, err)
-	if string(v) != "derek" {
-		t.Fatalf("Got wrong value: %q vs %q", v, "derek")
+	if string(e.Value()) != "derek" {
+		t.Fatalf("Got wrong value: %q vs %q", e.Value(), "derek")
 	}
-	if r != 1 {
-		t.Fatalf("Expected 1 for the revision, got %d", r)
+	if e.Revision() != 1 {
+		t.Fatalf("Expected 1 for the revision, got %d", e.Revision())
 	}
 
 	// Delete
 	err = kv.Delete("name")
 	expectOk(t, err)
-	_, _, err = kv.Get("name")
+	_, err = kv.Get("name")
 	expectErr(t, err)
 	r, err = kv.Create("name", []byte("derek"))
 	expectOk(t, err)
-	if r != 2 {
-		t.Fatalf("Expected 2 for the revision, got %d", r)
+	if r != 3 {
+		t.Fatalf("Expected 3 for the revision, got %d", r)
 	}
 
 	// Conditional Updates.
-	r, err = kv.Update("name", []byte("rip"), 2)
+	r, err = kv.Update("name", []byte("rip"), 3)
 	expectOk(t, err)
-	_, err = kv.Update("name", []byte("ik"), 2)
+	_, err = kv.Update("name", []byte("ik"), 3)
 	expectErr(t, err)
 	_, err = kv.Update("name", []byte("ik"), r)
 	expectOk(t, err)
@@ -102,14 +100,14 @@ func TestKeyValueList(t *testing.T) {
 		t.Fatalf("Expected %d values, got %d", 10, len(vl))
 	}
 	for i, v := range vl {
-		if v.Key != "age" {
-			t.Fatalf("Expected key of %q, got %q", "age", v.Key)
+		if v.Key() != "age" {
+			t.Fatalf("Expected key of %q, got %q", "age", v.Key())
 		}
-		if v.Revision != uint64(i+41) {
+		if v.Revision() != uint64(i+41) {
 			// History of 10, sent 50..
-			t.Fatalf("Expected revision of %d, got %d", i+41, v.Revision)
+			t.Fatalf("Expected revision of %d, got %d", i+41, v.Revision())
 		}
-		age, err := strconv.Atoi(string(v.Data))
+		age, err := strconv.Atoi(string(v.Value()))
 		expectOk(t, err)
 		if age != i+62 {
 			t.Fatalf("Expected data value of %d, got %d", i+22, age)
@@ -127,20 +125,33 @@ func TestKeyValueWatch(t *testing.T) {
 	kv, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
 	expectOk(t, err)
 
-	updates := make(chan *nats.KeyValueEntry, 32)
-	sub, err := kv.WatchAll(func(v *nats.KeyValueEntry) {
+	updates := make(chan nats.KeyValueEntry, 32)
+	sub, err := kv.WatchAll(func(v nats.KeyValueEntry) {
 		updates <- v
 	})
 	expectOk(t, err)
 	defer sub.Unsubscribe()
 
 	expectUpdate := func(key, value string, revision uint64) {
-		ev := &nats.KeyValueEntry{Key: key, Data: []byte(value), Revision: revision}
+		t.Helper()
 		select {
 		case v := <-updates:
-			if !reflect.DeepEqual(ev, v) {
-				fmt.Printf("v.Data is %q\n", v.Data)
-				t.Fatalf("Did not get expected: %+v vs %+v", ev, v)
+			if v.Key() != key || string(v.Value()) != value || v.Revision() != revision {
+				t.Fatalf("Did not get expected: %+v vs %q %q %d", v, key, value, revision)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Did not receive an update like expected")
+		}
+	}
+	expectDelete := func(key string, revision uint64) {
+		t.Helper()
+		select {
+		case v := <-updates:
+			if v.Operation() != nats.KeyValueDelete {
+				t.Fatalf("Expected a delete operation but got %+v", v)
+			}
+			if v.Revision() != revision {
+				t.Fatalf("Did not get expected revision: %d vs %d", revision, v.Revision())
 			}
 		case <-time.After(time.Second):
 			t.Fatalf("Did not receive an update like expected")
@@ -157,6 +168,9 @@ func TestKeyValueWatch(t *testing.T) {
 	expectUpdate("age", "22", 4)
 	kv.Put("age", []byte("33"))
 	expectUpdate("age", "33", 5)
+	kv.Delete("age")
+	expectDelete("age", 6)
+
 	// Stop first watcher.
 	sub.Unsubscribe()
 
@@ -166,14 +180,14 @@ func TestKeyValueWatch(t *testing.T) {
 	kv.Put("t.age", []byte("22"))
 	kv.Put("t.age", []byte("44"))
 
-	sub, err = kv.Watch("t.*", func(v *nats.KeyValueEntry) {
+	sub, err = kv.Watch("t.*", func(v nats.KeyValueEntry) {
 		updates <- v
 	})
 	expectOk(t, err)
 	defer sub.Unsubscribe()
 
-	expectUpdate("t.name", "ik", 7)
-	expectUpdate("t.age", "44", 9)
+	expectUpdate("t.name", "ik", 8)
+	expectUpdate("t.age", "44", 10)
 }
 
 func TestKeyValueBindStore(t *testing.T) {
@@ -203,6 +217,23 @@ func TestKeyValueBindStore(t *testing.T) {
 	if err != nats.ErrBadBucket {
 		t.Fatalf("Expected %v but got %v", nats.ErrBadBucket, err)
 	}
+}
+
+func TestKeyValueDeleteStore(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc := client(t, s)
+	defer nc.Close()
+
+	_, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
+	expectOk(t, err)
+
+	err = nc.DeleteKeyValue("WATCH")
+	expectOk(t, err)
+
+	_, err = nc.KeyValue("WATCH")
+	expectErr(t, err)
 }
 
 // Helpers
