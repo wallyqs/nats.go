@@ -59,6 +59,11 @@ func TestObjectBasics(t *testing.T) {
 	if !bytes.Equal(copy, blob) {
 		t.Fatalf("Result not the same")
 	}
+	// Test delete.
+	err = js.DeleteObject("BLOB")
+	expectOk(t, err)
+	_, err = js.GetObject("BLOB")
+	expectErr(t, err, nats.ErrStreamNotFound)
 }
 
 func TestObjectFileBasics(t *testing.T) {

@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,8 @@ type ObjectStore interface {
 	PutFile(cfg *ObjectConfig, filename string) error
 	// GetFile is a convenience function to pull and object and place in a file.
 	GetFile(name, outfile string) error
+	// DeleteObject will delete the underlying stream for the named object.
+	DeleteObject(name string) error
 }
 
 // Config for the object.
@@ -45,6 +48,7 @@ type ObjectConfig struct {
 	Name        string
 	Description string
 	Retain      time.Duration
+	ChunkSize   int
 	Storage     StorageType
 	Replicas    int
 }
@@ -58,16 +62,15 @@ type ObjectResult struct {
 }
 
 const (
-	objNameTmpl        = "OBJ_%s"
-	objSubjectsPre     = "$O."
-	objSubjectsTmpl    = "$O.%s.>"
-	objSubjectsPreTmpl = "$O.%s."
-	objNoPending       = "0"
-	objChunkSize       = 128 * 1024 // 128k
-	objShaHdrOff       = 256
-	objDigestType      = "sha-256="
-	objDigestTmpl      = objDigestType + "%s"
-	objDigestHdr       = "Digest"
+	objNameTmpl         = "OBJ_%s"
+	objSubjectsPre      = "$O."
+	objSubjectsTmpl     = "$O.%s.>"
+	objSubjectsPreTmpl  = "$O.%s."
+	objNoPending        = "0"
+	objDefaultChunkSize = 128 * 1024 // 128k
+	objShaHdrOff        = 256
+	objDigestType       = "sha-256="
+	objDigestTmpl       = objDigestType + "%s"
 )
 
 // PutObject will place the contents from the reader into a new stream.
@@ -78,6 +81,13 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 	if strings.Contains(cfg.Name, ".") {
 		return ErrInvalidStreamName
 	}
+	if cfg.ChunkSize < 0 {
+		return errors.New("nats: chunk size must be >= 0")
+	}
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = objDefaultChunkSize
+	}
+
 	// Create a random subject prefixed with the object stream name.
 	var sb strings.Builder
 	sb.WriteString(objSubjectsPre)
@@ -91,7 +101,7 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 		Description: cfg.Description,
 		Subjects:    []string{subj},
 		MaxAge:      cfg.Retain,
-		MaxMsgSize:  objChunkSize + objShaHdrOff,
+		MaxMsgSize:  int32(cfg.ChunkSize + objShaHdrOff),
 		Storage:     cfg.Storage,
 		Replicas:    cfg.Replicas,
 		Discard:     DiscardNew,
@@ -126,8 +136,9 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 		return errors.New("nats: object stream must be empty")
 	}
 
-	m := NewMsg(subj)
-	chunk, sent := make([]byte, objChunkSize), 0
+	m, h := NewMsg(subj), sha256.New()
+	chunk, sent, total := make([]byte, cfg.ChunkSize), 0, uint64(0)
+
 	for {
 		n, err := r.Read(chunk)
 		if err != nil {
@@ -135,11 +146,16 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 				js.DeleteStream(scfg.Name)
 				return err
 			}
-			break
+			m.Data = nil // Signals EOF
+			sha := h.Sum(nil)
+			// Place sha256 and content-length in EOF msg.
+			m.Header.Set("Digest", fmt.Sprintf(objDigestTmpl, base64.URLEncoding.EncodeToString(sha[:])))
+			m.Header.Set("Content-Length", strconv.FormatUint(total, 10))
+		} else {
+			m.Data = chunk[:n]
+			h.Write(m.Data)
 		}
-		m.Data = chunk[:n]
-		sha := sha256.Sum256(m.Data)
-		m.Header.Set(objDigestHdr, fmt.Sprintf(objDigestTmpl, base64.URLEncoding.EncodeToString(sha[:])))
+		// Send msg itself.
 		if _, err := js.PublishMsgAsync(m); err != nil {
 			js.DeleteStream(scfg.Name)
 			return err
@@ -148,7 +164,14 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 			js.DeleteStream(scfg.Name)
 			return err
 		}
+		// Update totals.
 		sent++
+		total += uint64(n)
+
+		// Check if we are done.
+		if err != nil && err == io.EOF {
+			break
+		}
 	}
 	select {
 	case <-js.PublishAsyncComplete():
@@ -179,6 +202,8 @@ func (js *js) GetObject(name string) (*ObjectResult, error) {
 		return nil, errors.New("nats: stream required to have one subject")
 	}
 
+	// TODO(dlc) - Could get last msg here for correct Content-Length.
+
 	pr, pw := net.Pipe()
 	result := &ObjectResult{StreamInfo: si, r: pr}
 
@@ -188,28 +213,10 @@ func (js *js) GetObject(name string) (*ObjectResult, error) {
 		result.setErr(err)
 	}
 
+	// For calculating sum256
+	h := sha256.New()
+
 	processChunk := func(m *Msg) {
-		// Check digest if we have one.
-		if sh := m.Header.Get(objDigestHdr); strings.HasPrefix(sh, objDigestType) {
-			nsha, err := base64.URLEncoding.DecodeString(sh[len(objDigestType):])
-			if err != nil {
-				gotErr(m, err)
-				return
-			}
-			sha := sha256.Sum256(m.Data)
-			if !bytes.Equal(sha[:], nsha) {
-				gotErr(m, errors.New("nats: received corrupt chunk"))
-				return
-			}
-		}
-		for b := m.Data; len(b) > 0; {
-			n, err := pw.Write(b)
-			if err != nil {
-				gotErr(m, err)
-				return
-			}
-			b = b[n:]
-		}
 		tokens, err := getMetadataFields(m.Reply)
 		if err != nil {
 			gotErr(m, err)
@@ -218,7 +225,32 @@ func (js *js) GetObject(name string) (*ObjectResult, error) {
 		if tokens[ackNumPendingTokenPos] == objNoPending {
 			pw.Close()
 			m.Sub.Unsubscribe()
+
+			// Check digest if we have one, this will be on the last msg.
+			if sh := m.Header.Get("Digest"); strings.HasPrefix(sh, objDigestType) {
+				rsha, err := base64.URLEncoding.DecodeString(sh[len(objDigestType):])
+				if err != nil {
+					gotErr(m, err)
+					return
+				}
+				sha := h.Sum(nil)
+				if !bytes.Equal(sha[:], rsha) {
+					gotErr(m, errors.New("nats: received corrupt object, digests do not match"))
+					return
+				}
+			}
 		}
+		// Write to our pipe.
+		for b := m.Data; len(b) > 0; {
+			n, err := pw.Write(b)
+			if err != nil {
+				gotErr(m, err)
+				return
+			}
+			b = b[n:]
+		}
+		// Update sha256
+		h.Write(m.Data)
 	}
 
 	_, err = js.Subscribe(si.Config.Subjects[0], processChunk, OrderedConsumer())
@@ -227,6 +259,13 @@ func (js *js) GetObject(name string) (*ObjectResult, error) {
 	}
 
 	return result, nil
+}
+
+// DeleteObject will delete the underlying stream.
+func (js *js) DeleteObject(name string) error {
+	// Lookup the stream to get the bound subject.
+	stream := fmt.Sprintf(objNameTmpl, name)
+	return js.DeleteStream(stream)
 }
 
 // PutFile is convenience function to put a file into an object store.
