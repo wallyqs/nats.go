@@ -93,6 +93,7 @@ type StreamConfig struct {
 	Placement         *Placement      `json:"placement,omitempty"`
 	Mirror            *StreamSource   `json:"mirror,omitempty"`
 	Sources           []*StreamSource `json:"sources,omitempty"`
+	Sealed            bool            `json:"sealed,omitempty"`
 }
 
 // Placement is used to guide placement of streams in clustered JetStream.

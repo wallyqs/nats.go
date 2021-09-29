@@ -183,8 +183,10 @@ func (ojs *js) PutObject(cfg *ObjectConfig, r io.Reader) error {
 	}
 
 	// Seal the stream from being able to take on more messages.
+	// TODO(dlc) - Formalize
 	scfg.MaxMsgs = int64(sent)
 	scfg.MaxMsgSize = 1
+	scfg.Sealed = true
 	js.UpdateStream(scfg)
 
 	return nil
