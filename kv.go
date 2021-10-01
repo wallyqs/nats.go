@@ -234,42 +234,15 @@ func (e *kve) Operation() KeyValueOp { return e.op }
 
 // Get returns the latest value for the key.
 func (kv *kvs) Get(key string) (KeyValueEntry, error) {
-	o, cancel, err := getJSContextOpts(kv.js.opts)
-	if err != nil {
-		return nil, err
-	}
-	if cancel != nil {
-		defer cancel()
-	}
-
 	var b strings.Builder
 	b.WriteString(kv.pre)
 	b.WriteString(key)
 
-	req, err := json.Marshal(&apiMsgGetRequest{LastFor: b.String()})
+	m, err := kv.js.GetLastMsg(kv.stream, b.String())
 	if err != nil {
 		return nil, err
 	}
 
-	// Send request.
-	// FIXME(dlc) - Done b/c no "lastFor" support in normal get message atm.
-	subj := kv.js.apiSubj(fmt.Sprintf(apiMsgGetT, kv.stream))
-	r, err := kv.nc.RequestWithContext(o.ctx, subj, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// FIXME(dlc) - Be good to avoid stdlib JSON when possible.
-	// Maybe: https://github.com/goccy/go-json
-	var resp apiMsgGetResponse
-	if err := json.Unmarshal(r.Data, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Error != nil {
-		return nil, errors.New(resp.Error.Description)
-	}
-
-	m := resp.Message
 	entry := &kve{
 		bucket:   kv.name,
 		key:      key,
@@ -279,15 +252,9 @@ func (kv *kvs) Get(key string) (KeyValueEntry, error) {
 	}
 
 	// Double check here that this is not a DEL Operation marker.
-	if len(m.Header) > 0 {
-		hdr, err := decodeHeadersMsg(m.Header)
-		if err != nil {
-			return nil, err
-		}
-		if hdr.Get(kvop) == kvdel {
-			entry.op = KeyValueDelete
-			return entry, ErrMSgNotFound
-		}
+	if len(m.Header) > 0 && m.Header.Get(kvop) == kvdel {
+		entry.op = KeyValueDelete
+		return entry, ErrMSgNotFound
 	}
 
 	return entry, nil

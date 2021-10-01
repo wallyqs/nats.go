@@ -16,6 +16,7 @@ package test
 import (
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -272,6 +273,7 @@ func expectOk(t *testing.T, err error) {
 }
 
 func expectErr(t *testing.T, err error, expected ...error) {
+	t.Helper()
 	if err == nil {
 		t.Fatalf("Expected error but got none")
 	}
@@ -279,7 +281,7 @@ func expectErr(t *testing.T, err error, expected ...error) {
 		return
 	}
 	for _, e := range expected {
-		if err == e {
+		if err == e || strings.Contains(e.Error(), err.Error()) {
 			return
 		}
 	}
