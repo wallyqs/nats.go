@@ -755,8 +755,18 @@ type apiMsgGetResponse struct {
 	Message *storedMsg `json:"message,omitempty"`
 }
 
+// GetLastMsg retrieves the last raw stream message stored in JetStream by subject.
+func (js *js) GetLastMsg(name, subject string, opts ...JSOpt) (*RawStreamMsg, error) {
+	return js.getMsg(name, &apiMsgGetRequest{LastFor: subject}, opts...)
+}
+
 // GetMsg retrieves a raw stream message stored in JetStream by sequence number.
 func (js *js) GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, error) {
+	return js.getMsg(name, &apiMsgGetRequest{Seq: seq}, opts...)
+}
+
+// Low level getMsg
+func (js *js) getMsg(name string, mreq *apiMsgGetRequest, opts ...JSOpt) (*RawStreamMsg, error) {
 	o, cancel, err := getJSContextOpts(js.opts, opts...)
 	if err != nil {
 		return nil, err
@@ -769,7 +779,7 @@ func (js *js) GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, err
 		return nil, ErrStreamNameRequired
 	}
 
-	req, err := json.Marshal(&apiMsgGetRequest{Seq: seq})
+	req, err := json.Marshal(mreq)
 	if err != nil {
 		return nil, err
 	}
@@ -851,6 +861,15 @@ func (js *js) DeleteMsg(name string, seq uint64, opts ...JSOpt) error {
 	return nil
 }
 
+type streamPurgeRequest struct {
+	// Purge up to but not including sequence.
+	Sequence uint64 `json:"seq,omitempty"`
+	// Subject to match against messages for the purge command.
+	Subject string `json:"filter,omitempty"`
+	// Number of messages to keep.
+	Keep uint64 `json:"keep,omitempty"`
+}
+
 type streamPurgeResponse struct {
 	apiResponse
 	Success bool   `json:"success,omitempty"`
@@ -858,7 +877,11 @@ type streamPurgeResponse struct {
 }
 
 // PurgeStream purges messages on a Stream.
-func (js *js) PurgeStream(name string, opts ...JSOpt) error {
+func (js *js) PurgeStream(stream string, opts ...JSOpt) error {
+	return js.purgeStream(stream, nil)
+}
+
+func (js *js) purgeStream(stream string, req *streamPurgeRequest, opts ...JSOpt) error {
 	o, cancel, err := getJSContextOpts(js.opts, opts...)
 	if err != nil {
 		return err
@@ -867,8 +890,15 @@ func (js *js) PurgeStream(name string, opts ...JSOpt) error {
 		defer cancel()
 	}
 
-	psSubj := js.apiSubj(fmt.Sprintf(apiStreamPurgeT, name))
-	r, err := js.nc.RequestWithContext(o.ctx, psSubj, nil)
+	var b []byte
+	if req != nil {
+		if b, err = json.Marshal(req); err != nil {
+			return err
+		}
+	}
+
+	psSubj := js.apiSubj(fmt.Sprintf(apiStreamPurgeT, stream))
+	r, err := js.nc.RequestWithContext(o.ctx, psSubj, b)
 	if err != nil {
 		return err
 	}
