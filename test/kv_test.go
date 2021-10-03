@@ -28,10 +28,10 @@ func TestKeyValueBasics(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
 
-	nc := client(t, s)
+	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	kv, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "TEST"})
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "TEST"})
 	expectOk(t, err)
 
 	if kv.Bucket() != "TEST" {
@@ -82,10 +82,10 @@ func TestKeyValueList(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
 
-	nc := client(t, s)
+	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	kv, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "LIST", History: 10})
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "LIST", History: 10})
 	expectOk(t, err)
 
 	for i := 0; i < 50; i++ {
@@ -120,10 +120,10 @@ func TestKeyValueWatch(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
 
-	nc := client(t, s)
+	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	kv, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
 	expectOk(t, err)
 
 	updates := make(chan nats.KeyValueEntry, 32)
@@ -198,11 +198,11 @@ func TestKeyValueBindStore(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	_, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
+	_, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
 	expectOk(t, err)
 
 	// Now bind to it..
-	_, err = nc.KeyValue("WATCH")
+	_, err = js.KeyValue("WATCH")
 	expectOk(t, err)
 
 	// Make sure we can't bind to a non-kv style stream.
@@ -213,7 +213,7 @@ func TestKeyValueBindStore(t *testing.T) {
 	})
 	expectOk(t, err)
 
-	_, err = nc.KeyValue("TEST")
+	_, err = js.KeyValue("TEST")
 	expectErr(t, err)
 	if err != nats.ErrBadBucket {
 		t.Fatalf("Expected %v but got %v", nats.ErrBadBucket, err)
@@ -224,16 +224,16 @@ func TestKeyValueDeleteStore(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
 
-	nc := client(t, s)
+	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	_, err := nc.AddKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
+	_, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
 	expectOk(t, err)
 
-	err = nc.DeleteKeyValue("WATCH")
+	err = js.DeleteKeyValue("WATCH")
 	expectOk(t, err)
 
-	_, err = nc.KeyValue("WATCH")
+	_, err = js.KeyValue("WATCH")
 	expectErr(t, err)
 }
 

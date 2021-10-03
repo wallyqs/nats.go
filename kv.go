@@ -15,13 +15,21 @@ package nats
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 )
+
+type KeyValueManager interface {
+	// KeyValue will lookup and bind to an existing KeyValue store.
+	KeyValue(bucket string) (KeyValue, error)
+	// CreateKeyValue will create a KeyValue store with the following configuration.
+	CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error)
+	// DeleteKeyValue will delete this KeyValue store (JetStream stream).
+	DeleteKeyValue(bucket string) error
+}
 
 type KeyValue interface {
 	// Get returns the latest value for the key.
@@ -107,19 +115,15 @@ const (
 )
 
 // KeyValue will lookup and bind to an existing KeyValue store.
-func (nc *Conn) KeyValue(bucket string, opts ...JSOpt) (KeyValue, error) {
+func (js *js) KeyValue(bucket string) (KeyValue, error) {
 	if bucket == _EMPTY_ {
 		return nil, ErrBucketNameRequired
 	}
 	if strings.Contains(bucket, ".") {
 		return nil, ErrInvalidBucketName
 	}
-	jsc, err := nc.JetStream(opts...)
-	if err != nil {
-		return nil, err
-	}
 	stream := fmt.Sprintf(kvBucketNameTmpl, bucket)
-	si, err := jsc.StreamInfo(stream)
+	si, err := js.StreamInfo(stream)
 	if err != nil {
 		if err == ErrStreamNotFound {
 			err = ErrBucketNotFound
@@ -136,26 +140,20 @@ func (nc *Conn) KeyValue(bucket string, opts ...JSOpt) (KeyValue, error) {
 		name:   bucket,
 		stream: stream,
 		pre:    fmt.Sprintf(kvSubjectsPreTmpl, bucket),
-		nc:     nc,
-		js:     jsc.(*js),
+		js:     js,
 	}
 	return kv, nil
 }
 
-// AddKeyValue will create a KeyValue store with the following configuration.
-func (nc *Conn) AddKeyValue(cfg *KeyValueConfig, opts ...JSOpt) (KeyValue, error) {
+// CreateKeyValue will create a KeyValue store with the following configuration.
+func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 	if cfg == nil || cfg.Bucket == _EMPTY_ {
 		return nil, ErrBucketNameRequired
 	}
 	if strings.Contains(cfg.Bucket, ".") {
 		return nil, ErrInvalidBucketName
 	}
-
-	jsc, err := nc.JetStream(opts...)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = jsc.AccountInfo(); err != nil {
+	if _, err := js.AccountInfo(); err != nil {
 		return nil, err
 	}
 
@@ -181,7 +179,7 @@ func (nc *Conn) AddKeyValue(cfg *KeyValueConfig, opts ...JSOpt) (KeyValue, error
 		Replicas:          replicas,
 	}
 
-	if _, err := jsc.AddStream(scfg); err != nil {
+	if _, err := js.AddStream(scfg); err != nil {
 		return nil, err
 	}
 
@@ -189,27 +187,21 @@ func (nc *Conn) AddKeyValue(cfg *KeyValueConfig, opts ...JSOpt) (KeyValue, error
 		name:   cfg.Bucket,
 		stream: scfg.Name,
 		pre:    fmt.Sprintf(kvSubjectsPreTmpl, cfg.Bucket),
-		nc:     nc,
-		js:     jsc.(*js),
+		js:     js,
 	}
 	return kv, nil
 }
 
 // DeleteKeyValue will delete this KeyValue store (JetStream stream).
-func (nc *Conn) DeleteKeyValue(bucket string, opts ...JSOpt) error {
-	js, err := nc.JetStream(opts...)
-	if err != nil {
-		return err
-	}
+func (js *js) DeleteKeyValue(bucket string) error {
 	stream := fmt.Sprintf(kvBucketNameTmpl, bucket)
-	return js.DeleteStream(stream, opts...)
+	return js.DeleteStream(stream)
 }
 
 type kvs struct {
 	name   string
 	stream string
 	pre    string
-	nc     *Conn
 	js     *js
 }
 
@@ -303,27 +295,8 @@ func (kv *kvs) Update(key string, value []byte, revision uint64) (uint64, error)
 	return pa.Sequence, err
 }
 
-// purgeRequest is optional request information to the purge API.
-// Subject will filter the purge request to only messages that match the subject, which can have wildcards.
-// Sequence will purge up to but not including this sequence and can be combined with subject filtering.
-// Keep will specify how many messages to keep. This can also be combined with subject filtering.
-// Note that Sequence and Keep are mutually exclusive, so both can not be set at the same time.
-type purgeRequest struct {
-	Sequence uint64 `json:"seq,omitempty"`
-	Subject  string `json:"filter,omitempty"`
-	Keep     uint64 `json:"keep,omitempty"`
-}
-
 // Delete the key and all revisions.
 func (kv *kvs) Delete(key string) error {
-	o, cancel, err := getJSContextOpts(kv.js.opts)
-	if err != nil {
-		return err
-	}
-	if cancel != nil {
-		defer cancel()
-	}
-
 	var b strings.Builder
 	b.WriteString(kv.pre)
 	b.WriteString(key)
@@ -335,23 +308,9 @@ func (kv *kvs) Delete(key string) error {
 	if err != nil {
 		return err
 	}
-	preq, err := json.Marshal(&purgeRequest{Subject: b.String(), Keep: 1})
+	err = kv.js.purgeStream(kv.stream, &streamPurgeRequest{Subject: b.String(), Keep: 1})
 	if err != nil {
 		return err
-	}
-
-	// Send request.
-	subj := kv.js.apiSubj(fmt.Sprintf(apiStreamPurgeT, kv.stream))
-	r, err := kv.nc.RequestWithContext(o.ctx, subj, preq)
-	if err != nil {
-		return err
-	}
-	var resp streamPurgeResponse
-	if err := json.Unmarshal(r.Data, &resp); err != nil {
-		return err
-	}
-	if resp.Error != nil {
-		return errors.New(resp.Error.Description)
 	}
 
 	// Double check the pubAck future.

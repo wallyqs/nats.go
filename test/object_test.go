@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/nats-io/nats.go"
 )
@@ -32,18 +33,32 @@ func TestObjectBasics(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	err := js.CreateObjectStore(&nats.ObjectConfig{Name: "OBJS"})
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
 	expectOk(t, err)
 
 	// Create ~16MB object.
 	blob := make([]byte, 16*1024*1024+22)
 	rand.Read(blob)
 
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "BLOB"}, bytes.NewReader(blob))
+	now := time.Now().UTC().Round(time.Second)
+	_, err = obs.PutBytes("BLOB", blob)
 	expectOk(t, err)
 
+	// Test info
+	info, err := obs.GetInfo("BLOB")
+	expectOk(t, err)
+	if len(info.NUID) == 0 {
+		t.Fatalf("Expected object to have a NUID")
+	}
+	if info.ModTime.IsZero() {
+		t.Fatalf("Expected object to have a non-zero ModTime")
+	}
+	if mt := info.ModTime.Round(time.Second); mt.Sub(now) != 0 && mt.Sub(now) != time.Second {
+		t.Fatalf("Expected ModTime to be about %v, got %v", now, mt)
+	}
+
 	// Make sure the stream is sealed.
-	err = js.SealObjectStore("OBJS")
+	err = obs.Seal()
 	expectOk(t, err)
 	si, err := js.StreamInfo("OBJ_OBJS")
 	expectOk(t, err)
@@ -52,17 +67,17 @@ func TestObjectBasics(t *testing.T) {
 	}
 
 	// Check simple errors.
-	_, err = js.GetObject("OBJS", "FOO")
+	_, err = obs.Get("FOO")
 	expectErr(t, err)
 
 	// Now get the object back.
-	result, err := js.GetObject("OBJS", "BLOB")
+	result, err := obs.Get("BLOB")
 	expectOk(t, err)
 	expectOk(t, result.Error())
 	defer result.Close()
 
-	// Check info stuff.
-	info, err := result.Info()
+	// Check info.
+	info, err = result.Info()
 	expectOk(t, err)
 	if info.Size != uint64(len(blob)) {
 		t.Fatalf("Size does not match, %d vs %d", info.Size, len(blob))
@@ -77,7 +92,7 @@ func TestObjectBasics(t *testing.T) {
 	// Test delete.
 	err = js.DeleteObjectStore("OBJS")
 	expectOk(t, err)
-	_, err = js.GetObject("OBJS", "BLOB")
+	_, err = obs.Get("BLOB")
 	expectErr(t, err, nats.ErrStreamNotFound)
 }
 
@@ -88,7 +103,7 @@ func TestObjectFileBasics(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	err := js.CreateObjectStore(&nats.ObjectConfig{Name: "FILES"})
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "FILES"})
 	expectOk(t, err)
 
 	// Create ~8MB object.
@@ -101,14 +116,14 @@ func TestObjectFileBasics(t *testing.T) {
 	err = ioutil.WriteFile(tmpFile.Name(), blob, 0600)
 	expectOk(t, err)
 
-	err = js.PutFile("FILES", tmpFile.Name())
+	_, err = obs.PutFile(tmpFile.Name())
 	expectOk(t, err)
 
 	tmpResult, err := ioutil.TempFile("", "objfileresult")
 	expectOk(t, err)
 	defer os.Remove(tmpResult.Name()) // clean up
 
-	err = js.GetFile("FILES", tmpFile.Name(), tmpResult.Name())
+	err = obs.GetFile(tmpFile.Name(), tmpResult.Name())
 	expectOk(t, err)
 
 	// Make sure they are the same.
@@ -130,8 +145,7 @@ func TestObjectMulti(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	on := "TEST_FILES"
-	err := js.CreateObjectStore(&nats.ObjectConfig{Name: on})
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "TEST_FILES"})
 	expectOk(t, err)
 
 	numFiles := 0
@@ -142,16 +156,16 @@ func TestObjectMulti(t *testing.T) {
 		if filepath.Ext(fn) != ".go" || fn[0] == '.' || fn[0] == '#' {
 			continue
 		}
-		err = js.PutFile(on, fn)
+		_, err = obs.PutFile(fn)
 		expectOk(t, err)
 		numFiles++
 	}
-	expectOk(t, js.SealObjectStore(on))
+	expectOk(t, obs.Seal())
 
 	_, err = js.StreamInfo("OBJ_TEST_FILES")
 	expectOk(t, err)
 
-	result, err := js.GetObject(on, "object_test.go")
+	result, err := obs.Get("object_test.go")
 	expectOk(t, err)
 	expectOk(t, result.Error())
 	defer result.Close()
@@ -170,6 +184,38 @@ func TestObjectMulti(t *testing.T) {
 	}
 }
 
+func TestObjectDeleteMarkers(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
+	expectOk(t, err)
+
+	msg := bytes.Repeat([]byte("A"), 100)
+	_, err = obs.PutBytes("A", msg)
+	expectOk(t, err)
+
+	err = obs.Delete("A")
+	expectOk(t, err)
+
+	si, err := js.StreamInfo("OBJ_OBJS")
+	expectOk(t, err)
+
+	// We should have one message left. The delete marker.
+	if si.State.Msgs != 1 {
+		t.Fatalf("Expected 1 marker msg, got %d msgs", si.State.Msgs)
+	}
+	// Make sure we have a delete marker, this will be there to drive Watch functionality.
+	info, err := obs.GetInfo("A")
+	expectOk(t, err)
+	if !info.Deleted {
+		t.Fatalf("Expected info to be marked as deleted")
+	}
+}
+
 func TestObjectMultiWithDelete(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
@@ -177,28 +223,23 @@ func TestObjectMultiWithDelete(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	err := js.CreateObjectStore(&nats.ObjectConfig{Name: "2OD"})
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "2OD"})
 	expectOk(t, err)
 
 	pa := bytes.Repeat([]byte("A"), 2_000_000)
 	pb := bytes.Repeat([]byte("B"), 3_000_000)
 
-	err = js.PutObject("2OD", &nats.ObjectMeta{Name: "A"}, bytes.NewReader(pa))
+	_, err = obs.PutBytes("A", pa)
 	expectOk(t, err)
 
 	// Hold onto this so we can make sure DeleteObject clears all messages, chunks and meta.
 	si, err := js.StreamInfo("OBJ_2OD")
 	expectOk(t, err)
 
-	err = js.PutObject("2OD", &nats.ObjectMeta{Name: "B"}, bytes.NewReader(pb))
+	_, err = obs.PutBytes("B", pb)
 	expectOk(t, err)
 
-	result, err := js.GetObject("2OD", "B")
-	expectOk(t, err)
-	expectOk(t, result.Error())
-	defer result.Close()
-
-	pb2, err := ioutil.ReadAll(result)
+	pb2, err := obs.GetBytes("B")
 	expectOk(t, err)
 
 	if !bytes.Equal(pb, pb2) {
@@ -206,13 +247,13 @@ func TestObjectMultiWithDelete(t *testing.T) {
 	}
 
 	// Now delete B
-	err = js.DeleteObject("2OD", "B")
+	err = obs.Delete("B")
 	expectOk(t, err)
 
 	siad, err := js.StreamInfo("OBJ_2OD")
 	expectOk(t, err)
-	if siad.State.Msgs != si.State.Msgs {
-		t.Fatalf("Expected to have %d msgs after delete, got %d", siad.State.Msgs, si.State.Msgs)
+	if siad.State.Msgs != si.State.Msgs+1 { // +1 more delete marker.
+		t.Fatalf("Expected to have %d msgs after delete, got %d", siad.State.Msgs, si.State.Msgs+1)
 	}
 }
 
@@ -223,30 +264,187 @@ func TestObjectNames(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	err := js.CreateObjectStore(&nats.ObjectConfig{Name: "OBJS"})
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
 	expectOk(t, err)
-
-	// Create ~1K object.
-	blob := make([]byte, 1024)
-	rand.Read(blob)
-	r := bytes.NewReader(blob)
 
 	// Test filename like naming.
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "BLOB.txt"}, r)
+	_, err = obs.PutString("BLOB.txt", "A")
 	expectOk(t, err)
 	// Spaces ok
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "foo bar"}, r)
+	_, err = obs.PutString("foo bar", "A")
 	expectOk(t, err)
 
 	// Errors
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "*"}, r)
+	_, err = obs.PutString("*", "A")
 	expectErr(t, err)
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: ">"}, r)
+	_, err = obs.PutString(">", "A")
 	expectErr(t, err)
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: ""}, r)
+	_, err = obs.PutString("", "A")
 	expectErr(t, err)
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "\t"}, r)
+	_, err = obs.PutString("", "\t")
 	expectErr(t, err)
-	err = js.PutObject("OBJS", &nats.ObjectMeta{Name: "\n"}, r)
+	_, err = obs.PutString("", "\n")
 	expectErr(t, err)
+}
+
+func TestObjectMetadata(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "META-TEST"})
+	expectOk(t, err)
+
+	// Simple with no Meta.
+	_, err = obs.PutString("A", "AAA")
+	expectOk(t, err)
+
+	meta := &nats.ObjectMeta{Name: "B"}
+
+	err = obs.UpdateMeta("A", meta)
+	expectOk(t, err)
+
+	info, err := obs.GetInfo("B")
+	expectOk(t, err)
+	if info.Name != "B" {
+		t.Fatalf("Update failed: %+v", info)
+	}
+	meta.Headers = make(nats.Header)
+	meta.Headers.Set("color", "red")
+
+	err = obs.UpdateMeta("B", meta)
+	expectOk(t, err)
+
+	info, err = obs.GetInfo("B")
+	expectOk(t, err)
+	if info.Headers == nil || info.Headers.Get("color") != "red" {
+		t.Fatalf("Update failed: %+v", info)
+	}
+}
+
+func TestObjectWatch(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "WATCH-TEST"})
+	expectOk(t, err)
+
+	_, err = obs.PutString("A", "AAA")
+	expectOk(t, err)
+
+	_, err = obs.PutString("B", "BBB")
+	expectOk(t, err)
+
+	updates := make(chan *nats.ObjectInfo, 32)
+	sub, err := obs.Watch(func(meta *nats.ObjectInfo) {
+		updates <- meta
+	})
+	expectOk(t, err)
+	defer sub.Unsubscribe()
+
+	expectUpdate := func(name string) {
+		t.Helper()
+		select {
+		case info := <-updates:
+			if false && info.Name != name {
+				t.Fatalf("Expected update for %q, but got %+v", name, info)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Did not receive an update like expected")
+		}
+	}
+
+	expectNoMoreUpdates := func() {
+		t.Helper()
+		select {
+		case info := <-updates:
+			t.Fatalf("Got an unexpected update: %+v", info)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+
+	// Initial Values.
+	expectUpdate("A")
+	expectUpdate("B")
+	expectNoMoreUpdates()
+
+	// Delete
+	err = obs.Delete("A")
+	expectOk(t, err)
+
+	// FIXME(dlc) - I think there is a bug in server on rollup that causes an update on "B" here.
+	expectUpdate("B")
+
+	expectUpdate("A")
+	expectNoMoreUpdates()
+
+	// New
+	_, err = obs.PutString("C", "CCC")
+	expectOk(t, err)
+
+	// Update Meta
+	info, err := obs.GetInfo("A")
+	expectOk(t, err)
+	meta := &info.ObjectMeta
+	meta.Description = "A's are better than B's"
+	err = obs.UpdateMeta("A", meta)
+	expectOk(t, err)
+}
+
+func TestObjectLinks(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	root, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "ROOT"})
+	expectOk(t, err)
+
+	_, err = root.PutString("A", "AAA")
+	expectOk(t, err)
+	_, err = root.PutString("B", "BBB")
+	expectOk(t, err)
+
+	info, err := root.GetInfo("A")
+	expectOk(t, err)
+
+	// Self link to individual object.
+	_, err = root.AddLink("LA", info)
+	expectOk(t, err)
+
+	dir, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "DIR"})
+	expectOk(t, err)
+
+	_, err = dir.PutString("DIR/A", "DIR-AAA")
+	expectOk(t, err)
+	_, err = dir.PutString("DIR/B", "DIR-BBB")
+	expectOk(t, err)
+
+	info, err = dir.GetInfo("DIR/B")
+	expectOk(t, err)
+
+	binfo, err := root.AddLink("DBL", info)
+	expectOk(t, err)
+
+	if binfo.Name != "DBL" || binfo.NUID == "" || binfo.ModTime.IsZero() {
+		t.Fatalf("Link info not what was expected: %+v", binfo)
+	}
+
+	// Now add whole other store as a link, like a directory.
+	_, err = root.AddBucket("dir", dir)
+	expectOk(t, err)
+
+	// Now try to get a linked object.
+	dbl, err := root.GetString("DBL")
+	expectOk(t, err)
+
+	if dbl != "DIR-BBB" {
+		t.Fatalf("Expected %q but got %q", "DIR-BBB", dbl)
+	}
 }
