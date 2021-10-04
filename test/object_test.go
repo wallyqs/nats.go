@@ -377,9 +377,6 @@ func TestObjectWatch(t *testing.T) {
 	err = obs.Delete("A")
 	expectOk(t, err)
 
-	// FIXME(dlc) - I think there is a bug in server on rollup that causes an update on "B" here.
-	expectUpdate("B")
-
 	expectUpdate("A")
 	expectNoMoreUpdates()
 

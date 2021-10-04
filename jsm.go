@@ -795,7 +795,10 @@ func (js *js) getMsg(name string, mreq *apiMsgGetRequest, opts ...JSOpt) (*RawSt
 		return nil, err
 	}
 	if resp.Error != nil {
-		return nil, errors.New(resp.Error.Description)
+		if resp.Error.Code == 404 && strings.Contains(resp.Error.Description, "message") {
+			return nil, ErrMsgNotFound
+		}
+		return nil, fmt.Errorf("nats: %s", resp.Error.Description)
 	}
 
 	msg := resp.Message
@@ -861,6 +864,7 @@ func (js *js) DeleteMsg(name string, seq uint64, opts ...JSOpt) error {
 	return nil
 }
 
+// purgeRequest is optional request information to the purge API.
 type streamPurgeRequest struct {
 	// Purge up to but not including sequence.
 	Sequence uint64 `json:"seq,omitempty"`

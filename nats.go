@@ -155,7 +155,7 @@ var (
 	ErrPullSubscribeToPushConsumer  = errors.New("nats: cannot pull subscribe to push based consumer")
 	ErrPullSubscribeRequired        = errors.New("nats: must use pull subscribe to bind to pull based consumer")
 	ErrConsumerNotActive            = errors.New("nats: consumer not active")
-	ErrMSgNotFound                  = errors.New("nats: message not found")
+	ErrMsgNotFound                  = errors.New("nats: message not found")
 )
 
 func init() {

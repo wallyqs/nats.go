@@ -58,7 +58,7 @@ func TestKeyValueBasics(t *testing.T) {
 	err = kv.Delete("name")
 	expectOk(t, err)
 	_, err = kv.Get("name")
-	expectErr(t, err)
+	expectErr(t, err, nats.ErrKeyDeleted)
 	r, err = kv.Create("name", []byte("derek"))
 	expectOk(t, err)
 	if r != 3 {
@@ -78,7 +78,7 @@ func TestKeyValueBasics(t *testing.T) {
 	expectOk(t, err)
 }
 
-func TestKeyValueList(t *testing.T) {
+func TestKeyValueHistory(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdown(s)
 
@@ -94,7 +94,7 @@ func TestKeyValueList(t *testing.T) {
 		expectOk(t, err)
 	}
 
-	vl, err := kv.List("age")
+	vl, err := kv.History("age")
 	expectOk(t, err)
 
 	if len(vl) != 10 {
@@ -235,6 +235,41 @@ func TestKeyValueDeleteStore(t *testing.T) {
 
 	_, err = js.KeyValue("WATCH")
 	expectErr(t, err)
+}
+
+func TestKeyValueDeleteVsPurge(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "KVS", History: 10})
+	expectOk(t, err)
+
+	put := func(key, value string) {
+		_, err := kv.Put(key, []byte(value))
+		expectOk(t, err)
+	}
+
+	// Put in a few names and ages.
+	put("name", "derek")
+	put("age", "22")
+	put("name", "ivan")
+	put("age", "33")
+	put("name", "rip")
+	put("age", "44")
+
+	kv.Delete("age")
+	entries, err := kv.History("age")
+	expectOk(t, err)
+	// Expect three entries and delete marker.
+	if len(entries) != 4 {
+		t.Fatalf("Expected 4 entries for age after delete, got %d", len(entries))
+	}
+	kv.Purge("name")
+	_, err = kv.History("name")
+	expectErr(t, err, nats.ErrKeyNotFound)
 }
 
 // Helpers
