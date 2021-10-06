@@ -43,8 +43,10 @@ type KeyValue interface {
 	Update(key string, value []byte, last uint64) (revision uint64, err error)
 	// Delete will place a delete marker and leave all revisions.
 	Delete(key string) error
-	// Purge will remove the key and all revisions.
+	// Purge will place a delete marker and remove all previous revisions.
 	Purge(key string) error
+	// PurgeDeletes will remove all current delete markers.
+	PurgeDeletes() error
 	// WatchAll will invoke the callback for all updates.
 	WatchAll(cb KeyValueUpdate) (*Subscription, error)
 	// Watch will invoke the callback for any keys that match keyPattern when they update.
@@ -130,6 +132,9 @@ var (
 
 // KeyValue will lookup and bind to an existing KeyValue store.
 func (js *js) KeyValue(bucket string) (KeyValue, error) {
+	if !js.nc.serverMinVersion(2, 6, 2) {
+		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
+	}
 	if !validBucketRe.MatchString(bucket) {
 		return nil, ErrInvalidBucketName
 	}
@@ -158,14 +163,13 @@ func (js *js) KeyValue(bucket string) (KeyValue, error) {
 
 // CreateKeyValue will create a KeyValue store with the following configuration.
 func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
+	if !js.nc.serverMinVersion(2, 6, 2) {
+		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
+	}
 	if cfg == nil {
 		return nil, ErrKeyValueConfigRequired
 	}
 	if !validBucketRe.MatchString(cfg.Bucket) {
-		return nil, ErrInvalidBucketName
-	}
-
-	if strings.Contains(cfg.Bucket, ".") {
 		return nil, ErrInvalidBucketName
 	}
 	if _, err := js.AccountInfo(); err != nil {
@@ -196,6 +200,8 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 		MaxMsgSize:        cfg.MaxValueSize,
 		Storage:           cfg.Storage,
 		Replicas:          replicas,
+		RollupAllowed:     true,
+		DenyDelete:        true,
 	}
 
 	if _, err := js.AddStream(scfg); err != nil {
@@ -361,11 +367,55 @@ func (kv *kvs) delete(key string, purge bool) error {
 	// DEL op marker. For watch functionality.
 	m := NewMsg(b.String())
 	m.Header.Set(kvop, kvdel)
-	_, err := kv.js.PublishMsg(m)
-	if err == nil && purge {
-		err = kv.js.purgeStream(kv.stream, &streamPurgeRequest{Subject: b.String()})
+	if purge {
+		m.Header.Set(MsgRollup, MsgRollupSubject)
 	}
+	_, err := kv.js.PublishMsg(m)
 	return err
+}
+
+// PurgeDeletes will remove all current delete markers.
+// This is a maintenance option if there is a larger buildup of delete markers.
+func (kv *kvs) PurgeDeletes() error {
+	o, cancel, err := getJSContextOpts(kv.js.opts)
+	if err != nil {
+		return err
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+
+	ctx := o.ctx
+	if ctx == nil {
+		ctx, cancel = context.WithTimeout(context.Background(), o.wait)
+		defer cancel()
+	}
+
+	done := make(chan error, 1)
+	sub, err := kv.WatchAll(func(v KeyValueEntry) {
+		var b strings.Builder
+		b.WriteString(kv.pre)
+		b.WriteString(v.Key())
+		err := kv.js.purgeStream(kv.stream, &streamPurgeRequest{Subject: b.String()})
+		if err != nil {
+			done <- err
+		}
+		if v.Delta() == 0 {
+			done <- nil
+		}
+	})
+	if err != nil {
+		return err
+	}
+	defer sub.Unsubscribe()
+
+	// Wait on done or ctx/timeout.
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // History will return all values for the key.

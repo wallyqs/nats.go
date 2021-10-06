@@ -94,6 +94,9 @@ type StreamConfig struct {
 	Mirror            *StreamSource   `json:"mirror,omitempty"`
 	Sources           []*StreamSource `json:"sources,omitempty"`
 	Sealed            bool            `json:"sealed,omitempty"`
+	DenyDelete        bool            `json:"deny_delete,omitempty"`
+	DenyPurge         bool            `json:"deny_purge,omitempty"`
+	RollupAllowed     bool            `json:"rollup_hdrs,omitempty"`
 }
 
 // Placement is used to guide placement of streams in clustered JetStream.

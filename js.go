@@ -324,6 +324,9 @@ const (
 	MsgRollup              = "Nats-Rollup"
 )
 
+// MsgSize is a header that will be part of a consumer's delivered message if HeadersOnly requested.
+const MsgSize = "Nats-Msg-Size"
+
 // Rollups, can be subject only or all messages.
 const (
 	MsgRollupSubject = "sub"
@@ -852,6 +855,7 @@ type ConsumerConfig struct {
 	MaxAckPending   int           `json:"max_ack_pending,omitempty"`
 	FlowControl     bool          `json:"flow_control,omitempty"`
 	Heartbeat       time.Duration `json:"idle_heartbeat,omitempty"`
+	HeadersOnly     bool          `json:"headers_only,omitempty"`
 }
 
 // ConsumerInfo is the info from a JetStream consumer.

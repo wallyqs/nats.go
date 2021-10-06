@@ -165,6 +165,9 @@ type obs struct {
 
 // CreateObjectStore will create an object store.
 func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
+	if !js.nc.serverMinVersion(2, 6, 2) {
+		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
+	}
 	if cfg == nil || cfg.Bucket == _EMPTY_ {
 		return nil, ErrStreamNameRequired
 	}
@@ -194,6 +197,10 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 
 // ObjectStore will lookup and bind to an existing object store instance.
 func (js *js) ObjectStore(bucket string) (ObjectStore, error) {
+	if !js.nc.serverMinVersion(2, 6, 2) {
+		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
+	}
+
 	stream := fmt.Sprintf(objNameTmpl, bucket)
 	si, err := js.StreamInfo(stream)
 	if err != nil {

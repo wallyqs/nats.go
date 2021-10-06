@@ -14,6 +14,7 @@
 package test
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -248,6 +249,7 @@ func TestKeyValueDeleteVsPurge(t *testing.T) {
 	expectOk(t, err)
 
 	put := func(key, value string) {
+		t.Helper()
 		_, err := kv.Put(key, []byte(value))
 		expectOk(t, err)
 	}
@@ -268,8 +270,47 @@ func TestKeyValueDeleteVsPurge(t *testing.T) {
 		t.Fatalf("Expected 4 entries for age after delete, got %d", len(entries))
 	}
 	kv.Purge("name")
-	_, err = kv.History("name")
-	expectErr(t, err, nats.ErrKeyNotFound)
+	entries, err = kv.History("name")
+	expectOk(t, err)
+	if len(entries) != 1 {
+		t.Fatalf("Expected only 1 entry for age after delete, got %d", len(entries))
+	}
+}
+
+func TestKeyValueDeleteTombstones(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "KVS", History: 10})
+	expectOk(t, err)
+
+	put := func(key, value string) {
+		t.Helper()
+		_, err := kv.Put(key, []byte(value))
+		expectOk(t, err)
+	}
+
+	v := strings.Repeat("ABC", 33)
+	for i := 1; i <= 100; i++ {
+		put(fmt.Sprintf("key-%d", i), v)
+	}
+	// Now delete them.
+	for i := 1; i <= 100; i++ {
+		err := kv.Delete(fmt.Sprintf("key-%d", i))
+		expectOk(t, err)
+	}
+	// Now cleanup.
+	err = kv.PurgeDeletes()
+	expectOk(t, err)
+
+	si, err := js.StreamInfo("KV_KVS")
+	expectOk(t, err)
+	if si.State.Msgs != 0 {
+		t.Fatalf("Expected no stream msgs to be left, got %d", si.State.Msgs)
+	}
 }
 
 // Helpers
