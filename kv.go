@@ -75,6 +75,7 @@ const (
 	AllKeys            = ">"
 	kvop               = "KV-Operation"
 	kvdel              = "DEL"
+	kvpurge            = "PURGE"
 )
 
 type KeyValueOp uint8
@@ -82,7 +83,24 @@ type KeyValueOp uint8
 const (
 	KeyValuePut KeyValueOp = iota
 	KeyValueDelete
+	KeyValuePurge
+	KeyValueWatchInit
 )
+
+func (op KeyValueOp) String() string {
+	switch op {
+	case KeyValuePut:
+		return "KeyValuePutOp"
+	case KeyValueDelete:
+		return "KeyValueDeleteOp"
+	case KeyValuePurge:
+		return "KeyValuePurgeOp"
+	case KeyValueWatchInit:
+		return "KeyValueWatchInitOp"
+	default:
+		return "Unknown Operation"
+	}
+}
 
 // KeyValueEntry is a retrieved entry for Get or List or Watch.
 type KeyValueEntry interface {
@@ -98,8 +116,12 @@ type KeyValueEntry interface {
 	Created() time.Time
 	// Delta is distance from the latest value.
 	Delta() uint64
-	// Operation returns Update or Delete
+	// Operation returns Put or Delete or Purge.
 	Operation() KeyValueOp
+
+	// WatchInitDone returns true if this entry signals the end
+	// of the initial values for a watch.
+	WatchInitDone() bool
 }
 
 // KeyValueUpdate is the callback handler for KeyValueEntry updates.
@@ -251,6 +273,7 @@ func (e *kve) Revision() uint64      { return e.revision }
 func (e *kve) Created() time.Time    { return e.created }
 func (e *kve) Delta() uint64         { return e.delta }
 func (e *kve) Operation() KeyValueOp { return e.op }
+func (e *kve) WatchInitDone() bool   { return e.op == KeyValueWatchInit }
 
 func keyValid(key string) bool {
 	if len(key) == 0 || key[0] == '.' || key[len(key)-1] == '.' {
@@ -286,9 +309,15 @@ func (kv *kvs) Get(key string) (KeyValueEntry, error) {
 	}
 
 	// Double check here that this is not a DEL Operation marker.
-	if len(m.Header) > 0 && m.Header.Get(kvop) == kvdel {
-		entry.op = KeyValueDelete
-		return entry, ErrKeyDeleted
+	if len(m.Header) > 0 {
+		switch m.Header.Get(kvop) {
+		case kvdel:
+			entry.op = KeyValueDelete
+			return entry, ErrKeyDeleted
+		case kvpurge:
+			entry.op = KeyValuePurge
+			return entry, ErrKeyDeleted
+		}
 	}
 
 	return entry, nil
@@ -366,9 +395,12 @@ func (kv *kvs) delete(key string, purge bool) error {
 
 	// DEL op marker. For watch functionality.
 	m := NewMsg(b.String())
-	m.Header.Set(kvop, kvdel)
+
 	if purge {
+		m.Header.Set(kvop, kvpurge)
 		m.Header.Set(MsgRollup, MsgRollupSubject)
+	} else {
+		m.Header.Set(kvop, kvdel)
 	}
 	_, err := kv.js.PublishMsg(m)
 	return err
@@ -452,14 +484,24 @@ func (kv *kvs) History(key string) ([]KeyValueEntry, error) {
 			}
 			subj := m.Subject[len(kv.pre):]
 			pending := tokens[ackNumPendingTokenPos]
-			vals = append(vals, &kve{
+			entry := &kve{
 				bucket:   kv.name,
 				key:      subj,
 				value:    m.Data,
 				revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
 				created:  time.Unix(0, parseNum(tokens[ackTimestampSeqTokenPos])),
 				delta:    uint64(parseNum(pending)),
-			})
+			}
+			if len(m.Header) > 0 {
+				switch m.Header.Get(kvop) {
+				case kvdel:
+					entry.op = KeyValueDelete
+				case kvpurge:
+					entry.op = KeyValuePurge
+				}
+			}
+			vals = append(vals, entry)
+
 			if pending == kvNoPending {
 				done <- nil
 			}
@@ -497,10 +539,22 @@ func (kv *kvs) WatchAll(cb KeyValueUpdate) (*Subscription, error) {
 // Watch will fire the callback when a key that matches the keys pattern is updated.
 // keys needs to be a valid NATS subject.
 func (kv *kvs) Watch(keys string, cb KeyValueUpdate) (*Subscription, error) {
+	var initDoneMarker bool
+
 	// Could be a pattern so don't check for validity as we normally do.
 	var b strings.Builder
 	b.WriteString(kv.pre)
 	b.WriteString(keys)
+	keys = b.String()
+
+	doInitMarker := func() {
+		initDoneMarker = true
+		cb(&kve{
+			bucket: kv.name,
+			key:    keys,
+			op:     KeyValueWatchInit,
+		})
+	}
 
 	update := func(m *Msg) {
 		tokens, err := getMetadataFields(m.Reply)
@@ -508,28 +562,43 @@ func (kv *kvs) Watch(keys string, cb KeyValueUpdate) (*Subscription, error) {
 			return
 		}
 		if len(m.Subject) <= len(kv.pre) {
-			//done <- ErrBadSubject
 			return
 		}
 		subj := m.Subject[len(kv.pre):]
 
 		var op KeyValueOp
-		if len(m.Header) > 0 && m.Header.Get(kvop) == kvdel {
-			op = KeyValueDelete
+		if len(m.Header) > 0 {
+			switch m.Header.Get(kvop) {
+			case kvdel:
+				op = KeyValueDelete
+			case kvpurge:
+				op = KeyValuePurge
+			}
 		}
-
+		delta := uint64(parseNum(tokens[ackNumPendingTokenPos]))
 		cb(&kve{
 			bucket:   kv.name,
 			key:      subj,
 			value:    m.Data,
 			revision: uint64(parseNum(tokens[ackStreamSeqTokenPos])),
 			created:  time.Unix(0, parseNum(tokens[ackTimestampSeqTokenPos])),
-			delta:    uint64(parseNum(tokens[ackNumPendingTokenPos])),
+			delta:    delta,
 			op:       op,
 		})
+
+		if !initDoneMarker && delta == 0 {
+			doInitMarker()
+		}
 	}
+
+	// Check if we have anything pending.
+	_, err := kv.js.GetLastMsg(kv.stream, keys)
+	if err == ErrMsgNotFound {
+		doInitMarker()
+	}
+
 	// Used ordered consumer to deliver results.
-	return kv.js.Subscribe(b.String(), update, OrderedConsumer(), DeliverLastPerSubject())
+	return kv.js.Subscribe(keys, update, OrderedConsumer(), DeliverLastPerSubject())
 }
 
 // Bucket returns the current bucket name (JetStream stream).

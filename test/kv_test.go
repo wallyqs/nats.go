@@ -159,6 +159,20 @@ func TestKeyValueWatch(t *testing.T) {
 			t.Fatalf("Did not receive an update like expected")
 		}
 	}
+	expectInitDone := func() {
+		t.Helper()
+		select {
+		case v := <-updates:
+			if !v.WatchInitDone() {
+				t.Fatalf("Did not get expected: %+v", v)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Did not receive a init done like expected")
+		}
+	}
+
+	// Make sure we already got an initial value marker.
+	expectInitDone()
 
 	kv.Create("name", []byte("derek"))
 	expectUpdate("name", "derek", 1)
@@ -190,6 +204,7 @@ func TestKeyValueWatch(t *testing.T) {
 
 	expectUpdate("t.name", "ik", 8)
 	expectUpdate("t.age", "44", 10)
+	expectInitDone()
 }
 
 func TestKeyValueBindStore(t *testing.T) {
@@ -270,10 +285,21 @@ func TestKeyValueDeleteVsPurge(t *testing.T) {
 		t.Fatalf("Expected 4 entries for age after delete, got %d", len(entries))
 	}
 	kv.Purge("name")
+	// Check marker
+	e, err := kv.Get("name")
+	expectErr(t, err, nats.ErrKeyDeleted)
+	// Also make sure op is purge
+	if e.Operation() != nats.KeyValuePurge {
+		t.Fatalf("Expected a purge operation but got %v", e.Operation())
+	}
 	entries, err = kv.History("name")
 	expectOk(t, err)
 	if len(entries) != 1 {
 		t.Fatalf("Expected only 1 entry for age after delete, got %d", len(entries))
+	}
+	// Make sure history also reports the purge operation.
+	if e := entries[0]; e.Operation() != nats.KeyValuePurge {
+		t.Fatalf("Expected a purge operation but got %v", e.Operation())
 	}
 }
 
