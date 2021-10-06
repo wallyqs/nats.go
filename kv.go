@@ -200,7 +200,7 @@ func (js *js) CreateKeyValue(cfg *KeyValueConfig) (KeyValue, error) {
 		MaxMsgSize:        cfg.MaxValueSize,
 		Storage:           cfg.Storage,
 		Replicas:          replicas,
-		RollupAllowed:     true,
+		AllowRollup:       true,
 		DenyDelete:        true,
 	}
 
