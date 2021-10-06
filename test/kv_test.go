@@ -163,7 +163,7 @@ func TestKeyValueWatch(t *testing.T) {
 		t.Helper()
 		select {
 		case v := <-updates:
-			if !v.WatchInitDone() {
+			if v != nil {
 				t.Fatalf("Did not get expected: %+v", v)
 			}
 		case <-time.After(time.Second):

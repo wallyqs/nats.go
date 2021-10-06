@@ -84,7 +84,6 @@ const (
 	KeyValuePut KeyValueOp = iota
 	KeyValueDelete
 	KeyValuePurge
-	KeyValueWatchInit
 )
 
 func (op KeyValueOp) String() string {
@@ -95,8 +94,6 @@ func (op KeyValueOp) String() string {
 		return "KeyValueDeleteOp"
 	case KeyValuePurge:
 		return "KeyValuePurgeOp"
-	case KeyValueWatchInit:
-		return "KeyValueWatchInitOp"
 	default:
 		return "Unknown Operation"
 	}
@@ -118,10 +115,6 @@ type KeyValueEntry interface {
 	Delta() uint64
 	// Operation returns Put or Delete or Purge.
 	Operation() KeyValueOp
-
-	// WatchInitDone returns true if this entry signals the end
-	// of the initial values for a watch.
-	WatchInitDone() bool
 }
 
 // KeyValueUpdate is the callback handler for KeyValueEntry updates.
@@ -273,7 +266,6 @@ func (e *kve) Revision() uint64      { return e.revision }
 func (e *kve) Created() time.Time    { return e.created }
 func (e *kve) Delta() uint64         { return e.delta }
 func (e *kve) Operation() KeyValueOp { return e.op }
-func (e *kve) WatchInitDone() bool   { return e.op == KeyValueWatchInit }
 
 func keyValid(key string) bool {
 	if len(key) == 0 || key[0] == '.' || key[len(key)-1] == '.' {
@@ -425,15 +417,16 @@ func (kv *kvs) PurgeDeletes() error {
 
 	done := make(chan error, 1)
 	sub, err := kv.WatchAll(func(v KeyValueEntry) {
+		if v == nil {
+			done <- nil
+			return
+		}
 		var b strings.Builder
 		b.WriteString(kv.pre)
 		b.WriteString(v.Key())
 		err := kv.js.purgeStream(kv.stream, &streamPurgeRequest{Subject: b.String()})
 		if err != nil {
 			done <- err
-		}
-		if v.Delta() == 0 {
-			done <- nil
 		}
 	})
 	if err != nil {
@@ -547,15 +540,6 @@ func (kv *kvs) Watch(keys string, cb KeyValueUpdate) (*Subscription, error) {
 	b.WriteString(keys)
 	keys = b.String()
 
-	doInitMarker := func() {
-		initDoneMarker = true
-		cb(&kve{
-			bucket: kv.name,
-			key:    keys,
-			op:     KeyValueWatchInit,
-		})
-	}
-
 	update := func(m *Msg) {
 		tokens, err := getMetadataFields(m.Reply)
 		if err != nil {
@@ -587,14 +571,16 @@ func (kv *kvs) Watch(keys string, cb KeyValueUpdate) (*Subscription, error) {
 		})
 
 		if !initDoneMarker && delta == 0 {
-			doInitMarker()
+			initDoneMarker = true
+			cb(nil)
 		}
 	}
 
 	// Check if we have anything pending.
 	_, err := kv.js.GetLastMsg(kv.stream, keys)
 	if err == ErrMsgNotFound {
-		doInitMarker()
+		initDoneMarker = true
+		cb(nil)
 	}
 
 	// Used ordered consumer to deliver results.
