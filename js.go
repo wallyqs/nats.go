@@ -2121,6 +2121,14 @@ func DeliverSubject(subject string) SubOpt {
 	})
 }
 
+// HeadersOnly() will instruct the consumer to only deleiver headers and no payloads.
+func HeadersOnly() SubOpt {
+	return subOptFn(func(opts *subOpts) error {
+		opts.cfg.HeadersOnly = true
+		return nil
+	})
+}
+
 func (sub *Subscription) ConsumerInfo() (*ConsumerInfo, error) {
 	sub.mu.Lock()
 	// TODO(dlc) - Better way to mark especially if we attach.

@@ -16,6 +16,7 @@ package test
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -284,7 +285,8 @@ func TestKeyValueDeleteVsPurge(t *testing.T) {
 	if len(entries) != 4 {
 		t.Fatalf("Expected 4 entries for age after delete, got %d", len(entries))
 	}
-	kv.Purge("name")
+	err = kv.Purge("name")
+	expectOk(t, err)
 	// Check marker
 	e, err := kv.Get("name")
 	expectErr(t, err, nats.ErrKeyDeleted)
@@ -336,6 +338,62 @@ func TestKeyValueDeleteTombstones(t *testing.T) {
 	expectOk(t, err)
 	if si.State.Msgs != 0 {
 		t.Fatalf("Expected no stream msgs to be left, got %d", si.State.Msgs)
+	}
+}
+
+func TestKeyValueKeys(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "KVS", History: 2})
+	expectOk(t, err)
+
+	put := func(key, value string) {
+		t.Helper()
+		_, err := kv.Put(key, []byte(value))
+		expectOk(t, err)
+	}
+
+	_, err = kv.Keys()
+	expectErr(t, err, nats.ErrNoKeysFound)
+
+	// Put in a few names and ages.
+	put("name", "derek")
+	put("age", "22")
+	put("country", "US")
+	put("name", "ivan")
+	put("age", "33")
+	put("country", "US")
+	put("name", "rip")
+	put("age", "44")
+	put("country", "MT")
+
+	keys, err := kv.Keys()
+	expectOk(t, err)
+
+	kmap := make(map[string]struct{})
+	for key := range keys {
+		if key == "" { // End of list
+			break
+		}
+		if _, ok := kmap[key]; ok {
+			t.Fatalf("Already saw %q", key)
+		}
+		kmap[key] = struct{}{}
+	}
+	if len(kmap) != 3 {
+		t.Fatalf("Expected 3 total keys, got %d", len(kmap))
+	}
+	expected := map[string]struct{}{
+		"name":    struct{}{},
+		"age":     struct{}{},
+		"country": struct{}{},
+	}
+	if !reflect.DeepEqual(kmap, expected) {
+		t.Fatalf("Expected %+v but got %+v", expected, kmap)
 	}
 }
 

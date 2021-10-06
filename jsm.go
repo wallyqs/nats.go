@@ -96,7 +96,7 @@ type StreamConfig struct {
 	Sealed            bool            `json:"sealed,omitempty"`
 	DenyDelete        bool            `json:"deny_delete,omitempty"`
 	DenyPurge         bool            `json:"deny_purge,omitempty"`
-	AllowRollup       bool            `json:"rollup_hdrs,omitempty"`
+	AllowRollup       bool            `json:"allow_rollup_hdrs,omitempty"`
 }
 
 // Placement is used to guide placement of streams in clustered JetStream.

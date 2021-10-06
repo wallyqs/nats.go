@@ -51,7 +51,9 @@ type KeyValue interface {
 	WatchAll(cb KeyValueUpdate) (*Subscription, error)
 	// Watch will invoke the callback for any keys that match keyPattern when they update.
 	Watch(keys string, cb KeyValueUpdate) (*Subscription, error)
-	// History will return all histroical values for the key.
+	// Keys() will return all keys
+	Keys() (<-chan string, error)
+	// History will return all historical values for the key.
 	History(key string) ([]KeyValueEntry, error)
 	// Bucket returns the current bucket name.
 	Bucket() string
@@ -130,6 +132,7 @@ var (
 	ErrKeyNotFound            = errors.New("nats: key not found")
 	ErrKeyDeleted             = errors.New("nats: key was deleted")
 	ErrHistoryToLarge         = errors.New("nats: history limited to a max of 64")
+	ErrNoKeysFound            = errors.New("nats: no keys found")
 )
 
 const (
@@ -441,6 +444,50 @@ func (kv *kvs) PurgeDeletes() error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Keys() will return all keys.
+func (kv *kvs) Keys() (<-chan string, error) {
+	_, err := kv.js.GetLastMsg(kv.stream, AllKeys)
+	if err != nil {
+		if err == ErrMsgNotFound {
+			err = ErrNoKeysFound
+		}
+		return nil, err
+	}
+
+	keys := make(chan string, 32)
+	cb := func(m *Msg) {
+		if len(m.Subject) <= len(kv.pre) {
+			keys <- _EMPTY_
+			m.Sub.Unsubscribe()
+			return
+		}
+		subj := m.Subject[len(kv.pre):]
+		keys <- subj
+
+		tokens, err := getMetadataFields(m.Reply)
+		if err != nil {
+			keys <- _EMPTY_
+			m.Sub.Unsubscribe()
+		}
+		pending := tokens[ackNumPendingTokenPos]
+		if pending == kvNoPending {
+			keys <- _EMPTY_
+			m.Sub.Unsubscribe()
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(kv.pre)
+	b.WriteString(AllKeys)
+
+	_, err = kv.js.Subscribe(b.String(), cb, OrderedConsumer(), DeliverLastPerSubject(), HeadersOnly())
+	if err != nil {
+		return nil, err
+	}
+
+	return keys, nil
 }
 
 // History will return all values for the key.
