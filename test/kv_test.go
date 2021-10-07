@@ -128,17 +128,14 @@ func TestKeyValueWatch(t *testing.T) {
 	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
 	expectOk(t, err)
 
-	updates := make(chan nats.KeyValueEntry, 32)
-	sub, err := kv.WatchAll(func(v nats.KeyValueEntry) {
-		updates <- v
-	})
+	watcher, err := kv.WatchAll()
 	expectOk(t, err)
-	defer sub.Unsubscribe()
+	defer watcher.Stop()
 
 	expectUpdate := func(key, value string, revision uint64) {
 		t.Helper()
 		select {
-		case v := <-updates:
+		case v := <-watcher.Updates():
 			if v.Key() != key || string(v.Value()) != value || v.Revision() != revision {
 				t.Fatalf("Did not get expected: %+v vs %q %q %d", v, key, value, revision)
 			}
@@ -149,7 +146,7 @@ func TestKeyValueWatch(t *testing.T) {
 	expectDelete := func(key string, revision uint64) {
 		t.Helper()
 		select {
-		case v := <-updates:
+		case v := <-watcher.Updates():
 			if v.Operation() != nats.KeyValueDelete {
 				t.Fatalf("Expected a delete operation but got %+v", v)
 			}
@@ -163,7 +160,7 @@ func TestKeyValueWatch(t *testing.T) {
 	expectInitDone := func() {
 		t.Helper()
 		select {
-		case v := <-updates:
+		case v := <-watcher.Updates():
 			if v != nil {
 				t.Fatalf("Did not get expected: %+v", v)
 			}
@@ -189,7 +186,7 @@ func TestKeyValueWatch(t *testing.T) {
 	expectDelete("age", 6)
 
 	// Stop first watcher.
-	sub.Unsubscribe()
+	watcher.Stop()
 
 	// Now try wildcard matching and make sure we only get last value when starting.
 	kv.Put("t.name", []byte("rip"))
@@ -197,11 +194,9 @@ func TestKeyValueWatch(t *testing.T) {
 	kv.Put("t.age", []byte("22"))
 	kv.Put("t.age", []byte("44"))
 
-	sub, err = kv.Watch("t.*", func(v nats.KeyValueEntry) {
-		updates <- v
-	})
+	watcher, err = kv.Watch("t.*")
 	expectOk(t, err)
-	defer sub.Unsubscribe()
+	defer watcher.Stop()
 
 	expectUpdate("t.name", "ik", 8)
 	expectUpdate("t.age", "44", 10)
@@ -375,10 +370,7 @@ func TestKeyValueKeys(t *testing.T) {
 	expectOk(t, err)
 
 	kmap := make(map[string]struct{})
-	for key := range keys {
-		if key == "" { // End of list
-			break
-		}
+	for _, key := range keys {
 		if _, ok := kmap[key]; ok {
 			t.Fatalf("Already saw %q", key)
 		}
@@ -405,10 +397,7 @@ func TestKeyValueKeys(t *testing.T) {
 	expectOk(t, err)
 
 	kmap = make(map[string]struct{})
-	for key := range keys {
-		if key == "" { // End of list
-			break
-		}
+	for _, key := range keys {
 		if _, ok := kmap[key]; ok {
 			t.Fatalf("Already saw %q", key)
 		}
