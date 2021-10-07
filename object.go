@@ -323,9 +323,7 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader) (*ObjectInfo, error) {
 
 	// Publish the metadata.
 	mm := NewMsg(metaSubj)
-	if einfo != nil {
-		mm.Header.Set(MsgRollup, MsgRollupSubject)
-	}
+	mm.Header.Set(MsgRollup, MsgRollupSubject)
 	mm.Data, err = json.Marshal(info)
 	if err != nil {
 		if r != nil {
