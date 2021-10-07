@@ -50,9 +50,9 @@ type KeyValue interface {
 	Purge(key string) error
 	// Watch for any updates to keys that match the keys argument which could include wildcards.
 	// Watch will send a nil entry when it has received all initial values.
-	Watch(keys string, opts ...WatchOpt) (Watcher, error)
+	Watch(keys string, opts ...WatchOpt) (KeyWatcher, error)
 	// WatchAll will invoke the callback for all updates.
-	WatchAll(opts ...WatchOpt) (Watcher, error)
+	WatchAll(opts ...WatchOpt) (KeyWatcher, error)
 	// Keys will return all keys.
 	Keys(opts ...WatchOpt) ([]string, error)
 	// History will return all historical values for the key.
@@ -63,8 +63,8 @@ type KeyValue interface {
 	PurgeDeletes(opts ...WatchOpt) error
 }
 
-// Watch is what is returned when doing a watch.
-type Watcher interface {
+// KeyWatcher is what is returned when doing a watch.
+type KeyWatcher interface {
 	// Updates returns a channel to read any updates to entries.
 	Updates() <-chan KeyValueEntry
 	// Stop() will stop this watcher.
@@ -543,13 +543,13 @@ func (w *watcher) Stop() error {
 }
 
 // WatchAll watches all keys.
-func (kv *kvs) WatchAll(opts ...WatchOpt) (Watcher, error) {
+func (kv *kvs) WatchAll(opts ...WatchOpt) (KeyWatcher, error) {
 	return kv.Watch(AllKeys, opts...)
 }
 
 // Watch will fire the callback when a key that matches the keys pattern is updated.
 // keys needs to be a valid NATS subject.
-func (kv *kvs) Watch(keys string, opts ...WatchOpt) (Watcher, error) {
+func (kv *kvs) Watch(keys string, opts ...WatchOpt) (KeyWatcher, error) {
 	var o watchOpts
 	for _, opt := range opts {
 		if opt != nil {
