@@ -73,8 +73,8 @@ type ObjectStore interface {
 	// AddLink will add a link to another object into this object store.
 	AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error)
 
-	// AddBucket will add a link to another object store.
-	AddBucket(name string, bucket ObjectStore) (*ObjectInfo, error)
+	// AddBucketLink will add a link to another object store.
+	AddBucketLink(name string, bucket ObjectStore) (*ObjectInfo, error)
 
 	// Seal will seal the object store, no further modifications will be allowed.
 	Seal() error
@@ -86,12 +86,12 @@ type ObjectStore interface {
 type ObjectStoreUpdate func(meta *ObjectInfo)
 
 var (
-	ErrObjectConfigRequired = errors.New("nats: config required")
+	ErrObjectConfigRequired = errors.New("nats: object-store config required")
+	ErrBadObjectMeta        = errors.New("nats: object-store meta information invalid")
 	ErrObjectNotFound       = errors.New("nats: object not found")
-	ErrBadObjectMeta        = errors.New("nats: object stream meta information invalid")
 	ErrInvalidStoreName     = errors.New("nats: invalid object-store name")
 	ErrInvalidObjectName    = errors.New("nats: invalid object name")
-	ErrDigestMismatch       = errors.New("nats: received corrupt object, digests do not match")
+	ErrDigestMismatch       = errors.New("nats: received a corrupt object, digests do not match")
 )
 
 // ObjectStoreConfig is the config for the object store.
@@ -169,7 +169,7 @@ type obs struct {
 // CreateObjectStore will create an object store.
 func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 	if !js.nc.serverMinVersion(2, 6, 2) {
-		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
+		return nil, errors.New("nats: object-store requires at least server version 2.6.2")
 	}
 	if cfg == nil {
 		return nil, ErrObjectConfigRequired
@@ -521,8 +521,8 @@ func (obs *obs) AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error) {
 	return obs.Put(meta, nil)
 }
 
-// AddBucket will add a link to another object store.
-func (ob *obs) AddBucket(name string, bucket ObjectStore) (*ObjectInfo, error) {
+// AddBucketLink will add a link to another object store.
+func (ob *obs) AddBucketLink(name string, bucket ObjectStore) (*ObjectInfo, error) {
 	if bucket == nil {
 		return nil, errors.New("nats: bucket required")
 	}

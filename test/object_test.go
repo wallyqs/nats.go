@@ -448,7 +448,7 @@ func TestObjectLinks(t *testing.T) {
 	}
 
 	// Now add whole other store as a link, like a directory.
-	_, err = root.AddBucket("dir", dir)
+	_, err = root.AddBucketLink("dir", dir)
 	expectOk(t, err)
 
 	// Now try to get a linked object.
