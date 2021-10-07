@@ -335,17 +335,14 @@ func TestObjectWatch(t *testing.T) {
 	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "WATCH-TEST"})
 	expectOk(t, err)
 
-	updates := make(chan *nats.ObjectInfo, 32)
-	sub, err := obs.Watch(func(meta *nats.ObjectInfo) {
-		updates <- meta
-	})
+	watcher, err := obs.Watch()
 	expectOk(t, err)
-	defer sub.Unsubscribe()
+	defer watcher.Stop()
 
 	expectUpdate := func(name string) {
 		t.Helper()
 		select {
-		case info := <-updates:
+		case info := <-watcher.Updates():
 			if false && info.Name != name {
 				t.Fatalf("Expected update for %q, but got %+v", name, info)
 			}
@@ -357,7 +354,7 @@ func TestObjectWatch(t *testing.T) {
 	expectNoMoreUpdates := func() {
 		t.Helper()
 		select {
-		case info := <-updates:
+		case info := <-watcher.Updates():
 			t.Fatalf("Got an unexpected update: %+v", info)
 		case <-time.After(100 * time.Millisecond):
 		}
@@ -366,7 +363,7 @@ func TestObjectWatch(t *testing.T) {
 	expectInitDone := func() {
 		t.Helper()
 		select {
-		case info := <-updates:
+		case info := <-watcher.Updates():
 			if info != nil {
 				t.Fatalf("Did not get expected: %+v", info)
 			}
@@ -521,10 +518,7 @@ func TestObjectList(t *testing.T) {
 	expectOk(t, err)
 
 	omap := make(map[string]struct{})
-	for info := range lch {
-		if info == nil { // eof
-			break
-		}
+	for _, info := range lch {
 		if _, ok := omap[info.Name]; ok {
 			t.Fatalf("Already saw %q", info.Name)
 		}

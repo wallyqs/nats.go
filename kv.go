@@ -100,7 +100,7 @@ func (opt watchOptFn) configureWatcher(opts *watchOpts) error {
 	return opt(opts)
 }
 
-// IncludeHistory instructs the watche to include historical values as well.
+// IncludeHistory instructs the key watcher to include historical values as well.
 func IncludeHistory() WatchOpt {
 	return watchOptFn(func(opts *watchOpts) error {
 		opts.includeHistory = true
@@ -108,7 +108,7 @@ func IncludeHistory() WatchOpt {
 	})
 }
 
-// IgnoreDeletes will have the watcher not pass delete markers.
+// IgnoreDeletes will have the key watcher not pass any deleted keys.
 func IgnoreDeletes() WatchOpt {
 	return watchOptFn(func(opts *watchOpts) error {
 		opts.ignoreDeletes = true

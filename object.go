@@ -30,6 +30,9 @@ import (
 	"github.com/nats-io/nuid"
 )
 
+// Notice: Experimental Preview
+//
+// This functionality is EXPERIMENTAL and may be changed in later releases.
 type ObjectStoreManager interface {
 	// ObjectStore will lookup and bind to an existing object store instance.
 	ObjectStore(bucket string) (ObjectStore, error)
@@ -39,13 +42,14 @@ type ObjectStoreManager interface {
 	DeleteObjectStore(bucket string) error
 }
 
+// Notice: Experimental Preview
+//
+// This functionality is EXPERIMENTAL and may be changed in later releases.
 type ObjectStore interface {
 	// Put will place the contents from the reader into a new object.
 	Put(obj *ObjectMeta, reader io.Reader) (*ObjectInfo, error)
 	// Get will pull the named object from the object store.
 	Get(name string) (ObjectResult, error)
-
-	// Convenience functions for low level Put and Get.
 
 	// PutBytes is convenience function to put a byte slice into this object store.
 	PutBytes(name string, data []byte) (*ObjectInfo, error)
@@ -80,13 +84,19 @@ type ObjectStore interface {
 	Seal() error
 
 	// Watch for changes in the underlying store and receive meta information updates.
-	Watch(cb ObjectStoreUpdate) (*Subscription, error)
+	Watch(opts ...WatchOpt) (ObjectWatcher, error)
 
 	// List will list all the objects in this store.
-	List() (<-chan *ObjectInfo, error)
+	List(opts ...WatchOpt) ([]*ObjectInfo, error)
 }
 
-type ObjectStoreUpdate func(meta *ObjectInfo)
+// ObjectWatcher is what is returned when doing a watch.
+type ObjectWatcher interface {
+	// Updates returns a channel to read any updates to entries.
+	Updates() <-chan *ObjectInfo
+	// Stop() will stop this watcher.
+	Stop() error
+}
 
 var (
 	ErrObjectConfigRequired = errors.New("nats: object-store config required")
@@ -677,9 +687,42 @@ func (obs *obs) Seal() error {
 	return err
 }
 
+// Implementation for Watch
+type objWatcher struct {
+	updates chan *ObjectInfo
+	sub     *Subscription
+}
+
+// Updates returns the interior channel.
+func (w *objWatcher) Updates() <-chan *ObjectInfo {
+	if w == nil {
+		return nil
+	}
+	return w.updates
+}
+
+// Stop will unsubscribe from the watcher.
+func (w *objWatcher) Stop() error {
+	if w == nil {
+		return nil
+	}
+	return w.sub.Unsubscribe()
+}
+
 // Watch for changes in the underlying store and receive meta information updates.
-func (obs *obs) Watch(cb ObjectStoreUpdate) (*Subscription, error) {
+func (obs *obs) Watch(opts ...WatchOpt) (ObjectWatcher, error) {
+	var o watchOpts
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt.configureWatcher(&o); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	var initDoneMarker bool
+
+	w := &objWatcher{updates: make(chan *ObjectInfo, 32)}
 
 	update := func(m *Msg) {
 		var info ObjectInfo
@@ -691,56 +734,55 @@ func (obs *obs) Watch(cb ObjectStoreUpdate) (*Subscription, error) {
 			return
 		}
 
-		info.ModTime = meta.Timestamp
-		cb(&info)
+		if !o.ignoreDeletes || !info.Deleted {
+			info.ModTime = meta.Timestamp
+			w.updates <- &info
+		}
 
 		if !initDoneMarker && meta.NumPending == 0 {
 			initDoneMarker = true
-			cb(nil)
+			w.updates <- nil
 		}
 	}
-	// Used ordered consumer to deliver results.
+
 	allMeta := fmt.Sprintf(objAllMetaPreTmpl, obs.name)
 	_, err := obs.js.GetLastMsg(obs.stream, allMeta)
 	if err == ErrMsgNotFound {
 		initDoneMarker = true
-		cb(nil)
+		w.updates <- nil
 	}
 
-	return obs.js.Subscribe(allMeta, update, OrderedConsumer(), DeliverLastPerSubject())
+	// Used ordered consumer to deliver results.
+	subOpts := []SubOpt{OrderedConsumer()}
+	if !o.includeHistory {
+		subOpts = append(subOpts, DeliverLastPerSubject())
+	}
+	sub, err := obs.js.Subscribe(allMeta, update, subOpts...)
+	if err != nil {
+		return nil, err
+	}
+	w.sub = sub
+	return w, nil
 }
 
 // List will list all the objects in this store.
-func (obs *obs) List() (<-chan *ObjectInfo, error) {
-	allMeta := fmt.Sprintf(objAllMetaPreTmpl, obs.name)
-	_, err := obs.js.GetLastMsg(obs.stream, allMeta)
-	if err == ErrMsgNotFound {
-		return nil, ErrNoObjectsFound
-	}
-
-	objs := make(chan *ObjectInfo, 32)
-	cb := func(m *Msg) {
-		var info ObjectInfo
-		if err := json.Unmarshal(m.Data, &info); err != nil {
-			return // TODO(dlc) - Communicate this upwards?
-		}
-		meta, err := m.Metadata()
-		if err != nil {
-			return
-		}
-		if !info.Deleted {
-			info.ModTime = meta.Timestamp
-			objs <- &info
-		}
-		if meta.NumPending == 0 {
-			objs <- nil
-			m.Sub.Unsubscribe()
-		}
-	}
-
-	_, err = obs.js.Subscribe(allMeta, cb, OrderedConsumer(), DeliverLastPerSubject())
+func (obs *obs) List(opts ...WatchOpt) ([]*ObjectInfo, error) {
+	opts = append(opts, IgnoreDeletes())
+	watcher, err := obs.Watch(opts...)
 	if err != nil {
 		return nil, err
+	}
+	defer watcher.Stop()
+
+	var objs []*ObjectInfo
+	for entry := range watcher.Updates() {
+		if entry == nil {
+			break
+		}
+		objs = append(objs, entry)
+	}
+	if len(objs) == 0 {
+		return nil, ErrNoObjectsFound
 	}
 	return objs, nil
 }
