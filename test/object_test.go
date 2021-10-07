@@ -15,9 +15,7 @@ package test
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
-	"io"
 	"io/ioutil"
 	"os"
 	"path"
@@ -538,59 +536,4 @@ func TestObjectList(t *testing.T) {
 	if !reflect.DeepEqual(omap, expected) {
 		t.Fatalf("Expected %+v but got %+v", expected, omap)
 	}
-}
-
-func TestObjectContextOpt(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	defer shutdown(s)
-
-	nc, js := jsClient(t, s)
-	defer nc.Close()
-
-	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
-	expectOk(t, err)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	time.AfterFunc(100*time.Millisecond, cancel)
-
-	start := time.Now()
-	_, err = obs.Put(&nats.ObjectMeta{Name: "TEST"}, &slow{1000}, nats.Context(ctx))
-	expectErr(t, err)
-	if delta := time.Since(start); delta > time.Second {
-		t.Fatalf("Cancel took too long: %v", delta)
-	}
-	si, err := js.StreamInfo("OBJ_OBJS")
-	expectOk(t, err)
-	if si.State.Msgs != 0 {
-		t.Fatalf("Expected no messages after canceling put, got %+v", si.State)
-	}
-
-	// Now put a large object in there.
-	blob := make([]byte, 8*1024*1024)
-	rand.Read(blob)
-	_, err = obs.PutBytes("BLOB", blob)
-	expectOk(t, err)
-
-	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	time.AfterFunc(100*time.Millisecond, cancel)
-
-	time.AfterFunc(20*time.Millisecond, func() { shutdown(s) })
-	start = time.Now()
-	_, err = obs.GetBytes("BLOB", nats.Context(ctx))
-	expectErr(t, err)
-	if delta := time.Since(start); delta > time.Second {
-		t.Fatalf("Cancel took too long: %v", delta)
-	}
-}
-
-type slow struct{ n int }
-
-func (sr *slow) Read(p []byte) (n int, err error) {
-	if sr.n <= 0 {
-		return 0, io.EOF
-	}
-	sr.n--
-	time.Sleep(10 * time.Millisecond)
-	p[0] = 'A'
-	return 1, nil
 }
