@@ -463,15 +463,26 @@ func (kv *kvs) Keys() (<-chan string, error) {
 			m.Sub.Unsubscribe()
 			return
 		}
-		subj := m.Subject[len(kv.pre):]
-		keys <- subj
-
 		tokens, err := getMetadataFields(m.Reply)
 		if err != nil {
 			keys <- _EMPTY_
 			m.Sub.Unsubscribe()
 		}
 		pending := tokens[ackNumPendingTokenPos]
+
+		// Check for purged keys, etc.
+		if len(m.Header) > 0 {
+			// Ignore deleted or purged keys.
+			if op := m.Header.Get(kvop); op == kvdel || op == kvpurge {
+				if pending == kvNoPending {
+					keys <- _EMPTY_
+					m.Sub.Unsubscribe()
+				}
+				return
+			}
+		}
+		// Grab correct key by stripping prefix.
+		keys <- m.Subject[len(kv.pre):]
 		if pending == kvNoPending {
 			keys <- _EMPTY_
 			m.Sub.Unsubscribe()

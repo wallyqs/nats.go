@@ -395,6 +395,31 @@ func TestKeyValueKeys(t *testing.T) {
 	if !reflect.DeepEqual(kmap, expected) {
 		t.Fatalf("Expected %+v but got %+v", expected, kmap)
 	}
+	// Make sure delete and purge do the right thing and not return the keys.
+	err = kv.Delete("name")
+	expectOk(t, err)
+	err = kv.Purge("country")
+	expectOk(t, err)
+
+	keys, err = kv.Keys()
+	expectOk(t, err)
+
+	kmap = make(map[string]struct{})
+	for key := range keys {
+		if key == "" { // End of list
+			break
+		}
+		if _, ok := kmap[key]; ok {
+			t.Fatalf("Already saw %q", key)
+		}
+		kmap[key] = struct{}{}
+	}
+	if len(kmap) != 1 {
+		t.Fatalf("Expected 1 total key, got %d", len(kmap))
+	}
+	if _, ok := kmap["age"]; !ok {
+		t.Fatalf("Expected %q to be only key present", "age")
+	}
 }
 
 // Helpers
