@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -468,7 +469,6 @@ func TestObjectHistory(t *testing.T) {
 	nc, js := jsClient(t, s)
 	defer nc.Close()
 
-	// No history.
 	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
 	expectOk(t, err)
 
@@ -485,5 +485,61 @@ func TestObjectHistory(t *testing.T) {
 	if si.State.Msgs != 2 {
 		t.Fatalf("Expected 2 msgs (1 data 1 meta) but got %d", si.State.Msgs)
 	}
+}
 
+func TestObjectList(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	root, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "ROOT"})
+	expectOk(t, err)
+
+	put := func(name, value string) {
+		_, err = root.PutString(name, value)
+		expectOk(t, err)
+	}
+
+	put("A", "AAA")
+	put("B", "BBB")
+	put("C", "CCC")
+	put("B", "bbb")
+
+	// Self link
+	info, err := root.GetInfo("B")
+	expectOk(t, err)
+	_, err = root.AddLink("b", info)
+	expectOk(t, err)
+
+	put("D", "DDD")
+	err = root.Delete("D")
+	expectOk(t, err)
+
+	lch, err := root.List()
+	expectOk(t, err)
+
+	omap := make(map[string]struct{})
+	for info := range lch {
+		if info == nil { // eof
+			break
+		}
+		if _, ok := omap[info.Name]; ok {
+			t.Fatalf("Already saw %q", info.Name)
+		}
+		omap[info.Name] = struct{}{}
+	}
+	if len(omap) != 4 {
+		t.Fatalf("Expected 4 total objects, got %d", len(omap))
+	}
+	expected := map[string]struct{}{
+		"A": struct{}{},
+		"B": struct{}{},
+		"C": struct{}{},
+		"b": struct{}{},
+	}
+	if !reflect.DeepEqual(omap, expected) {
+		t.Fatalf("Expected %+v but got %+v", expected, omap)
+	}
 }

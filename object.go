@@ -81,6 +81,9 @@ type ObjectStore interface {
 
 	// Watch for changes in the underlying store and receive meta information updates.
 	Watch(cb ObjectStoreUpdate) (*Subscription, error)
+
+	// List will list all the objects in this store.
+	List() (<-chan *ObjectInfo, error)
 }
 
 type ObjectStoreUpdate func(meta *ObjectInfo)
@@ -92,6 +95,7 @@ var (
 	ErrInvalidStoreName     = errors.New("nats: invalid object-store name")
 	ErrInvalidObjectName    = errors.New("nats: invalid object name")
 	ErrDigestMismatch       = errors.New("nats: received a corrupt object, digests do not match")
+	ErrNoObjectsFound       = errors.New("nats: no objects found")
 )
 
 // ObjectStoreConfig is the config for the object store.
@@ -706,6 +710,41 @@ func (obs *obs) Watch(cb ObjectStoreUpdate) (*Subscription, error) {
 	}
 
 	return obs.js.Subscribe(allMeta, update, OrderedConsumer(), DeliverLastPerSubject())
+}
+
+// List will list all the objects in this store.
+func (obs *obs) List() (<-chan *ObjectInfo, error) {
+	allMeta := fmt.Sprintf(objAllMetaPreTmpl, obs.name)
+	_, err := obs.js.GetLastMsg(obs.stream, allMeta)
+	if err == ErrMsgNotFound {
+		return nil, ErrNoObjectsFound
+	}
+
+	objs := make(chan *ObjectInfo, 32)
+	cb := func(m *Msg) {
+		var info ObjectInfo
+		if err := json.Unmarshal(m.Data, &info); err != nil {
+			return // TODO(dlc) - Communicate this upwards?
+		}
+		meta, err := m.Metadata()
+		if err != nil {
+			return
+		}
+		if !info.Deleted {
+			info.ModTime = meta.Timestamp
+			objs <- &info
+		}
+		if meta.NumPending == 0 {
+			objs <- nil
+			m.Sub.Unsubscribe()
+		}
+	}
+
+	_, err = obs.js.Subscribe(allMeta, cb, OrderedConsumer(), DeliverLastPerSubject())
+	if err != nil {
+		return nil, err
+	}
+	return objs, nil
 }
 
 // Read impl.
