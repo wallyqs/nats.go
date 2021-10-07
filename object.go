@@ -86,9 +86,12 @@ type ObjectStore interface {
 type ObjectStoreUpdate func(meta *ObjectInfo)
 
 var (
-	errBadMeta        = errors.New("nats: object stream meta information invalid")
-	errBadObjectName  = errors.New("nats: invalid object name")
-	errDigestMismatch = errors.New("nats: received corrupt object, digests do not match")
+	ErrObjectConfigRequired = errors.New("nats: config required")
+	ErrObjectNotFound       = errors.New("nats: object not found")
+	ErrBadObjectMeta        = errors.New("nats: object stream meta information invalid")
+	ErrInvalidStoreName     = errors.New("nats: invalid object-store name")
+	ErrInvalidObjectName    = errors.New("nats: invalid object name")
+	ErrDigestMismatch       = errors.New("nats: received corrupt object, digests do not match")
 )
 
 // ObjectStoreConfig is the config for the object store.
@@ -168,8 +171,11 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 	if !js.nc.serverMinVersion(2, 6, 2) {
 		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
 	}
-	if cfg == nil || cfg.Bucket == _EMPTY_ {
-		return nil, ErrStreamNameRequired
+	if cfg == nil {
+		return nil, ErrObjectConfigRequired
+	}
+	if !validBucketRe.MatchString(cfg.Bucket) {
+		return nil, ErrInvalidStoreName
 	}
 
 	name := cfg.Bucket
@@ -184,6 +190,7 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 		Storage:     cfg.Storage,
 		Replicas:    cfg.Replicas,
 		Discard:     DiscardNew,
+		AllowRollup: true,
 	}
 
 	// Create our stream.
@@ -197,6 +204,9 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 
 // ObjectStore will lookup and bind to an existing object store instance.
 func (js *js) ObjectStore(bucket string) (ObjectStore, error) {
+	if !validBucketRe.MatchString(bucket) {
+		return nil, ErrInvalidStoreName
+	}
 	if !js.nc.serverMinVersion(2, 6, 2) {
 		return nil, errors.New("nats: key-value requires at least server version 2.6.2")
 	}
@@ -215,20 +225,6 @@ func (js *js) DeleteObjectStore(bucket string) error {
 	return js.DeleteStream(stream)
 }
 
-func nameOk(name string) bool {
-	if len(name) == 0 {
-		return false
-	} else if len(name) == 1 {
-		if name == "*" || name == ">" {
-			return false
-		}
-	}
-	if strings.ContainsAny(name, " \t\r\n.") {
-		return false
-	}
-	return true
-}
-
 func sanitizeName(name string) string {
 	stream := strings.ReplaceAll(name, ".", "_")
 	return strings.ReplaceAll(stream, " ", "_")
@@ -237,11 +233,18 @@ func sanitizeName(name string) string {
 // PutObject will place the contents from the reader into a new stream.
 func (obs *obs) Put(meta *ObjectMeta, r io.Reader) (*ObjectInfo, error) {
 	if meta == nil {
-		return nil, errBadMeta
+		return nil, ErrBadObjectMeta
 	}
+
 	obj := sanitizeName(meta.Name)
-	if !nameOk(obj) {
-		return nil, errBadObjectName
+	if !keyValid(obj) {
+		return nil, ErrInvalidObjectName
+	}
+
+	// Grab existing meta info.
+	einfo, err := obs.GetInfo(meta.Name)
+	if err != nil && err != ErrObjectNotFound {
+		return nil, err
 	}
 
 	// Create a random subject prefixed with the object stream name.
@@ -316,6 +319,9 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader) (*ObjectInfo, error) {
 
 	// Publish the metadata.
 	mm := NewMsg(metaSubj)
+	if einfo != nil {
+		mm.Header.Set(MsgRollup, MsgRollupSubject)
+	}
 	mm.Data, err = json.Marshal(info)
 	if err != nil {
 		if r != nil {
@@ -323,6 +329,7 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader) (*ObjectInfo, error) {
 		}
 		return nil, err
 	}
+	// Send meta message.
 	_, err = js.PublishMsgAsync(mm)
 	if err != nil {
 		if r != nil {
@@ -335,12 +342,20 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader) (*ObjectInfo, error) {
 	select {
 	case <-js.PublishAsyncComplete():
 		if err := getErr(); err != nil {
+			purgePartial()
 			return nil, err
 		}
 	case <-time.After(obs.js.opts.wait):
 		return nil, ErrTimeout
 	}
 	info.ModTime = time.Now().UTC()
+
+	// Delete any original one.
+	if einfo != nil && !einfo.Deleted {
+		chunkSubj := fmt.Sprintf(objChunksPreTmpl, obs.name, einfo.NUID)
+		obs.js.purgeStream(obs.stream, &streamPurgeRequest{Subject: chunkSubj})
+	}
+
 	return info, nil
 }
 
@@ -364,7 +379,7 @@ func (obs *obs) Get(name string) (ObjectResult, error) {
 		return nil, err
 	}
 	if info.NUID == _EMPTY_ {
-		return nil, errBadMeta
+		return nil, ErrBadObjectMeta
 	}
 
 	// Check for object links.If single objects we do a pass through.
@@ -428,7 +443,7 @@ func (obs *obs) Get(name string) (ObjectResult, error) {
 				return
 			}
 			if !bytes.Equal(sha[:], rsha) {
-				gotErr(m, errDigestMismatch)
+				gotErr(m, ErrDigestMismatch)
 				return
 			}
 		}
@@ -451,7 +466,7 @@ func (obs *obs) Delete(name string) error {
 		return err
 	}
 	if info.NUID == _EMPTY_ {
-		return errBadMeta
+		return ErrBadObjectMeta
 	}
 
 	// Place a rollup delete marker.
@@ -483,6 +498,11 @@ func (obs *obs) AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error) {
 	if obj.Deleted {
 		return nil, errors.New("nats: object is deleted")
 	}
+	name = sanitizeName(name)
+	if !keyValid(name) {
+		return nil, ErrInvalidObjectName
+	}
+
 	// Same object store.
 	if obj.Bucket == obs.name {
 		info := *obj
@@ -506,6 +526,11 @@ func (ob *obs) AddBucket(name string, bucket ObjectStore) (*ObjectInfo, error) {
 	if bucket == nil {
 		return nil, errors.New("nats: bucket required")
 	}
+	name = sanitizeName(name)
+	if !keyValid(name) {
+		return nil, ErrInvalidObjectName
+	}
+
 	bos, ok := bucket.(*obs)
 	if !ok {
 		return nil, errors.New("nats: bucket malformed")
@@ -592,8 +617,8 @@ func (obs *obs) GetFile(name, file string) error {
 func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
 	// Lookup the stream to get the bound subject.
 	obj := sanitizeName(name)
-	if !nameOk(obj) {
-		return nil, errBadObjectName
+	if !keyValid(obj) {
+		return nil, ErrInvalidObjectName
 	}
 
 	// Grab last meta value we have.
@@ -602,11 +627,14 @@ func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
 
 	m, err := obs.js.GetLastMsg(stream, meta)
 	if err != nil {
+		if err == ErrMsgNotFound {
+			err = ErrObjectNotFound
+		}
 		return nil, err
 	}
 	var info ObjectInfo
 	if err := json.Unmarshal(m.Data, &info); err != nil {
-		return nil, errBadMeta
+		return nil, ErrBadObjectMeta
 	}
 	info.ModTime = m.Time
 	return &info, nil
@@ -615,7 +643,7 @@ func (obs *obs) GetInfo(name string) (*ObjectInfo, error) {
 // UpdateMeta will update the meta data for the object.
 func (obs *obs) UpdateMeta(name string, meta *ObjectMeta) error {
 	if meta == nil {
-		return errBadMeta
+		return ErrBadObjectMeta
 	}
 	// Grab meta info.
 	info, err := obs.GetInfo(name)
@@ -649,18 +677,34 @@ func (obs *obs) Seal() error {
 
 // Watch for changes in the underlying store and receive meta information updates.
 func (obs *obs) Watch(cb ObjectStoreUpdate) (*Subscription, error) {
+	var initDoneMarker bool
+
 	update := func(m *Msg) {
 		var info ObjectInfo
 		if err := json.Unmarshal(m.Data, &info); err != nil {
 			return // TODO(dlc) - Communicate this upwards?
 		}
-		if meta, err := m.Metadata(); err == nil {
-			info.ModTime = meta.Timestamp
+		meta, err := m.Metadata()
+		if err != nil {
+			return
 		}
+
+		info.ModTime = meta.Timestamp
 		cb(&info)
+
+		if !initDoneMarker && meta.NumPending == 0 {
+			initDoneMarker = true
+			cb(nil)
+		}
 	}
 	// Used ordered consumer to deliver results.
 	allMeta := fmt.Sprintf(objAllMetaPreTmpl, obs.name)
+	_, err := obs.js.GetLastMsg(obs.stream, allMeta)
+	if err == ErrMsgNotFound {
+		initDoneMarker = true
+		cb(nil)
+	}
+
 	return obs.js.Subscribe(allMeta, update, OrderedConsumer(), DeliverLastPerSubject())
 }
 

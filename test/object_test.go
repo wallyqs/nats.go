@@ -334,12 +334,6 @@ func TestObjectWatch(t *testing.T) {
 	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "WATCH-TEST"})
 	expectOk(t, err)
 
-	_, err = obs.PutString("A", "AAA")
-	expectOk(t, err)
-
-	_, err = obs.PutString("B", "BBB")
-	expectOk(t, err)
-
 	updates := make(chan *nats.ObjectInfo, 32)
 	sub, err := obs.Watch(func(meta *nats.ObjectInfo) {
 		updates <- meta
@@ -367,6 +361,26 @@ func TestObjectWatch(t *testing.T) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+
+	expectInitDone := func() {
+		t.Helper()
+		select {
+		case info := <-updates:
+			if info != nil {
+				t.Fatalf("Did not get expected: %+v", info)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Did not receive a init done like expected")
+		}
+	}
+
+	// We should get a marker that is nil when all initital values are delivered.
+	expectInitDone()
+
+	_, err = obs.PutString("A", "AAA")
+	expectOk(t, err)
+	_, err = obs.PutString("B", "BBB")
+	expectOk(t, err)
 
 	// Initial Values.
 	expectUpdate("A")
@@ -444,4 +458,32 @@ func TestObjectLinks(t *testing.T) {
 	if dbl != "DIR-BBB" {
 		t.Fatalf("Expected %q but got %q", "DIR-BBB", dbl)
 	}
+}
+
+// Right now no history, just make sure we are cleaning up after ourselves.
+func TestObjectHistory(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdown(s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	// No history.
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: "OBJS"})
+	expectOk(t, err)
+
+	_, err = obs.PutBytes("A", bytes.Repeat([]byte("A"), 100))
+	expectOk(t, err)
+
+	_, err = obs.PutBytes("A", bytes.Repeat([]byte("a"), 100))
+	expectOk(t, err)
+
+	// Should only be 1 copy of 'A', so 1 data and 1 meta since history was not selected.
+	si, err := js.StreamInfo("OBJ_OBJS")
+	expectOk(t, err)
+
+	if si.State.Msgs != 2 {
+		t.Fatalf("Expected 2 msgs (1 data 1 meta) but got %d", si.State.Msgs)
+	}
+
 }
