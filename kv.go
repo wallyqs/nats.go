@@ -23,6 +23,9 @@ import (
 	"time"
 )
 
+// Notice: Experimental Preview
+//
+// This functionality is EXPERIMENTAL and may be changed in later releases.
 type KeyValueManager interface {
 	// KeyValue will lookup and bind to an existing KeyValue store.
 	KeyValue(bucket string) (KeyValue, error)
@@ -40,6 +43,8 @@ type KeyValue interface {
 	Get(key string) (entry KeyValueEntry, err error)
 	// Put will place the new value for the key into the store.
 	Put(key string, value []byte) (revision uint64, err error)
+	// PutString will place the string for the key into the store.
+	PutString(key string, value string) (revision uint64, err error)
 	// Create will add the key/value pair iff it does not exist.
 	Create(key string, value []byte) (revision uint64, err error)
 	// Update will update the value iff the latest revision matches.
@@ -382,6 +387,11 @@ func (kv *kvs) Put(key string, value []byte) (revision uint64, err error) {
 		return 0, err
 	}
 	return pa.Sequence, err
+}
+
+// PutString will place the string for the key into the store.
+func (kv *kvs) PutString(key string, value string) (revision uint64, err error) {
+	return kv.Put(key, []byte(value))
 }
 
 // Create will add the key/value pair iff it does not exist.
