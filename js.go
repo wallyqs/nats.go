@@ -218,6 +218,7 @@ type jsOpts struct {
 	domain string
 	// enables protocol tracing
 	trace       TraceCB
+	ctrace      ClientTrace
 	shouldTrace bool
 }
 
@@ -279,6 +280,20 @@ func TraceFunc(cb TraceCB) JSOpt {
 	})
 }
 
+type ClientTrace struct {
+	// ProtocolSent
+	// ProtocolReceived
+	RequestSent      func(subj string, payload []byte, hdr Header)
+	ResponseReceived func(subj string, payload []byte, hdr Header)
+	// Other misc low level connect options ala net/http/httptrace"a
+}
+
+func (ct ClientTrace) configureJSContext(js *jsOpts) error {
+	js.ctrace = ct
+	js.shouldTrace = true
+	return nil
+}
+
 // Domain changes the domain part of JetSteam API prefix.
 func Domain(domain string) JSOpt {
 	if domain == _EMPTY_ {
@@ -288,7 +303,6 @@ func Domain(domain string) JSOpt {
 	return jsOptFn(func(js *jsOpts) error {
 		js.domain = domain
 		js.pre = fmt.Sprintf(jsDomainT, domain)
-
 		return nil
 	})
 

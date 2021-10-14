@@ -895,14 +895,33 @@ func TestJetStreamTracing(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
 
-	nc, err := Connect(s.ClientURL())
+	// Same trace funcs but at the NATS level, a bit similar to how httptrace does it:
+	// https://pkg.go.dev/net/http/httptrace#ClientTrace
+	//
+	nc, err := Connect(s.ClientURL(), WithClientTrace(&ClientTrace{}))
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	defer nc.Close()
 
+	// Trace funcs scoped at the JS level.  Implements the interface for
+	// JS option so can use the same type.
+	js, err := nc.JetStream(&ClientTrace{
+		RequestSent: func(subj string, payload []byte, hdr Header) {
+			fmt.Println(">>> SENT : ", subj, payload)
+		},
+		ResponseReceived: func(subj string, payload []byte, hdr Header) {
+			fmt.Println("<<< RECVD: ", subj, payload)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("---> JS Context With Tracing: %+v", js)
+
+	// Original test
 	ctr := 0
-	js, err := nc.JetStream(TraceFunc(func(op TraceOperation, subj string, payload []byte, hdr Header) {
+	js, err = nc.JetStream(TraceFunc(func(op TraceOperation, subj string, payload []byte, hdr Header) {
 		ctr++
 		if ctr == 1 {
 			if op != TraceSent || subj != "$JS.API.STREAM.CREATE.X" {

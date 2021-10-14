@@ -461,6 +461,8 @@ type Options struct {
 
 	// InboxPrefix allows the default _INBOX prefix to be customized
 	InboxPrefix string
+
+	ClientTrace *ClientTrace
 }
 
 const (
@@ -752,6 +754,16 @@ func Connect(url string, options ...Option) (*Conn, error) {
 func Name(name string) Option {
 	return func(o *Options) error {
 		o.Name = name
+		return nil
+	}
+}
+
+// mimics WithClientTrace from
+// https://pkg.go.dev/net/http/httptrace#ClientTrace
+func WithClientTrace(ct *ClientTrace) Option {
+	return func(o *Options) error {
+		// Trace funcs but at the NATS level
+		o.ClientTrace = ct
 		return nil
 	}
 }
