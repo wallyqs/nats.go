@@ -69,6 +69,9 @@ type KeyValue interface {
 	Bucket() string
 	// PurgeDeletes will remove all current delete markers.
 	PurgeDeletes(opts ...WatchOpt) error
+	// PurgeDeletesOlderThan will remove delete markers that have been present
+	// for longer than the `olderThan` duration.
+	PurgeDeletesOlderThan(olderThan time.Duration, opts ...WatchOpt) error
 	// Status retrieves the status and configuration of a bucket
 	Status() (KeyValueStatus, error)
 }
@@ -539,11 +542,29 @@ func (kv *kvs) delete(key string, purge bool) error {
 // PurgeDeletes will remove all current delete markers.
 // This is a maintenance option if there is a larger buildup of delete markers.
 func (kv *kvs) PurgeDeletes(opts ...WatchOpt) error {
+	return kv.purgeDeletes(0, opts...)
+}
+
+// PurgeDeletes will remove all delete markers that have been in the key
+// more more than the given `olderThan`.
+// If `olderThan` is negative or 0, all delete markers are removed, similar
+// to `PurgeDeletes()`.
+// This is a maintenance option if there is a larger buildup of delete markers.
+func (kv *kvs) PurgeDeletesOlderThan(olderThan time.Duration, opts ...WatchOpt) error {
+	return kv.purgeDeletes(olderThan, opts...)
+}
+
+func (kv *kvs) purgeDeletes(olderThan time.Duration, opts ...WatchOpt) error {
 	watcher, err := kv.WatchAll(opts...)
 	if err != nil {
 		return err
 	}
 	defer watcher.Stop()
+
+	var limit time.Time
+	if olderThan > 0 {
+		limit = time.Now().Add(-olderThan)
+	}
 
 	var deleteMarkers []KeyValueEntry
 	for entry := range watcher.Updates() {
@@ -551,7 +572,10 @@ func (kv *kvs) PurgeDeletes(opts ...WatchOpt) error {
 			break
 		}
 		if op := entry.Operation(); op == KeyValueDelete || op == KeyValuePurge {
-			deleteMarkers = append(deleteMarkers, entry)
+			// Add entries if there is no time limit or if the entry is older than the limit.
+			if limit.IsZero() || entry.Created().Before(limit) {
+				deleteMarkers = append(deleteMarkers, entry)
+			}
 		}
 	}
 

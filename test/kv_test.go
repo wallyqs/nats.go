@@ -430,6 +430,57 @@ func TestKeyValueDeleteTombstones(t *testing.T) {
 	}
 }
 
+func TestKeyValueDeleteTombstonesOlderThan(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdownJSServerAndRemoveStorage(t, s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "KVS", History: 10})
+	expectOk(t, err)
+
+	put := func(key, value string) {
+		t.Helper()
+		_, err := kv.Put(key, []byte(value))
+		expectOk(t, err)
+	}
+
+	put("foo", "foo1")
+	put("foo", "foo2")
+	err = kv.Delete("foo")
+	expectOk(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	put("bar", "bar1")
+	err = kv.Delete("bar")
+	expectOk(t, err)
+
+	err = kv.PurgeDeletesOlderThan(50 * time.Millisecond)
+	expectOk(t, err)
+
+	si, err := js.StreamInfo("KV_KVS")
+	expectOk(t, err)
+	// There should be the bar key left, with its delete marker,
+	// so that's 2 messages.
+	if si.State.Msgs != 2 {
+		t.Fatalf("Expected 2 stream msgs to be left, got %d", si.State.Msgs)
+	}
+	barEntries, err := kv.History("bar")
+	expectOk(t, err)
+	if len(barEntries) != 2 {
+		t.Fatalf("Expected 2 entries, got %v", barEntries)
+	}
+	for i, e := range barEntries {
+		if i == 0 && e.Operation() != nats.KeyValuePut && string(e.Value()) != "bar1" {
+			t.Fatalf("Unexpected first entry: %+v", e)
+		} else if i == 1 && e.Operation() != nats.KeyValueDelete {
+			t.Fatalf("Unexpected second entry: %+v", e)
+		}
+	}
+}
+
 func TestKeyValueKeys(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdownJSServerAndRemoveStorage(t, s)
