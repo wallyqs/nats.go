@@ -68,10 +68,7 @@ type KeyValue interface {
 	// Bucket returns the current bucket name.
 	Bucket() string
 	// PurgeDeletes will remove all current delete markers.
-	PurgeDeletes(opts ...WatchOpt) error
-	// PurgeDeletesOlderThan will remove delete markers that have been present
-	// for longer than the `olderThan` duration.
-	PurgeDeletesOlderThan(olderThan time.Duration, opts ...WatchOpt) error
+	PurgeDeletes(opts ...PurgeOpt) error
 	// Status retrieves the status and configuration of a bucket
 	Status() (KeyValueStatus, error)
 }
@@ -126,6 +123,35 @@ type watchOptFn func(opts *watchOpts) error
 
 func (opt watchOptFn) configureWatcher(opts *watchOpts) error {
 	return opt(opts)
+}
+
+type PurgeOpt interface {
+	configurePurge(opts *purgeOpts) error
+}
+
+type purgeOpts struct {
+	olderThan time.Duration
+	ctx       context.Context
+}
+
+type purgeOptFn func(opts *purgeOpts) error
+
+func (opt purgeOptFn) configurePurge(opts *purgeOpts) error {
+	return opt(opts)
+}
+
+// OlderThan sets a time limit for a PurgeDelete operation for example.
+type OlderThan time.Duration
+
+func (ttl OlderThan) configurePurge(opts *purgeOpts) error {
+	opts.olderThan = time.Duration(ttl)
+	return nil
+}
+
+// For nats.Context() support.
+func (ctx ContextOpt) configurePurge(opts *purgeOpts) error {
+	opts.ctx = ctx
+	return nil
 }
 
 // IncludeHistory instructs the key watcher to include historical values as well.
@@ -541,27 +567,35 @@ func (kv *kvs) delete(key string, purge bool) error {
 
 // PurgeDeletes will remove all current delete markers.
 // This is a maintenance option if there is a larger buildup of delete markers.
-func (kv *kvs) PurgeDeletes(opts ...WatchOpt) error {
-	return kv.purgeDeletes(0, opts...)
+// If `OlderThan` option is passed and it is negative or 0, all delete markers that have been in the key
+// more than the given `OlderThan` are removed.
+func (kv *kvs) PurgeDeletes(opts ...PurgeOpt) error {
+	return kv.purgeDeletes(opts...)
 }
 
-// PurgeDeletes will remove all delete markers that have been in the key
-// more more than the given `olderThan`.
-// If `olderThan` is negative or 0, all delete markers are removed, similar
-// to `PurgeDeletes()`.
-// This is a maintenance option if there is a larger buildup of delete markers.
-func (kv *kvs) PurgeDeletesOlderThan(olderThan time.Duration, opts ...WatchOpt) error {
-	return kv.purgeDeletes(olderThan, opts...)
-}
+func (kv *kvs) purgeDeletes(opts ...PurgeOpt) error {
+	// Cast purge opts into watch opts
+	var o purgeOpts
+	for _, opt := range opts {
+		if opt != nil {
+			if err := opt.configurePurge(&o); err != nil {
+				return err
+			}
+		}
+	}
 
-func (kv *kvs) purgeDeletes(olderThan time.Duration, opts ...WatchOpt) error {
-	watcher, err := kv.WatchAll(opts...)
+	wopts := []WatchOpt{}
+	if o.ctx != nil {
+		wopts = append(wopts, Context(o.ctx))
+	}
+	watcher, err := kv.WatchAll(wopts...)
 	if err != nil {
 		return err
 	}
 	defer watcher.Stop()
 
 	var limit time.Time
+	olderThan := o.olderThan
 	if olderThan > 0 {
 		limit = time.Now().Add(-olderThan)
 	}

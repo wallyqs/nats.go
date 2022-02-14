@@ -428,6 +428,12 @@ func TestKeyValueDeleteTombstones(t *testing.T) {
 	if si.State.Msgs != 0 {
 		t.Fatalf("Expected no stream msgs to be left, got %d", si.State.Msgs)
 	}
+
+	// Try with context
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	err = kv.PurgeDeletes(nats.Context(ctx))
+	expectOk(t, err)
 }
 
 func TestKeyValueDeleteTombstonesOlderThan(t *testing.T) {
@@ -457,7 +463,7 @@ func TestKeyValueDeleteTombstonesOlderThan(t *testing.T) {
 	err = kv.Delete("bar")
 	expectOk(t, err)
 
-	err = kv.PurgeDeletesOlderThan(50 * time.Millisecond)
+	err = kv.PurgeDeletes(nats.OlderThan(50 * time.Millisecond))
 	expectOk(t, err)
 
 	si, err := js.StreamInfo("KV_KVS")
