@@ -524,6 +524,7 @@ type Conn struct {
 	ar      bool // abort reconnect
 	rqch    chan struct{}
 	ws      bool // true if a websocket connection
+	hdrsOK  bool // true if headers can be used with current server.
 
 	// New style response handler
 	respSub       string               // The wildcard subject
@@ -2114,6 +2115,10 @@ func (nc *Conn) processExpectedInfo() error {
 		return nil
 	}
 
+	// Track whether currently connected server has support for headers,
+	// only do this after processing INFO during connect (not during async INFOs).
+	nc.hdrsOK = nc.info.Headers
+
 	return nc.checkForSecure()
 }
 
@@ -3383,21 +3388,10 @@ func (nc *Conn) PublishMsg(m *Msg) error {
 	if m == nil {
 		return ErrInvalidMsg
 	}
-
-	var hdr []byte
-	var err error
-
-	if len(m.Header) > 0 {
-		if !nc.info.Headers {
-			return ErrHeadersNotSupported
-		}
-
-		hdr, err = m.headerBytes()
-		if err != nil {
-			return err
-		}
+	hdr, err := m.headerBytes()
+	if err != nil {
+		return err
 	}
-
 	return nc.publish(m.Subject, m.Reply, hdr, m.Data)
 }
 
@@ -3422,6 +3416,12 @@ func (nc *Conn) publish(subj, reply string, hdr, data []byte) error {
 		return ErrBadSubject
 	}
 	nc.mu.Lock()
+
+	// Check if headers attempted to be sent to server that does not support them.
+	if hdr != nil && len(hdr) > 0 && !nc.hdrsOK {
+		nc.mu.Unlock()
+		return ErrHeadersNotSupported
+	}
 
 	if nc.isClosed() {
 		nc.mu.Unlock()
@@ -3593,17 +3593,12 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 // RequestMsg will send a request payload including optional headers and deliver
 // the response message, or an error, including a timeout if no message was received properly.
 func (nc *Conn) RequestMsg(msg *Msg, timeout time.Duration) (*Msg, error) {
-	var hdr []byte
-	var err error
-
-	if len(msg.Header) > 0 {
-		if !nc.info.Headers {
-			return nil, ErrHeadersNotSupported
-		}
-		hdr, err = msg.headerBytes()
-		if err != nil {
-			return nil, err
-		}
+	if msg == nil {
+		return nil, ErrInvalidMsg
+	}
+	hdr, err := msg.headerBytes()
+	if err != nil {
+		return nil, err
 	}
 
 	return nc.request(msg.Subject, hdr, msg.Data, timeout)
@@ -5071,7 +5066,7 @@ func (nc *Conn) MaxPayload() int64 {
 func (nc *Conn) HeadersSupported() bool {
 	nc.mu.RLock()
 	defer nc.mu.RUnlock()
-	return nc.info.Headers
+	return nc.hdrsOK
 }
 
 // AuthRequired will return if the connected server requires authorization.
