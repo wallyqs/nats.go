@@ -298,30 +298,40 @@ func TestMaxConnectionsReconnect(t *testing.T) {
 	s2 := RunServerWithOptions(&s2Opts)
 	defer s2.Shutdown()
 
-	// Only explicitly connect to first server
-	var opts = Options{
-		Url:            s1.ClientURL(),
-		AllowReconnect: true,
-		MaxReconnect:   2,
-		ReconnectWait:  10 * time.Millisecond,
-		Timeout:        200 * time.Millisecond,
+	reconnectCh := make(chan struct{})
+	errCh := make(chan error, 2)
+	opts := []Option{
+		MaxReconnects(2),
+		ReconnectWait(10*time.Millisecond),
+		Timeout(200*time.Millisecond),
+		ErrorHandler(func(_ *Conn, _ *Subscription, err error) {
+			fmt.Println("ERROR: ", err)
+		}),
+		DisconnectErrHandler(func(_ *Conn, err error) {
+			if err != nil {
+				errCh <- err
+			}
+		}),
+		ReconnectHandler(func(_ *Conn){
+			reconnectCh <- struct{}{}
+		}),
 	}
 
-	// Create two connections (the current max) for first server
-	nc1, _ := opts.Connect()
+	// Create two connections (the current max) for first server.
+	nc1, _ := Connect(s1.ClientURL(), opts...)
 	defer nc1.Close()
 	nc1.Flush()
 
-	nc2, _ := opts.Connect()
+	nc2, _ := Connect(s1.ClientURL(), opts...)
 	defer nc2.Close()
 	nc2.Flush()
 
 	if s1.NumClients() != 2 {
-		t.Fatalf("Expected 2 client connections to first server. Got %d\n", s1.NumClients())
+		t.Fatalf("Expected 2 client connections to first server. Got %d", s1.NumClients())
 	}
 
 	if s2.NumClients() > 0 {
-		t.Fatalf("Expected 0 client connections to second server. Got %d\n", s2.NumClients())
+		t.Fatalf("Expected 0 client connections to second server. Got %d", s2.NumClients())
 	}
 
 	// Kick one of our two server connections off first server. One client should reconnect to second server.
@@ -332,10 +342,23 @@ func TestMaxConnectionsReconnect(t *testing.T) {
 		t.Fatalf("Unexpected error changing max_connections [%s]", err)
 	}
 
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case err := <-errCh:
+		if err != ErrMaxConnectionsExceeded {
+			t.Fatalf("Unexpected error %v", err)
+		}
+	case <-time.After(2*time.Second):
+		t.Fatal("Timed out waiting for disconnect event")
+	}
+
+	select {
+	case <-reconnectCh:
+	case <-time.After(2*time.Second):
+		t.Fatal("Timed out waiting for reconnect event")
+	}
 
 	if s2.NumClients() <= 0 || s1.NumClients() > 1 {
-		t.Fatalf("Expected client reconnection to second server.\n")
+		t.Fatalf("Expected client reconnection to second server.")
 	}
 }
 
