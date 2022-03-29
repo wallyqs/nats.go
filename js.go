@@ -341,6 +341,8 @@ type pubOpts struct {
 	rwait time.Duration // Retry wait between attempts
 	rnum  int           // Retry attempts
 
+	// stallWait is the max wait of a async pub ack.
+	stallWait time.Duration
 }
 
 // pubAckResponse is the ack response from the JetStream API when publishing a message.
@@ -395,6 +397,9 @@ func (js *js) PublishMsg(m *Msg, opts ...PubOpt) (*PubAck, error) {
 	}
 	if o.ttl == 0 && o.ctx == nil {
 		o.ttl = js.opts.wait
+	}
+	if o.stallWait > 0 {
+		return nil, fmt.Errorf("nats: stall wait cannot be set to sync publish")
 	}
 
 	if o.id != _EMPTY_ {
@@ -706,6 +711,8 @@ func (js *js) PublishAsync(subj string, data []byte, opts ...PubOpt) (PubAckFutu
 	return js.PublishMsgAsync(&Msg{Subject: subj, Data: data}, opts...)
 }
 
+const defaultStallWait = 200 * time.Millisecond
+
 func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 	var o pubOpts
 	if len(opts) > 0 {
@@ -722,6 +729,10 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 	// Timeouts and contexts do not make sense for these.
 	if o.ttl != 0 || o.ctx != nil {
 		return nil, ErrContextAndTimeout
+	}
+	stallWait := defaultStallWait
+	if o.stallWait > 0 {
+		stallWait = o.stallWait
 	}
 
 	// FIXME(dlc) - Make common.
@@ -760,7 +771,7 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 	if maxPending > 0 && numPending >= maxPending {
 		select {
 		case <-js.asyncStall():
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(stallWait):
 			js.clearPAF(id)
 			return nil, errors.New("nats: stalled with too many outstanding async published messages")
 		}
@@ -840,6 +851,17 @@ func RetryWait(dur time.Duration) PubOpt {
 func RetryAttempts(num int) PubOpt {
 	return pubOptFn(func(opts *pubOpts) error {
 		opts.rnum = num
+		return nil
+	})
+}
+
+// StallWait sets the max wait when the producer becomes stall producing messages.
+func StallWait(ttl time.Duration) PubOpt {
+	return pubOptFn(func(opts *pubOpts) error {
+		if ttl <= 0 {
+			return fmt.Errorf("nats: stall wait should be more than 0")
+		}
+		opts.stallWait = ttl
 		return nil
 	})
 }
