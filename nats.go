@@ -609,6 +609,23 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+
+	// PullSubscription stats
+	errors map[string]int
+	reqs   int
+	msgs   int
+}
+
+func (sub *Subscription) TotalMessages() int {
+	return sub.msgs
+}
+
+func (sub *Subscription) Errors() map[string]int {
+	return sub.errors
+}
+
+func (sub *Subscription) Requests() int {
+	return sub.reqs
 }
 
 // Msg represents a message delivered by NATS. This structure is used
@@ -4381,6 +4398,11 @@ func (s *Subscription) processNextMsgDelivered(msg *Msg) error {
 			nc.mu.Unlock()
 		}
 	}
+	// if len(msg.Data) == 0 {
+	// 	hdr := msg.Header.Get(statusHdr)
+	// 	desc := msg.Header.Get("Description")
+	// 	s.errors[fmt.Sprintf("%s:%s", hdr, desc)]++
+	// }
 	if len(msg.Data) == 0 && msg.Header.Get(statusHdr) == noResponders {
 		return ErrNoResponders
 	}

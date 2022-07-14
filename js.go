@@ -1548,6 +1548,7 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 	if err != nil {
 		return nil, err
 	}
+	// sub.errors = make(map[string]int)
 
 	// If we fail and we had the sub we need to cleanup, but can't just do a straight Unsubscribe or Drain.
 	// We need to clear the jsi so we do not remove any durables etc.
@@ -2592,6 +2593,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 		if o.ctx == nil && err == context.DeadlineExceeded {
 			return ErrTimeout
 		}
+		// fmt.Println("ERROR!", err)
 		return err
 	}
 
@@ -2610,6 +2612,13 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 			}
 			break
 		}
+		// sub.msgs++
+		// if len(msg.Data) == 0 {
+		// 	hdr := msg.Header.Get(statusHdr)
+		// 	desc := msg.Header.Get("Description")
+		// 	sub.errors[fmt.Sprintf("%s:%s", hdr, desc)]++
+		// }
+
 		// Check msg but just to determine if this is a user message
 		// or status message, however, we don't care about values of status
 		// messages at this point in the Fetch() call, so checkMsg can't
@@ -2625,6 +2634,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 		var nr nextRequest
 
 		sendReq := func() error {
+			// sub.reqs++
 			// The current deadline for the context will be used
 			// to set the expires TTL for a fetch request.
 			deadline, _ = ctx.Deadline()
@@ -2647,6 +2657,7 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 			nr.Expires = expires
 			nr.NoWait = noWait
 			req, _ := json.Marshal(nr)
+			// fmt.Printf("-------: %+v\n", string(req))
 			return nc.PublishRequest(nms, rply, req)
 		}
 
@@ -2654,7 +2665,15 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 		for err == nil && len(msgs) < batch {
 			// Ask for next message and wait if there are no messages
 			msg, err = sub.nextMsgWithContext(ctx, true, true)
+			// fmt.Printf("-------> %v || %v || %v || %+v || %v\n", sub.Subject, err, msg, sub.Errors(), sub.msgs)
 			if err == nil {
+				// sub.msgs++
+				// if len(msg.Data) == 0 {
+				// 	hdr := msg.Header.Get(statusHdr)
+				// 	desc := msg.Header.Get("Description")
+				// 	sub.errors[fmt.Sprintf("%s:%s", hdr, desc)]++
+				// }
+
 				var usrMsg bool
 
 				usrMsg, err = checkMsg(msg, true, noWait)
@@ -2669,11 +2688,18 @@ func (sub *Subscription) Fetch(batch int, opts ...PullOpt) ([]*Msg, error) {
 				} else if err == ErrTimeout && len(msgs) == 0 {
 					// If we get a 408, we will bail if we already collected some
 					// messages, otherwise ignore and go back calling NextMsg.
+					// if ctx.Err() != nil {
+					// 	fmt.Println("TIMED OUT ALREADY!")
+					// 	return nil, err
+					// 	// break
+					// }
+
 					err = nil
 				}
 			}
 		}
 	}
+	// fmt.Println("================= unblock: ", sub.Subject, err, len(msgs))
 	// If there is at least a message added to msgs, then need to return OK and no error
 	if err != nil && len(msgs) == 0 {
 		return nil, checkCtxErr(err)
