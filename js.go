@@ -236,6 +236,8 @@ type jsOpts struct {
 	purgeOpts *StreamPurgeRequest
 	// streamInfoOpts contains optional stream info options
 	streamInfoOpts *StreamInfoRequest
+	// getMsgOpts contains options to query directly.
+	getMsgOpts *GetMsgRequest
 }
 
 const (

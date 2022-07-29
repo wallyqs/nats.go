@@ -1395,8 +1395,10 @@ func (nc *Conn) currentServer() (int, *srv) {
 // Pop the current server and put onto the end of the list. Select head of list as long
 // as number of reconnect attempts under MaxReconnect.
 func (nc *Conn) selectNextServer() (*srv, error) {
+	fmt.Println("-----------")
 	i, s := nc.currentServer()
 	if i < 0 {
+		fmt.Println("????????????????")
 		return nil, ErrNoServers
 	}
 	sp := nc.srvPool
@@ -2089,6 +2091,7 @@ func (nc *Conn) connect() error {
 				// to try before starting doReconnect().
 			}
 		} else {
+			fmt.Println(">>>>>>>>>>>>", err)
 			// Cancel out default connection refused, will trigger the
 			// No servers error conditional
 			if strings.Contains(err.Error(), "connection refused") {
@@ -2430,6 +2433,7 @@ func (nc *Conn) doReconnect(err error) {
 		}
 	}
 
+	fmt.Println("??????")
 	for i := 0; len(nc.srvPool) > 0; {
 		cur, err := nc.selectNextServer()
 		if err != nil {

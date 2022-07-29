@@ -52,6 +52,9 @@ type JetStreamManager interface {
 	// GetLastMsg retrieves the last raw stream message stored in JetStream by subject.
 	GetLastMsg(name, subject string, opts ...JSOpt) (*RawStreamMsg, error)
 
+	// // GetNextMsg retrieves the last raw stream message stored in JetStream by subject.
+	// GetNextMsg(name, subject string, opts ...JSOpt) (*RawStreamMsg, error)
+
 	// DirectGetMsg retrieves directly a raw stream message stored in JetStream from a
 	// distributed group of servers. The stream must have been created/updated with the
 	// AllowDirect boolean.
@@ -825,6 +828,7 @@ func (js *js) DeleteStream(name string, opts ...JSOpt) error {
 type apiMsgGetRequest struct {
 	Seq     uint64 `json:"seq,omitempty"`
 	LastFor string `json:"last_by_subj,omitempty"`
+	NextFor string `json:"next_by_subj,omitempty"`
 }
 
 // RawStreamMsg is a raw message stored in JetStream.
@@ -861,6 +865,11 @@ func (js *js) GetMsg(name string, seq uint64, opts ...JSOpt) (*RawStreamMsg, err
 	return js.getMsg(name, &apiMsgGetRequest{Seq: seq}, opts...)
 }
 
+// // GetNextMsg retrieves the next raw stream message stored in JetStream by subject.
+// func (js *js) GetNextMsg(name, subject string, opts ...JSOpt) (*RawStreamMsg, error) {
+// 	return js.getMsg(name, &apiMsgGetRequest{NextFor: subject}, opts...)
+// }
+
 // Low level getMsg
 func (js *js) getMsg(name string, mreq *apiMsgGetRequest, opts ...JSOpt) (*RawStreamMsg, error) {
 	o, cancel, err := getJSContextOpts(js.opts, opts...)
@@ -873,6 +882,18 @@ func (js *js) getMsg(name string, mreq *apiMsgGetRequest, opts ...JSOpt) (*RawSt
 
 	if name == _EMPTY_ {
 		return nil, ErrStreamNameRequired
+	}
+
+	// Use direct get
+	if js.opts.getMsgOpts != nil && js.opts.getMsgOpts.Direct {
+		fmt.Println("use direct get")
+		req := &DirectGetMsgRequest{
+			Seq: mreq.Seq,
+		}
+		if mreq.LastFor != "" {
+			req.LastFor = js.opts.getMsgOpts.LastFor
+		}
+		return js.DirectGetMsg(name, req, opts...)
 	}
 
 	req, err := json.Marshal(mreq)
@@ -920,6 +941,17 @@ type DirectGetMsgRequest struct {
 	Seq     uint64 `json:"seq,omitempty"`
 	LastFor string `json:"last_by_subj,omitempty"`
 	NextFor string `json:"next_by_subj,omitempty"`
+}
+
+type GetMsgRequest struct {
+	Direct  bool
+	LastFor string
+	NextFor string
+}
+
+func (req *GetMsgRequest) configureJSContext(js *jsOpts) error {
+	js.getMsgOpts = req
+	return nil
 }
 
 func (js *js) DirectGetMsg(name string, dgo *DirectGetMsgRequest, opts ...JSOpt) (*RawStreamMsg, error) {
