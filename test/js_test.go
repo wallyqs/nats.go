@@ -7951,6 +7951,42 @@ func TestJetStreamConsumerReplicasOption(t *testing.T) {
 	})
 }
 
+func TestJetStreamConsumerConfigOpt(t *testing.T) {
+	withJSCluster(t, "CR", 3, func(t *testing.T, nodes ...*jsServer) {
+		nc, js := jsClient(t, nodes[0].Server)
+		defer nc.Close()
+
+		if _, err := js.AddStream(&nats.StreamConfig{
+			Name:     "ConsumerReplicasTest",
+			Subjects: []string{"foo"},
+			Replicas: 3,
+		}); err != nil {
+			t.Fatalf("Error adding stream: %v", err)
+		}
+
+		// Subscribe to the stream with a durable consumer "bar" and replica set to 1.
+		cb := func(msg *nats.Msg) {}
+		_, err := js.Subscribe("foo", cb, &nats.ConsumerConfig{
+			Durable: "bar",
+			Replicas: 1,
+		})
+		if err != nil {
+			t.Fatalf("Error on subscribe: %v", err)
+		}
+
+		// Get consumer info
+		consInfo, err := js.ConsumerInfo("ConsumerReplicasTest", "bar")
+		if err != nil {
+			t.Fatalf("Error getting consumer info: %v", err)
+		}
+
+		// Check if the number of replicas is the same as we provided.
+		if consInfo.Config.Replicas != 1 {
+			t.Fatalf("Expected consumer replica to be %v, got %+v", 1, consInfo.Config.Replicas)
+		}
+	})
+}
+
 func TestJetStreamMsgAckShouldErrForConsumerAckNone(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdownJSServerAndRemoveStorage(t, s)

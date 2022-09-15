@@ -1067,6 +1067,16 @@ type ConsumerConfig struct {
 	MemoryStorage bool `json:"mem_storage,omitempty"`
 }
 
+func (config *ConsumerConfig) configureSubscribe(opts *subOpts) error {
+	// Hack to merge two structs
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	return nil
+}
+
 // ConsumerInfo is the info from a JetStream consumer.
 type ConsumerInfo struct {
 	Stream         string         `json:"stream_name"`

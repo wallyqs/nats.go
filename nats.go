@@ -3768,6 +3768,7 @@ func (nc *Conn) request(subj string, hdr, data []byte, timeout time.Duration) (*
 	}
 
 	// Check for no responder status.
+	fmt.Println("------->", subj, m)
 	if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
 		m, err = nil, ErrNoResponders
 	}
