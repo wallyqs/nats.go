@@ -8374,3 +8374,90 @@ func TestJetStreamStreamInfoAlternates(t *testing.T) {
 		}
 	})
 }
+
+func TestJetStreamPullSubscribeLeadershipChange(t *testing.T) {
+	withJSCluster(t, "PSLSC", 3, testJetStreamPSLeaderShipChange)
+}
+
+func testJetStreamPSLeaderShipChange(t *testing.T, srvs ...*jsServer) {
+	srv := srvs[1]
+	nc, js := jsClient(t, srv.Server)
+	defer nc.Close()
+
+	var err error
+
+	subject := "WQ"
+	_, err = js.AddStream(&nats.StreamConfig{
+		Name:     subject,
+		Replicas: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sub, err := js.PullSubscribe(subject, "name")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() {
+		totalMsgs := 100
+		for range time.NewTicker(200 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			for i := 0; i < totalMsgs; i++ {
+				payload := fmt.Sprintf("i:%d", i)
+				js.Publish(subject, []byte(payload))
+				// _, err := js.Publish(subject, []byte(payload))
+				// if err != nil {
+				// 	t.Errorf("Unexpected error: %v", err)
+				// }
+			}
+		}
+	}()
+
+	go func() {
+		for range time.NewTicker(20 * time.Millisecond).C {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			nc.Request(fmt.Sprintf("$JS.API.STREAM.LEADER.STEPDOWN.%s", subject), nil, time.Second)
+			nc.Request(fmt.Sprintf("$JS.API.CONSUMER.LEADER.STEPDOWN.%s.name", subject), nil, time.Second)
+		}
+	}()
+
+	for range time.NewTicker(2 * time.Millisecond).C {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		_, err := sub.Fetch(100, nats.MaxWait(1*time.Second))
+		if err != nil {
+			t.Logf("======== %v", err)
+		}
+		if err != nil {
+			if errors.Is(err, nats.ErrConsumerLeadershipChanged) {
+				t.Logf("YEP IT IS! %v", err)
+			} else {
+				t.Logf("NO IT IS NOT! %v", err)
+			}
+		}
+
+		// msgs, err := sub.Fetch(100, nats.MaxWait(1*time.Second))
+		// if err != nil {
+		// 	t.Logf("------> %v", err)
+		// }
+		// for _, msg := range msgs {
+		// 	t.Logf("============ %v", msg)
+		// }
+		time.Sleep(2 * time.Millisecond)
+	}
+}

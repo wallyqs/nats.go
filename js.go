@@ -2557,6 +2557,12 @@ func checkMsg(msg *Msg, checkSts, isNoWait bool) (usrMsg bool, err error) {
 	if !checkSts {
 		return
 	}
+	if val == reqTimeoutSts {
+		val = jetStream409Sts
+		msg.Header[statusHdr] = []string{"409"}
+		msg.Header[descrHdr] = []string{"Leadership Changed"}
+	}
+
 	switch val {
 	case noResponders:
 		err = ErrNoResponders
