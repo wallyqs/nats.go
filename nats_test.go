@@ -2348,6 +2348,7 @@ func TestRequestMultipleReplies(t *testing.T) {
 	}
 }
 
+// FIXME: Mock Status
 func TestRequestInit(t *testing.T) {
 	o := natsserver.DefaultTestOptions
 	o.Port = -1
