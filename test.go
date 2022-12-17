@@ -1,4 +1,4 @@
-// Copyright 2012-2022 The NATS Authors
+// Copyright 2022 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,36 +13,23 @@
 
 package nats
 
-import (
-	"fmt"
-	"github.com/nats-io/nats.go/internal/test"
-)
+import it "github.com/nats-io/nats.go/internal/test"
 
-// TestClient thing.
-func NewTestClient(nc *Conn) *TestClient {
-	return &TestClient{&testClient{nc}}
+// TestClient is a helper function used in internal testing from
+// the nats module, it cannot be used outside of this repo.
+func TestClient(nc *Conn, _ it.TC) it.TestClient {
+	return &testClient{nc: nc}
 }
 
-type TestClient struct {
-	// Avoid others attempting to implement this interface
-	// thus breaking compatibility.
-	// getClient() internal_test.TestClient
-	itc *testClient
-}
-
-func (tc *TestClient) getClient() internal_test.TestClient {
-	fmt.Println("calling private!")
-	return tc.itc
-}
-
+// testClient implements the it.TestClient interface.
 type testClient struct {
 	nc *Conn
+	it.TestClient
 }
 
-func (*testClient) SetConnectionStatus(int) {
-	fmt.Println("called internal!")
+// SetConnectionStatus overrides the status of the connection.
+func (tc *testClient) SetConnectionStatus(status int) {
+	tc.nc.mu.Lock()
+	tc.nc.status = Status(status)
+	tc.nc.mu.Unlock()
 }
-
-// func (*testClient) SetConnectionStatus(status int) {
-// 	fmt.Println("AAAAAAAAAAAAAAAAAAAAA")
-// }
