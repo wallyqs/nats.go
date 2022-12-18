@@ -16,6 +16,10 @@ type Engine interface {
 	// private()
 }
 
+type Client interface {
+	InternalTestEngine() Engine
+}
+
 // func TestClient(conn interface{}) TC {
 // 	return conn.(TC)
 // }

@@ -9,12 +9,8 @@ import (
 	internal_test "github.com/nats-io/nats.go/internal/test"
 )
 
-type TestClient interface {
-	InternalTestEngine() internal_test.Engine
-}
-
 func NewTestClient(nc *nats.Conn) internal_test.Engine {
-	return nats.TestClient(nc).(TestClient).InternalTestEngine()
+	return nats.TestClient(nc).(internal_test.Client).InternalTestEngine()
 }
 
 func TestInternal(t *testing.T) {
