@@ -13,23 +13,51 @@
 
 package nats
 
-import it "github.com/nats-io/nats.go/internal/test"
+// import (
+// 	it "github.com/nats-io/nats.go/internal/test"
+// )
 
-// TestClient is a helper function used in internal testing from
-// the nats module, it cannot be used outside of this repo.
-func TestClient(nc *Conn, _ it.TC) it.TestClient {
-	return &testClient{nc: nc}
+// TestClient is a helper function used for internal testing,
+// it cannot be used outside of the nats package.
+// func TestClient(nc *Conn) *TC {
+// 	return &TC{&testClient{nc: nc}, nil}
+// }
+
+// type TC struct {
+// 	TC it.TC
+// }
+
+// func TestClient(nc *Conn) *TC {
+// 	return &TC{
+// 		TC: &testClient{nc},
+// 	}
+// }
+
+func TestClient(nc *Conn) TC {
+	return &testClient{nc}
 }
 
-// testClient implements the it.TestClient interface.
+type TC interface {
+	IsTestClient() bool
+	// Ensures that no one can implement this interface,
+	// unless the this interface type is embedded.
+	private()
+}
+
+// testClient implements the TC interface.
 type testClient struct {
 	nc *Conn
-	it.TestClient
 }
+
+func (tc *testClient) private() {}
 
 // SetConnectionStatus overrides the status of the connection.
 func (tc *testClient) SetConnectionStatus(status int) {
 	tc.nc.mu.Lock()
 	tc.nc.status = Status(status)
 	tc.nc.mu.Unlock()
+}
+
+func (tc *testClient) IsTestClient() bool {
+	return true
 }

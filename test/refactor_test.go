@@ -6,11 +6,14 @@ import (
 
 	"github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
-	it "github.com/nats-io/nats.go/internal/test"
 )
 
-func NewTestClient(nc *nats.Conn) it.TestClient {
-	return nats.TestClient(nc, it.TC{})
+type TestClient interface {
+	SetConnectionStatus(int)
+}
+
+func NewTestClient(nc *nats.Conn) TestClient {
+	return nats.TestClient(nc).(TestClient)
 }
 
 func TestInternal(t *testing.T) {
@@ -23,8 +26,22 @@ func TestInternal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Change the state manually.
+
 	tc := NewTestClient(nc)
+	fmt.Println(tc)
+
+	// tcl := nats.TC{
+	// 	Conn: nc,
+	// 	TC: it.TC{},
+	// }
+	// tcl.Setup()
+	// fmt.Println("AAAA) Is it connected?", nc.IsConnected())
+	// fmt.Println(tcl)
+	// tcl.TC.SetConnectionStatus(int(nats.CLOSED))
+	// fmt.Println("BBBB) Is it connected?", nc.IsConnected())
+
+	// Change the state manually.
+	// tc := NewTestClient(nc)
 	fmt.Println("A) Is it connected?", nc.IsConnected())
 	tc.SetConnectionStatus(int(nats.CLOSED))
 	fmt.Println("B) Is it connected?", nc.IsConnected())
