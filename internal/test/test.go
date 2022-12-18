@@ -13,11 +13,12 @@ type Engine interface {
 	// Ensures that no one can implement this interface,
 	// unless the this interface type is embedded,
 	// meaning that the code is able to reach the internal package.
-	// private()
+	private()
 }
 
 type Client interface {
 	InternalTestEngine() Engine
+	private()
 }
 
 // func TestClient(conn interface{}) TC {
