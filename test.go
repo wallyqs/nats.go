@@ -13,34 +13,19 @@
 
 package nats
 
-// import (
-// 	it "github.com/nats-io/nats.go/internal/test"
-// )
+import "github.com/nats-io/nats.go/internal/test"
 
 // TestClient is a helper function used for internal testing,
-// it cannot be used outside of the nats package.
-// func TestClient(nc *Conn) *TC {
-// 	return &TC{&testClient{nc: nc}, nil}
-// }
-
-// type TC struct {
-// 	TC it.TC
-// }
-
-// func TestClient(nc *Conn) *TC {
-// 	return &TC{
-// 		TC: &testClient{nc},
-// 	}
-// }
-
+// it is not helpful to use outside the nats module.
 func TestClient(nc *Conn) TC {
 	return &testClient{nc}
 }
 
+// TC is an interface internally used for testing.
 type TC interface {
-	IsTestClient() bool
-	// Ensures that no one can implement this interface,
-	// unless the this interface type is embedded.
+	// IsTestClient() bool
+	// Ensures that no one can implement or use this interface
+	// outside of the current package.
 	private()
 }
 
@@ -51,13 +36,22 @@ type testClient struct {
 
 func (tc *testClient) private() {}
 
-// SetConnectionStatus overrides the status of the connection.
-func (tc *testClient) SetConnectionStatus(status int) {
-	tc.nc.mu.Lock()
-	tc.nc.status = Status(status)
-	tc.nc.mu.Unlock()
+func (tc *testClient) InternalTestEngine() internal_test.Engine {
+	return &internalTestEngine{tc}
 }
 
-func (tc *testClient) IsTestClient() bool {
-	return true
+// func (tc *testClient) IsTestClient() bool {
+// 	return true
+// }
+
+type internalTestEngine struct {
+	tc *testClient
+}
+
+// SetConnectionStatus overrides the status of the connection.
+func (e *internalTestEngine) SetConnectionStatus(status int) {
+	nc := e.tc.nc
+	nc.mu.Lock()
+	nc.status = Status(status)
+	nc.mu.Unlock()
 }
