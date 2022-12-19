@@ -2642,3 +2642,38 @@ func TestRetryOnFailedConnectWithTLSError(t *testing.T) {
 		t.Fatal("Should have connected")
 	}
 }
+
+func TestRequestInit(t *testing.T) {
+	o := test.DefaultTestOptions
+	o.Port = -1
+	s := RunServerWithOptions(o)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	if _, err := nc.Subscribe("foo", func(m *nats.Msg) {
+		m.Respond([]byte("reply"))
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	// Artificially change the status to something that would make the internal subscribe
+	// call fail. Don't use CLOSED because then there is a risk that the flusher() goes away
+	// and so the rest of the test would fail.
+	tc := NewTestClient(nc)
+	orgStatus := tc.ConnectionStatus()
+	tc.SetConnectionStatus(int(nats.DRAINING_SUBS))
+
+	if _, err := nc.Request("foo", []byte("request"), 50*time.Millisecond); err == nil {
+		t.Fatal("Expected error, got none")
+	}
+	tc.SetConnectionStatus(orgStatus)
+
+	if _, err := nc.Request("foo", []byte("request"), 500*time.Millisecond); err != nil {
+		t.Fatalf("Error on request: %v", err)
+	}
+}

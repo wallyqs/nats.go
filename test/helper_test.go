@@ -26,6 +26,7 @@ import (
 	"github.com/nats-io/nats.go"
 
 	natsserver "github.com/nats-io/nats-server/v2/test"
+	internal_test "github.com/nats-io/nats.go/internal/test"
 )
 
 // So that we can pass tests and benchmarks...
@@ -130,6 +131,10 @@ func RunBasicJetStreamServer() *server.Server {
 	opts.Port = -1
 	opts.JetStream = true
 	return RunServerWithOptions(opts)
+}
+
+func NewTestClient(nc *nats.Conn) internal_test.InternalTestClient {
+	return nats.TestClient(nc).(internal_test.TC).InternalTestClient()
 }
 
 func createConfFile(t *testing.T, content []byte) string {
