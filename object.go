@@ -149,31 +149,42 @@ var (
 
 // ObjectStoreConfig is the config for the object store.
 type ObjectStoreConfig struct {
-	Bucket      string
+	// Bucket is the bucket name.
+	Bucket string
+
+	// Description is the description of the bucket.
 	Description string
-	TTL         time.Duration
-	MaxBytes    int64
-	Storage     StorageType
-	Replicas    int
-	Placement   *Placement
+
+	// TTL indicates how long objects are kept in the bucket.
+	TTL time.Duration
+
+	// Storage indicates the underlying JetStream storage technology used to store data.
+	Storage StorageType
+
+	// Replicas indicates how many storage replicas are kept for the data in the bucket.
+	Replicas int
+
+	// MaxBytes are the max bytes 
+	MaxBytes  int64
+	Placement *Placement
 }
 
 type ObjectStoreStatus interface {
-	// Bucket is the name of the bucket
+	// Bucket is the name of the bucket.
 	Bucket() string
-	// Description is the description supplied when creating the bucket
+	// Description is the description supplied when creating the bucket.
 	Description() string
-	// TTL indicates how long objects are kept in the bucket
+	// TTL indicates how long objects are kept in the bucket.
 	TTL() time.Duration
-	// Storage indicates the underlying JetStream storage technology used to store data
+	// Storage indicates the underlying JetStream storage technology used to store data.
 	Storage() StorageType
-	// Replicas indicates how many storage replicas are kept for the data in the bucket
+	// Replicas indicates how many storage replicas are kept for the data in the bucket.
 	Replicas() int
-	// Sealed indicates the stream is sealed and cannot be modified in any way
+	// Sealed indicates the stream is sealed and cannot be modified in any way.
 	Sealed() bool
-	// Size is the combined size of all data in the bucket including metadata, in bytes
+	// Size is the combined size of all data in the bucket including metadata, in bytes.
 	Size() uint64
-	// BackingStore provides details about the underlying storage
+	// BackingStore provides details about the underlying storage.
 	BackingStore() string
 }
 
@@ -254,6 +265,8 @@ func (js *js) CreateObjectStore(cfg *ObjectStoreConfig) (ObjectStore, error) {
 	name := cfg.Bucket
 	chunks := fmt.Sprintf(objAllChunksPreTmpl, name)
 	meta := fmt.Sprintf(objAllMetaPreTmpl, name)
+	fmt.Println("chunks: ", chunks)
+	fmt.Println("meta:   ", meta)
 
 	// We will set explicitly some values so that we can do comparison
 	// if we get an "already in use" error and need to check if it is same.
@@ -346,6 +359,7 @@ func (obs *obs) Put(meta *ObjectMeta, r io.Reader, opts ...ObjectOpt) (*ObjectIn
 
 	// These will be used in more than one place
 	chunkSubj := fmt.Sprintf(objChunksPreTmpl, obs.name, newnuid)
+	fmt.Println("::: ", chunkSubj)
 
 	// Grab existing meta info (einfo). Ok to be found or not found, any other error is a problem
 	// Chunks on the old nuid can be cleaned up at the end

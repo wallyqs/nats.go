@@ -30,6 +30,28 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+func TestTryObject(t *testing.T) {
+	t.Logf("---------------------------")
+	s := RunBasicJetStreamServer()
+	defer shutdownJSServerAndRemoveStorage(t, s)
+
+	nc, js := jsClient(t, s)
+	defer nc.Close()
+
+	obs, err := js.CreateObjectStore(&nats.ObjectStoreConfig{
+		Bucket: "MYNAME",
+		Description: "testing",
+	})
+
+	// Create ~16MB object.
+	blob := make([]byte, 16*1024*1024+22)
+	rand.Read(blob)
+
+	info, err := obs.PutBytes("BLOB", blob)
+	t.Logf("::::::::: %v", err)
+	t.Logf("========= %+v", info)
+}
+
 func TestObjectBasics(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer shutdownJSServerAndRemoveStorage(t, s)
