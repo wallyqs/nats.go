@@ -1,112 +1,174 @@
 package nats
 
 import (
+	// "context"
+
 	"github.com/nats-io/nats.go/internal/vnext"
 )
 
-// // VNextConn is an interface that represents the next version
-// // of the client but that cannot be depended upon yet, mostly used to
-// // to scaffold packages that may try to start using it already.
-// type VNextConn interface {
-// 	// Interface that cannot be implemented or depended upon
-// 	// outside of the nats package.
-// 	private()
-// }
-
-type MsgHandlerI interface {
-	MsgHandler
+// VNextClient is an interface that represents a next version
+// of the client but that cannot be depended upon yet, mostly used to
+// to scaffold packages that may try to start using it already
+// and internal development of interfaces from the future.
+type VNextClient interface {
+	// Connect(string, ...ConnectOption) (vnext.Conn, error)
+	// Interface that cannot be implemented outside of the nats package.
+	private()
 }
 
-func WithMsgHandler(cb MsgHandler) vnext.Handler {
-	return nil
+// VNext returns the context of a V2 client that can connect.
+func VNext() VNextClient {
+	return &v2alpha{}
 }
 
-// VNext returns an interface of a possible next version of the NATS client APIs.
-func VNext(nc *Conn) vnext.Conn {
-	return &vnextClient{nc, nil}
-}
+// v2alpha is the internal v2 client implementation.
+type v2alpha struct {}
 
-// type vnextMsg struct {
-// 	*Msg
-// }
-
-// func(*vnextMsg) ProcessMsg(msg vnext.Msg) {}
-
-type mHandler struct {
-	cb MsgHandler
-}
-
-type msgHandler interface {
-	processMsg(*Msg)
-}
-
-// MsgHandler implements both an internal interface
-func (fn MsgHandler) processMsg(msg *Msg) { fn(msg) }
-func (fn MsgHandler) ProcessMsg(msg vnext.Msg) {
-	m := &Msg{
-		Subject: msg.Subject(),
-		Reply: msg.Reply(),
-		Data: msg.Data(),
-		Header: msg.Header().(Header),
+// Connect is compatible with nats.go v1 Connect but takes functional option
+// interfaces instead for more flexibility.
+func (v2alpha) Connect(url string, opts ...ConnectOption) (vnext.Conn, error) {
+	nc, err := Connect(url, connectOptions(opts...))
+	if err != nil {
+		return nil, err
 	}
-	fn(m)
+	return &v2Conn{nc}, nil
 }
 
-// MsgHandler can act as a vnext.Handler
-var _ vnext.Handler = MsgHandler(func(*Msg){})
+// private makes it so that the interface cannot be implemented upon yet.
+func (v2alpha) private() {}
 
-// func(fn msgHandler) processMsg(msg *Msg) {
-// 	fn(msg)
-// }
+type vnextMsg struct {
+	*Msg
+}
 
-// func(fn msgHandler) ProcessMsg(msg vnext.Msg) {
-// 	fn(msg)
-// }
+func (msg *vnextMsg) Subject() string {
+	return msg.Msg.Subject
+}
 
-// vnextClient is an implementation of the next gen client.
-type vnextClient struct {
+func (msg *vnextMsg) Reply() string {
+	return msg.Msg.Reply
+}
+
+func (msg *vnextMsg) Data() []byte {
+	return msg.Msg.Data
+}
+
+func (msg *vnextMsg) Header() vnext.Header {
+	return msg.Msg.Header
+}
+
+func (msg *vnextMsg) Respond(data []byte) error {
+	return msg.Msg.Respond(data)
+}
+
+////////////////////////////////////////
+//                                    //
+// Base NATS V2 Client implementation //
+//                                    //
+////////////////////////////////////////
+
+// v1 MsgHandler can act as a vnext.Handler.
+var _ vnext.Handler = MsgHandler(func(*Msg) {})
+var _ vnext.Conn = &v2Conn{}
+var _ vnext.Msg = &vnextMsg{}
+
+// v2Conn is a possible implementation of a next gen client.
+type v2Conn struct {
 	nc *Conn
-	vnext.Conn
 }
 
-func (vc *vnextClient) Publish(subj string, data []byte) error {
+func (vc *v2Conn) Publish(subj string, data []byte) error {
+	return vc.nc.Publish(subj, data)
+}
+
+func (vc *v2Conn) PublishRequest(subj, reply string, data []byte) error {
+	return vc.nc.PublishRequest(subj, reply, data)
+}
+
+func (vc *v2Conn) PublishMsg(vnext.Msg) error {
 	return nil
 }
 
-func (vc *vnextClient) PublishRequest(subj, reply string, data []byte) error {
+func (vc *v2Conn) Subscribe(subj string, cb vnext.Handler) (vnext.Subscription, error) {
+	var (
+		sub vnext.Subscription
+		err error
+	)
+	switch fn := cb.(type) {
+	case MsgHandler, vnext.MsgHandler:
+		_, err = vc.nc.Subscribe(subj, func(msg *Msg) {
+			fn.ProcessMsg(&vnextMsg{msg})
+		})
+	}
+	if err != nil {
+		return nil, err
+	}
+	return sub, nil
+}
+
+func (vc *v2Conn) Drain() error {
 	return nil
 }
 
-func (vc *vnextClient) PublishMsg(vnext.Msg) error {
-	return nil
+func (vc *v2Conn) Close() {
 }
 
-func (vc *vnextClient) Subscribe(subj string, cb vnext.Handler) (vnext.Subscription, error) {
-	// ---
-	_, err := vc.nc.Subscribe(subj, nil)
+func (vc *v2Conn) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
+	_, err := vc.nc.QueueSubscribe(subj, queue, nil)
 	if err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
-// func (vc *vnextClient) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
-// 	_, err := vc.nc.QueueSubscribe(subj, queue, cb)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return nil, nil
+///////////////////////////////////////
+//                                   //
+//  Enhanced types for compatibility //
+//                                   //
+///////////////////////////////////////
+
+// Takes a collection of connect options and turns them into
+// a series of ConnectOption interfaces.
+func connectOptions(options ...ConnectOption) Option {
+	return func(o *Options) error {
+		for _, opt := range options {
+			if opt != nil {
+				if err := opt.ConfigureConnect(o); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+}
+
+// Context based APIs interface.
+// nc.Context(ctx).Publish()
+
+// // Converts nats.MsgHandler to an interface type that is
+// // composable.
+// func WithMsgHandler(cb MsgHandler) vnext.Handler {
+// 	return nil
 // }
 
-//
-// type V2Client = vnext.Client
-//
-// type v2client struct {
-// 	*Conn
-// 	vnext.Client
-// }
-//
-// func (nc *Conn) V2() V2Client {
-// 	return &v2client{Conn: nc}
-// }
-//
+// ConfigureConnect implements the ConnectOption interface.
+func (fn Option) ConfigureConnect(opts *Options) error {
+	return fn(opts)
+}
+
+// ConnectOption is an option to configure the connection.
+type ConnectOption interface {
+	ConfigureConnect(*Options) error
+}
+
+// ProcessMsg implements the vnext.Handler interface for
+// the regular MsgHandler callbacks.
+func (fn MsgHandler) ProcessMsg(msg vnext.Msg) {
+	m := &Msg{
+		Subject: msg.Subject(),
+		Reply:   msg.Reply(),
+		Data:    msg.Data(),
+		Header:  msg.Header().(Header),
+	}
+	fn(m)
+}

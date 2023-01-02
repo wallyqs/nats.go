@@ -16,14 +16,14 @@ type Conn interface {
 	Subscribe(subj string, cb Handler) (Subscription, error)
 	QueueSubscribe(subj, queue string, cb Handler) (Subscription, error)
 	Drain() error
+	// Request
+	// Flush() error
 	Close()
 	// Stats()  -> Statistics
 	// Status() -> connected, closed, etc...
 	// Info()   -> ServerID, ClientID, etc...
-	private()
+	// private()
 }
-
-// type Handler interface {}
 
 type Handler interface {
 	ProcessMsg(Msg)
@@ -46,7 +46,7 @@ type Msg interface {
 	Header() Header
 	// SetHeader(Header)
 	Respond([]byte) error
-	RespondMsg(Msg) error
+	// RespondMsg(Msg) error
 }
 
 type Header interface {
