@@ -1,83 +1,112 @@
 package nats
 
 import (
-	"fmt"
-
 	"github.com/nats-io/nats.go/internal/vnext"
 )
 
-// VNextClient is an interface that represents the next version
-// of the client but that cannot be depended upon yet, mostly used to
-// to scaffold packages that may try to start using it already.
-type VNextClient interface {
-	Connect(url string, options ...Option) (VNextClient, error)
-	// Interface that cannot be implemented or depended upon
-	// outside of the nats package.
-	private()
+// // VNextConn is an interface that represents the next version
+// // of the client but that cannot be depended upon yet, mostly used to
+// // to scaffold packages that may try to start using it already.
+// type VNextConn interface {
+// 	// Interface that cannot be implemented or depended upon
+// 	// outside of the nats package.
+// 	private()
+// }
+
+type MsgHandlerI interface {
+	MsgHandler
 }
 
-// VNext returns the next version of the NATS client APIs.
-func VNext() VNextClient {
-	return &vnextClient{}
+func WithMsgHandler(cb MsgHandler) vnext.Handler {
+	return nil
 }
+
+// VNext returns an interface of a possible next version of the NATS client APIs.
+func VNext(nc *Conn) vnext.Conn {
+	return &vnextClient{nc, nil}
+}
+
+// type vnextMsg struct {
+// 	*Msg
+// }
+
+// func(*vnextMsg) ProcessMsg(msg vnext.Msg) {}
+
+type mHandler struct {
+	cb MsgHandler
+}
+
+type msgHandler interface {
+	processMsg(*Msg)
+}
+
+// MsgHandler implements both an internal interface
+func (fn MsgHandler) processMsg(msg *Msg) { fn(msg) }
+func (fn MsgHandler) ProcessMsg(msg vnext.Msg) {
+	m := &Msg{
+		Subject: msg.Subject(),
+		Reply: msg.Reply(),
+		Data: msg.Data(),
+		Header: msg.Header().(Header),
+	}
+	fn(m)
+}
+
+// MsgHandler can act as a vnext.Handler
+var _ vnext.Handler = MsgHandler(func(*Msg){})
+
+// func(fn msgHandler) processMsg(msg *Msg) {
+// 	fn(msg)
+// }
+
+// func(fn msgHandler) ProcessMsg(msg vnext.Msg) {
+// 	fn(msg)
+// }
 
 // vnextClient is an implementation of the next gen client.
 type vnextClient struct {
 	nc *Conn
+	vnext.Conn
 }
 
-func (*vnextClient) private() {}
+func (vc *vnextClient) Publish(subj string, data []byte) error {
+	return nil
+}
 
-// Connect takes ConnectOption interface instead, and Option implements that.
-func (vc *vnextClient) Connect(url string, options ...Option) (VNextClient, error) {
-	if vc == nil {
-		return nil, fmt.Errorf("nats: invalid call to vnext client")
-	}
-	nc, err := Connect(url, options...)
+func (vc *vnextClient) PublishRequest(subj, reply string, data []byte) error {
+	return nil
+}
+
+func (vc *vnextClient) PublishMsg(vnext.Msg) error {
+	return nil
+}
+
+func (vc *vnextClient) Subscribe(subj string, cb vnext.Handler) (vnext.Subscription, error) {
+	// ---
+	_, err := vc.nc.Subscribe(subj, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &v2Client{nc, vc, nil, nil}, nil
-}
-
-type v2Client struct {
-	nc *Conn
-	vc *vnextClient
-	VNextClient
-	vnext.Client
-}
-
-func (*v2Client) Publish(subj string, data []byte) error {
-	return nil
-}
-
-func (*v2Client) PublishRequest(subj, reply string, data []byte) error {
-	return nil
-}
-
-func (*v2Client) PublishMsg(vnext.Msg) error {
-	return nil
-}
-
-func (*v2Client) Subscribe(subj string, cb vnext.Handler) (vnext.Subscription, error) {
-	fmt.Println("aaaaaaaaaaa", subj, cb)
 	return nil, nil
 }
 
-func (*v2Client) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
-	fmt.Println("bbbbbbbbbbb", subj, queue, cb)
-	return nil, nil
-}
+// func (vc *vnextClient) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
+// 	_, err := vc.nc.QueueSubscribe(subj, queue, cb)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	return nil, nil
+// }
 
 //
 // type V2Client = vnext.Client
-// 
+//
 // type v2client struct {
 // 	*Conn
 // 	vnext.Client
 // }
-// 
+//
 // func (nc *Conn) V2() V2Client {
 // 	return &v2client{Conn: nc}
 // }
-// 
+//
