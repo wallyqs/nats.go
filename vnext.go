@@ -164,6 +164,8 @@ type ConnectOption interface {
 // ProcessMsg implements the vnext.Handler interface for
 // the regular MsgHandler callbacks.
 func (fn MsgHandler) ProcessMsg(msg vnext.Msg) {
+	// TODO: Lost metadata and inner state?
+	// How to use Respond() without the connection?
 	m := &Msg{
 		Subject: msg.Subject(),
 		Reply:   msg.Reply(),
