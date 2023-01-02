@@ -131,6 +131,7 @@ func TestV2Client(t *testing.T) {
 	}))
 	nc.Publish("asdf", []byte("hello"))
 	nc.Publish("foo", []byte("hello"))
+	nc.PublishRequest("foo", "bar", []byte("hello!!!!!"))
 	time.Sleep(1 * time.Second)
 	// nc.QueueSubscribe("foo", "bar", vnext.MsgHandler(func(msg vnext.Msg){
 	// }))

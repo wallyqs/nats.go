@@ -1,8 +1,8 @@
 package vnext
 
 type Subscription interface {
-	Subject() string
-	Queue() string
+	// Subject() string
+	// Queue() string
 	Unsubscribe() error
 	Drain() error
 	// Pending
@@ -12,7 +12,7 @@ type Subscription interface {
 type Conn interface {
 	Publish(subj string, data []byte) error
 	PublishRequest(subj, reply string, data []byte) error
-	PublishMsg(Msg) error
+	// PublishMsg(Msg) error
 	Subscribe(subj string, cb Handler) (Subscription, error)
 	QueueSubscribe(subj, queue string, cb Handler) (Subscription, error)
 	Drain() error

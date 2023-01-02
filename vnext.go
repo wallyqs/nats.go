@@ -38,27 +38,28 @@ func (v2alpha) Connect(url string, opts ...ConnectOption) (vnext.Conn, error) {
 func (v2alpha) private() {}
 
 type vnextMsg struct {
-	*Msg
+	m *Msg
+	nc vnext.Conn
 }
 
 func (msg *vnextMsg) Subject() string {
-	return msg.Msg.Subject
+	return msg.m.Subject
 }
 
 func (msg *vnextMsg) Reply() string {
-	return msg.Msg.Reply
+	return msg.m.Reply
 }
 
 func (msg *vnextMsg) Data() []byte {
-	return msg.Msg.Data
+	return msg.m.Data
 }
 
 func (msg *vnextMsg) Header() vnext.Header {
-	return msg.Msg.Header
+	return msg.m.Header
 }
 
 func (msg *vnextMsg) Respond(data []byte) error {
-	return msg.Msg.Respond(data)
+	return msg.nc.Publish(msg.m.Reply, data)
 }
 
 ////////////////////////////////////////
@@ -85,19 +86,19 @@ func (vc *v2Conn) PublishRequest(subj, reply string, data []byte) error {
 	return vc.nc.PublishRequest(subj, reply, data)
 }
 
-func (vc *v2Conn) PublishMsg(vnext.Msg) error {
-	return nil
-}
+// func (vc *v2Conn) PublishMsg(vnext.Msg) error {
+// 	return nil
+// }
 
 func (vc *v2Conn) Subscribe(subj string, cb vnext.Handler) (vnext.Subscription, error) {
 	var (
-		sub vnext.Subscription
+		sub *Subscription
 		err error
 	)
 	switch fn := cb.(type) {
 	case MsgHandler, vnext.MsgHandler:
-		_, err = vc.nc.Subscribe(subj, func(msg *Msg) {
-			fn.ProcessMsg(&vnextMsg{msg})
+		sub, err = vc.nc.Subscribe(subj, func(msg *Msg) {
+			fn.ProcessMsg(&vnextMsg{msg, vc.nc})
 		})
 	}
 	if err != nil {
