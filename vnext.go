@@ -39,7 +39,7 @@ func (v2alpha) private() {}
 
 type vnextMsg struct {
 	m *Msg
-	nc vnext.Conn
+	nc *Conn
 }
 
 func (msg *vnextMsg) Subject() string {
@@ -114,13 +114,13 @@ func (vc *v2Conn) Drain() error {
 func (vc *v2Conn) Close() {
 }
 
-func (vc *v2Conn) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
-	_, err := vc.nc.QueueSubscribe(subj, queue, nil)
-	if err != nil {
-		return nil, err
-	}
-	return nil, nil
-}
+// func (vc *v2Conn) QueueSubscribe(subj, queue string, cb vnext.Handler) (vnext.Subscription, error) {
+// 	_, err := vc.nc.QueueSubscribe(subj, queue, nil)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	return nil, nil
+// }
 
 ///////////////////////////////////////
 //                                   //

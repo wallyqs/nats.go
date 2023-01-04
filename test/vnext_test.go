@@ -1,6 +1,8 @@
 package test
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -101,6 +103,56 @@ type V2Alpha interface {
 	Connect(string, ...nats.ConnectOption) (vnext.Conn, error)
 }
 
+func SlowMsgHandler(h vnext.MsgHandler) vnext.Handler {
+	return vnext.MsgHandler(func(msg vnext.Msg) {
+		fmt.Println("Slower handler:...", string(msg.Data()))
+		h.ProcessMsg(msg)
+	})
+}
+
+func WithChannel(ch chan vnext.Msg) vnext.Handler {
+	return vnext.MsgHandler(func(msg vnext.Msg) {
+		fmt.Println("Receiving...", msg)
+		ch <- msg
+	})
+}
+
+// // Encoded conn interface uses any instead of payloads.
+// type JSONCtx struct {
+// 	nc vnext.Conn
+// 	vnext.Conn
+// }
+
+// func (ctx *JSONCtx) Publish(subj string, msg any) error {
+// 	b, err := json.Marshal(msg)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	return ctx.nc.Publish(subj, b)
+// }
+
+// // type jsonHandler struct {
+// // }
+
+// // func (*jsonHandler) Subscribe(subj string, )
+
+// func (ctx *JSONCtx) Subscribe(subj string, cb func(msg any)) (vnext.Subscription, error) {
+// 	// b, err := json.Unmarshal(msg)
+// 	// if err != nil {
+// 	// 	return err
+// 	// }
+// 	// return ctx.nc.Publish(subj, b)
+// 	var jsonHandler vnext.MsgHandler = func(m vnext.Msg) {
+// 		json.Unmarshal(m.Data())
+// 		cb(m)
+// 	}
+// 	return ctx.nc.Subscribe(subj, jsonHandler)
+// })
+
+// func JSON(nc vnext.Conn) *JSONCtx {
+// 	return &JSONCtx{nc, nil}
+// }
+
 func TestV2Client(t *testing.T) {
 	// Surface the work in progress version of the NATS client.
 	v2 := nats.VNext().(V2Alpha)
@@ -124,7 +176,7 @@ func TestV2Client(t *testing.T) {
 	}
 	nc.Subscribe("foo", v1cb)
 
-	// breaking change: anonymous function callback has to be casted into MsgHandler type.
+	// Breaking Change: anonymous function callback has to be casted into MsgHandler type.
 	nc.Subscribe("foo", nats.MsgHandler(func(msg *nats.Msg) {
 		t.Logf("v1 style handler: Got a message on %q: %q", msg.Subject, msg.Data)
 		msg.Respond([]byte("Hello World!"))
@@ -132,7 +184,32 @@ func TestV2Client(t *testing.T) {
 	nc.Publish("asdf", []byte("hello"))
 	nc.Publish("foo", []byte("hello"))
 	nc.PublishRequest("foo", "bar", []byte("hello!!!!!"))
+	nc.Subscribe(">", SlowMsgHandler(func(msg vnext.Msg) {
+		msg.Respond([]byte("responding!"))
+	}))
+	nc.Publish("foo", []byte("hello"))
+
+	// ch := make(chan vnext.Msg, 100)
+	// nc.Subscribe(">", WithChannel(ch))
+
+	// fmt.Println("...............")
+	// nc.Publish("foo", []byte("hello"))
+	// nc.Publish("foo", []byte("hello"))
+	// msg := <-ch
+	// fmt.Println("Got via channel: ", string(msg.Data()))
+
+	// js := &JSONConn{nc}
+	// js.Publish("json", []byte("hello world"))
+	js := JSON(nc)
+	js.Publish("json", []byte("hello world"))
+
+	// Inline encoder.
+	err = JSON(nc).Publish("json", []byte("hello world!!!!!!"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(1 * time.Second)
+
 	// nc.QueueSubscribe("foo", "bar", vnext.MsgHandler(func(msg vnext.Msg){
 	// }))
 	// nc.Close()

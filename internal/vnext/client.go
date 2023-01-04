@@ -14,7 +14,7 @@ type Conn interface {
 	PublishRequest(subj, reply string, data []byte) error
 	// PublishMsg(Msg) error
 	Subscribe(subj string, cb Handler) (Subscription, error)
-	QueueSubscribe(subj, queue string, cb Handler) (Subscription, error)
+	// QueueSubscribe(subj, queue string, cb Handler) (Subscription, error)
 	Drain() error
 	// Request
 	// Flush() error
@@ -29,7 +29,7 @@ type Handler interface {
 	ProcessMsg(Msg)
 }
 
-// MsgHandler is a helper type to be able to create callbacks,
+// MsgHandler is a helper type to be able to create callbacks
 // a la http.HandlerFunc.
 type MsgHandler func(Msg)
 
