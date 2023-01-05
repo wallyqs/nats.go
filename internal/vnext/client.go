@@ -25,6 +25,7 @@ type Conn interface {
 	// private()
 }
 
+// Handler replaces nats.Handler.
 type Handler interface {
 	ProcessMsg(Msg)
 }
@@ -38,6 +39,7 @@ func (fn MsgHandler) ProcessMsg(msg Msg) {
 }
 
 // Msg has to be a concrete type maybe?
+// But the current handler has to conform to some interface.
 // Nah...
 type Msg interface {
 	Subject() string
@@ -45,10 +47,13 @@ type Msg interface {
 	Data() []byte
 	Header() Header
 	// SetHeader(Header)
+
+	// Respond definitely an interface.
 	Respond([]byte) error
 	// RespondMsg(Msg) error
 }
 
+// Should be a concrete type
 type Header interface {
 	Add(key, value string)
 	Set(key, value string)

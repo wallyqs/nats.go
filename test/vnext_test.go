@@ -117,19 +117,35 @@ func WithChannel(ch chan vnext.Msg) vnext.Handler {
 	})
 }
 
-// // Encoded conn interface uses any instead of payloads.
-// type JSONCtx struct {
-// 	nc vnext.Conn
-// 	vnext.Conn
-// }
+func JSON[T any](nc vnext.Conn) *JSONCtx[T] {
+	return &JSONCtx[T]{nc}
+}
 
-// func (ctx *JSONCtx) Publish(subj string, msg any) error {
-// 	b, err := json.Marshal(msg)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	return ctx.nc.Publish(subj, b)
-// }
+// Encoded conn interface uses any instead of payloads.
+type JSONCtx[T any] struct {
+	nc vnext.Conn
+	// vnext.Conn
+	// kind T
+}
+
+func (ctx *JSONCtx[T]) Publish(subj string, msg T) error {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	return ctx.nc.Publish(subj, b)
+}
+
+func (ctx *JSONCtx[T]) Subscribe(subj string, cb func(*T)) {
+	ctx.nc.Subscribe(subj, vnext.MsgHandler(func(m vnext.Msg){
+		t := new(T)
+		err := json.Unmarshal(m.Data(), &t)
+		if err != nil {
+			fmt.Println("foo", err)
+		}
+		cb(t)
+	}))
+}
 
 // // type jsonHandler struct {
 // // }
@@ -149,8 +165,8 @@ func WithChannel(ch chan vnext.Msg) vnext.Handler {
 // 	return ctx.nc.Subscribe(subj, jsonHandler)
 // })
 
-// func JSON(nc vnext.Conn) *JSONCtx {
-// 	return &JSONCtx{nc, nil}
+// func JSON[T any](nc vnext.Conn) *JSONCtx {
+// 	return &JSONCtx{nc, nil, nil}
 // }
 
 func TestV2Client(t *testing.T) {
@@ -200,14 +216,30 @@ func TestV2Client(t *testing.T) {
 
 	// js := &JSONConn{nc}
 	// js.Publish("json", []byte("hello world"))
-	js := JSON(nc)
-	js.Publish("json", []byte("hello world"))
+	type myMsg struct {
+		Foo string
+	}
+
+	// js := &JSON[myMsg]{nc: nc, kind: nil}
+	// js.Publish("json", []byte("hello world"))
+	// JSON(nc).Publish("json", []byte("hello world"))
+
+	// ctx := &JSONCtx[myMsg]{nc}
+	ctx := JSON[myMsg](nc)
+	ctx.Publish("json", myMsg{"hello world"})
+
+	ctx.Subscribe("json", func(msg *myMsg){
+		fmt.Printf("Generics! %+v\n", msg)
+		fmt.Println("My Foo is ", msg.Foo)
+	})
+	ctx.Publish("json", myMsg{"hello world"})
+	// ctx.Publish("json", []byte("hello world"))
 
 	// Inline encoder.
-	err = JSON(nc).Publish("json", []byte("hello world!!!!!!"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// err = JSON(nc).Publish("json", []byte("hello world!!!!!!"))
+	// if err != nil {
+	// 	t.Fatal(err)
+	// }
 	time.Sleep(1 * time.Second)
 
 	// nc.QueueSubscribe("foo", "bar", vnext.MsgHandler(func(msg vnext.Msg){
