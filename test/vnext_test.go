@@ -117,12 +117,12 @@ func WithChannel(ch chan vnext.Msg) vnext.Handler {
 	})
 }
 
-func JSON[T any](nc vnext.Conn) *JSONCtx[T] {
+func JSON[T BaseMsg](nc vnext.Conn) *JSONCtx[T] {
 	return &JSONCtx[T]{nc}
 }
 
 // Encoded conn interface uses any instead of payloads.
-type JSONCtx[T any] struct {
+type JSONCtx[T BaseMsg] struct {
 	nc vnext.Conn
 	// vnext.Conn
 	// kind T
@@ -138,12 +138,12 @@ func (ctx *JSONCtx[T]) Publish(subj string, msg T) error {
 
 func (ctx *JSONCtx[T]) Subscribe(subj string, cb func(*T)) {
 	ctx.nc.Subscribe(subj, vnext.MsgHandler(func(m vnext.Msg){
-		t := new(T)
-		err := json.Unmarshal(m.Data(), &t)
+		o := new(T)
+		err := json.Unmarshal(m.Data(), &o)
 		if err != nil {
 			fmt.Println("foo", err)
 		}
-		cb(t)
+		cb(o)
 	}))
 }
 
@@ -169,8 +169,45 @@ func (ctx *JSONCtx[T]) Subscribe(subj string, cb func(*T)) {
 // 	return &JSONCtx{nc, nil, nil}
 // }
 
+type BaseMsg interface {
+	Subject() string
+	Reply() string
+	Data() []byte
+	Header() vnext.Header
+	// No response methods
+}
+
+type myMsg struct {
+	Foo string
+	msg BaseMsg
+}
+
+func (m myMsg) Subject() string {
+	return m.msg.Subject()
+}
+
+func (m myMsg) Reply() string {
+	return m.msg.Reply()
+}
+
+func (m myMsg) Data() []byte {
+	return m.msg.Data()
+}
+
+func (m myMsg) Header() vnext.Header {
+	return m.msg.Header()
+}
+
+// JSON Stream are different types.  The micro package is better
+// suited for those respondable types instead.
+// Has to be bound to both the request/response type as well?
+// func (m myMsg) Respond(data T) error {
+// 	return m.msg.Respond(data)
+// }
+
 func TestV2Client(t *testing.T) {
 	// Surface the work in progress version of the NATS client.
+	// V2Alpha as discoverable via type assertion until ready.
 	v2 := nats.VNext().(V2Alpha)
 	nc, err := v2.Connect("localhost", nats.Name("v2:alpha:client"))
 	if err != nil {
@@ -193,6 +230,7 @@ func TestV2Client(t *testing.T) {
 	nc.Subscribe("foo", v1cb)
 
 	// Breaking Change: anonymous function callback has to be casted into MsgHandler type.
+	// In the future it may auto cast this again.
 	nc.Subscribe("foo", nats.MsgHandler(func(msg *nats.Msg) {
 		t.Logf("v1 style handler: Got a message on %q: %q", msg.Subject, msg.Data)
 		msg.Respond([]byte("Hello World!"))
@@ -216,23 +254,19 @@ func TestV2Client(t *testing.T) {
 
 	// js := &JSONConn{nc}
 	// js.Publish("json", []byte("hello world"))
-	type myMsg struct {
-		Foo string
-	}
-
 	// js := &JSON[myMsg]{nc: nc, kind: nil}
 	// js.Publish("json", []byte("hello world"))
 	// JSON(nc).Publish("json", []byte("hello world"))
 
 	// ctx := &JSONCtx[myMsg]{nc}
 	ctx := JSON[myMsg](nc)
-	ctx.Publish("json", myMsg{"hello world"})
+	ctx.Publish("json", myMsg{"hello world", nil})
 
 	ctx.Subscribe("json", func(msg *myMsg){
 		fmt.Printf("Generics! %+v\n", msg)
 		fmt.Println("My Foo is ", msg.Foo)
 	})
-	ctx.Publish("json", myMsg{"hello world"})
+	ctx.Publish("json", myMsg{Foo: "hello world"})
 	// ctx.Publish("json", []byte("hello world"))
 
 	// Inline encoder.
