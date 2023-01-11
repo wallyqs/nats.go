@@ -14,9 +14,11 @@
 package micro_test
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"reflect"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
@@ -263,4 +265,61 @@ func ExampleRequest_Error() {
 	}
 
 	fmt.Printf("%T", handler)
+}
+
+func WithContext(ctx context.Context, h func(context.Context, micro.Request)) micro.Handler {
+	return micro.HandlerFunc(func(req micro.Request) {
+		h(ctx, req)
+	})
+}
+
+func ExampleAddService_Custom() {
+	nc, err := nats.Connect("127.0.0.1:4222")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer nc.Close()
+
+	echoHandler := func(ctx context.Context, req micro.Request) {
+		log.Println("With Context:", ctx.Value("logging"))
+		req.Respond(req.Data())
+	}
+
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "logging", "example")
+
+	config := micro.Config{
+		Name:        "EchoService",
+		Version:     "1.0.0",
+		Description: "Send back what you receive",
+		Endpoint: micro.Endpoint{
+			Subject: "echo",
+			Handler: WithContext(ctx, echoHandler),
+		},
+		// DoneHandler can be set to customize behavior on stopping a service.
+		DoneHandler: func(srv micro.Service) {
+			info := srv.Info()
+			fmt.Printf("stopped service %q with ID %q\n", info.Name, info.ID)
+		},
+
+		// ErrorHandler can be used to customize behavior on service execution error.
+		ErrorHandler: func(srv micro.Service, err *micro.NATSError) {
+			info := srv.Info()
+			fmt.Printf("Service %q returned an error on subject %q: %s", info.Name, err.Subject, err.Description)
+		},
+	}
+
+	srv, err := micro.AddService(nc, config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer srv.Stop()
+
+	resp, err := nc.Request("echo", []byte("hello world"), 1*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Fatalf("Resp: %v", string(resp.Data))
+
+	// Output:
 }
