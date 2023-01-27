@@ -8399,3 +8399,45 @@ func TestJetStreamStreamInfoAlternates(t *testing.T) {
 		}
 	})
 }
+
+func TestJetStreamMetadata(t *testing.T) {
+	nc, err := nats.Connect("localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := js.AddStream(&nats.StreamConfig{
+		Name: "foo",
+		Metadata: map[string]string{
+			"foo": "bar",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("STREAM: %+v", stream)
+
+	stream, err = js.AddStream(&nats.StreamConfig{
+		Name: "bar",
+		Metadata: map[string]string{
+			"": "bar",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("STREAM: %+v", stream)
+
+	stream, err = js.AddStream(&nats.StreamConfig{
+		Name: "quux",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("STREAM: %+v", stream)
+}
