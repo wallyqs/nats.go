@@ -1909,22 +1909,35 @@ func (r *natsReader) doneWithConnect() {
 }
 
 func (r *natsReader) Read() ([]byte, error) {
+	// First check if Read will be reliable.
+	var err error
+	rn, err := r.r.Read(nil)
+	fmt.Println("RELIABLE?", rn, err)
+
+	start := time.Now()
 	if r.off >= 0 {
 		off := r.off
 		r.off = -1
+		fmt.Println(">>>>>>>>>>!", time.Since(start), r.n, string(r.buf[:r.n]))
 		return r.buf[off:r.n], nil
 	}
-	var err error
+	// time.Sleep(10*time.Millisecond)
 	r.n, err = r.r.Read(r.buf)
+	fmt.Println(">>>>>>>>>>O", time.Since(start), r.n, string(r.buf[:r.n]))
 	return r.buf[:r.n], err
 }
 
 func (r *natsReader) ReadString(delim byte) (string, error) {
+	start := time.Now()
+	var iii int
 	var s string
 build_string:
 	// First look if we have something in the buffer
+	iii++
 	if r.off >= 0 {
+		fmt.Println("~~~~~~~~~~~~~~", iii, time.Since(start))
 		i := bytes.IndexByte(r.buf[r.off:r.n], delim)
+		fmt.Println("~~~~~~~~~~~~~~", iii, time.Since(start))
 		if i >= 0 {
 			end := r.off + i + 1
 			s += string(r.buf[r.off:end])
@@ -1938,10 +1951,14 @@ build_string:
 		s += string(r.buf[r.off:r.n])
 		r.off = -1
 	}
-	if _, err := r.Read(); err != nil {
+	// r.SetReadDeadline(time.Now().Add(10*time.Millisecond))
+	n, err := r.Read()
+	if err != nil {
+		fmt.Println("XXXXXXXXXXXXXXXXXXXXXXXXXXX", n, iii, time.Since(start))
 		return s, err
 	}
 	r.off = 0
+	fmt.Println("_____________________", iii, time.Since(start), string(n), n)
 	goto build_string
 }
 
@@ -1991,6 +2008,7 @@ func (nc *Conn) createConn() (err error) {
 		// We will copy and shorten the timeout if we have multiple hosts to try.
 		copyDialer := *nc.Opts.Dialer
 		copyDialer.Timeout = copyDialer.Timeout / time.Duration(len(hosts))
+		fmt.Println("==============================> TIMEOUT", copyDialer.Timeout, len(hosts))
 		dialer = &copyDialer
 	}
 
@@ -1999,8 +2017,11 @@ func (nc *Conn) createConn() (err error) {
 			hosts[i], hosts[j] = hosts[j], hosts[i]
 		})
 	}
+	start := time.Now()
 	for _, host := range hosts {
+		fmt.Println("====================================================================================== PER HOST", host)
 		nc.conn, err = dialer.Dial("tcp", host)
+		fmt.Println("====================================================================================== PER HOST DONE", host, time.Since(start))
 		if err == nil {
 			break
 		}
@@ -2251,7 +2272,7 @@ func (nc *Conn) setup() {
 
 // Process a connected connection and initialize properly.
 func (nc *Conn) processConnectInit() error {
-
+	start := time.Now()
 	// Set our deadline for the whole connect process
 	nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
 	defer nc.conn.SetDeadline(time.Time{})
@@ -2266,19 +2287,25 @@ func (nc *Conn) processConnectInit() error {
 			return err
 		}
 	}
+	fmt.Println(":::::::::::::::::::::::::::::::::::::::::::::::::::A", time.Since(start))
 
 	// Process the INFO protocol received from the server
+	nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
 	err := nc.processExpectedInfo()
 	if err != nil {
 		return err
 	}
+	fmt.Println(":::::::::::::::::::::::::::::::::::::::::::::::::::B", time.Since(start))
 
 	// Send the CONNECT protocol along with the initial PING protocol.
 	// Wait for the PONG response (or any error that we get from the server).
+	nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
 	err = nc.sendConnect()
 	if err != nil {
+		fmt.Println("::::::::::::::CONNECT:::::::::::::::::::::::::::::::::::::C", time.Since(start), err)
 		return err
 	}
+	fmt.Println(":::::::::::::::::::::::::::::::::::::::::::::::::::C", time.Since(start))
 
 	// Reset the number of PING sent out
 	nc.pout = 0
@@ -2307,6 +2334,7 @@ func (nc *Conn) processConnectInit() error {
 // Main connect function. Will connect to the nats-server.
 func (nc *Conn) connect() (bool, error) {
 	var err error
+	var authErr error
 	var connectionEstablished bool
 
 	// Create actual socket connection
@@ -2315,6 +2343,10 @@ func (nc *Conn) connect() (bool, error) {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 	nc.initc = true
+
+	type timeout interface {
+		Timeout() bool
+	}
 	// The pool may change inside the loop iteration due to INFO protocol.
 	for i := 0; i < len(nc.srvPool); i++ {
 		nc.current = nc.srvPool[i]
@@ -2324,14 +2356,20 @@ func (nc *Conn) connect() (bool, error) {
 			// that function is now invoked from doReconnect() too.
 			nc.setup()
 
-			err = nc.processConnectInit()
+			// start := time.Now()
 
+			nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
+			err = nc.processConnectInit()
+			// fmt.Println("BOOOOOOOOOOOOOOOOOOOOO error here", err, time.Since(start))
 			if err == nil {
 				nc.current.didConnect = true
 				nc.current.reconnects = 0
 				nc.current.lastErr = nil
 				break
 			} else {
+				if errors.Is(err, ErrAuthorization) {
+					authErr = err
+				}
 				nc.mu.Unlock()
 				nc.close(DISCONNECTED, false, err)
 				nc.mu.Lock()
@@ -2365,6 +2403,15 @@ func (nc *Conn) connect() (bool, error) {
 		nc.current = nil
 	}
 
+	// When connecting to multiple servers prefer returning a auth failure
+	// hard errors that may have shown up during the connect attempts
+	// over network temporary i/o errors.
+	_, lastErrIsTimeout := err.(timeout)
+	if authErr != nil && lastErrIsTimeout {
+		fmt.Println("RETURNING AUTH ERROR INSTEAD!!!!!!!!!", err, authErr, lastErrIsTimeout)
+		return connectionEstablished, authErr
+	}
+	fmt.Println("RETURNING THIS!!!!!!!!!", err, authErr)
 	return connectionEstablished, err
 }
 
@@ -2409,8 +2456,14 @@ func (nc *Conn) processExpectedInfo() error {
 		return err
 	}
 
-	// The nats protocol should send INFO first always.
+	// The nats protocol should send INFO first, although -ERR can arrive
+	// first in some networks environments.
 	if c.op != _INFO_OP_ {
+		if c.op == _ERR_OP_ && strings.Contains(strings.ToLower(c.args), AUTHORIZATION_ERR) {
+			fmt.Println("GOT ERROR", c.op, c.args)
+			return ErrAuthorization
+		}
+		fmt.Println("ERROR IS", []byte(c.op), []byte(_ERR_OP_), c.args)
 		return ErrNoInfoReceived
 	}
 
@@ -2538,6 +2591,7 @@ func (nerr *natsProtoErr) Is(err error) bool {
 // applicable. Will wait for a flush to return from the server for error
 // processing.
 func (nc *Conn) sendConnect() error {
+	start := time.Now()
 	// Construct the CONNECT protocol string
 	cProto, err := nc.connectProto()
 	if err != nil {
@@ -2551,6 +2605,13 @@ func (nc *Conn) sendConnect() error {
 	if err := nc.bw.writeDirect(cProto, pingProto); err != nil {
 		return err
 	}
+	fmt.Println("===================================================A", time.Since(start))
+
+	// err = nc.processExpectedInfo()
+	// if err != nil {
+	// 	fmt.Println("===================================================B", time.Since(start), err)
+	// 	return err
+	// }
 
 	// We don't want to read more than we need here, otherwise
 	// we would need to transfer the excess read data to the readLoop.
@@ -2563,6 +2624,7 @@ func (nc *Conn) sendConnect() error {
 		}
 		return err
 	}
+	fmt.Println("===================================================C", time.Since(start))
 
 	// If opts.Verbose is set, handle +OK
 	if nc.Opts.Verbose && proto == okProto {
@@ -2612,7 +2674,12 @@ func (nc *Conn) sendConnect() error {
 
 // reads a protocol line.
 func (nc *Conn) readProto() (string, error) {
-	return nc.br.ReadString('\n')
+	s, err := nc.br.ReadString('\n')
+	if err != nil {
+		fmt.Println("ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", len(s), s, err)
+		return s, err
+	}
+	return s, err
 }
 
 // A control protocol line.
@@ -2970,6 +3037,7 @@ func (nc *Conn) readLoop() {
 			err = nc.parse(buf)
 		}
 		if err != nil {
+			fmt.Println("--------------->", buf)
 			nc.processOpErr(err)
 			break
 		}
@@ -3401,6 +3469,7 @@ func (nc *Conn) processOK() {
 // from the server.
 // This function may update the server pool.
 func (nc *Conn) processInfo(info string) error {
+	fmt.Println("INFO!!!!!!!!!!", info)
 	if info == _EMPTY_ {
 		return nil
 	}
