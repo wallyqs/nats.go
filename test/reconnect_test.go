@@ -892,7 +892,24 @@ func TestAuthExpiredReconnect(t *testing.T) {
 func TestForceReconnect(t *testing.T) {
 	s := RunDefaultServer()
 
-	nc, err := nats.Connect(s.ClientURL(), nats.ReconnectWait(10*time.Second))
+	// dch := make(chan bool, 2)
+	// dcb := func(_ *nats.Conn, _ error) { dch <- true }
+	// rch := make(chan bool)
+	// rcb := func(_ *nats.Conn) { rch <- true }
+
+	// nc, err := nats.Connect(secureURL,
+	// 	nats.RootCAs("./configs/certs/ca.pem"),
+	// 	nats.DisconnectErrHandler(dcb),
+	// 	nats.ReconnectHandler(rcb))
+	// if err != nil {
+	// 	t.Fatalf("Failed to create secure (TLS) connection: %v", err)
+	// }
+
+	nc, err := nats.Connect(s.ClientURL(), nats.ReconnectWait(10*time.Second),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			t.Logf("ERROR: %v", err)
+		}),
+	)
 	if err != nil {
 		t.Fatalf("Unexpected error on connect: %v", err)
 	}
@@ -924,6 +941,7 @@ func TestForceReconnect(t *testing.T) {
 	}
 
 	// Force a reconnect
+	t.Logf("FORCE RECONNECT!!!!!!!!!!! %v", nc.IsReconnecting())
 	err = nc.ForceReconnect()
 	if err != nil {
 		t.Fatalf("Unexpected error on reconnect: %v", err)
@@ -942,16 +960,25 @@ func TestForceReconnect(t *testing.T) {
 
 	// shutdown server and then force a reconnect
 	s.Shutdown()
+	s.WaitForShutdown()
 	WaitOnChannel(t, newStatus, nats.RECONNECTING)
 	_, err = sub.NextMsg(100 * time.Millisecond)
 	if err == nil {
 		t.Fatal("Expected error getting message")
 	}
 
+	t.Logf("Reconnect while waiting shutdown is a no op %v", nc.IsReconnecting())
+	if err := nc.ForceReconnect(); err != nil {
+		t.Fatalf("Unexpected error on reconnect: %v", err)
+	} else {
+		t.Logf("No error??")
+	}
+
 	// restart server
 	s = RunDefaultServer()
 	defer s.Shutdown()
 
+	t.Logf("Second reconnect")
 	if err := nc.ForceReconnect(); err != nil {
 		t.Fatalf("Unexpected error on reconnect: %v", err)
 	}
