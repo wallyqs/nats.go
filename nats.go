@@ -472,6 +472,11 @@ type Options struct {
 	// a *net.Dialer).
 	CustomDialer CustomDialer
 
+	// UseMPTCP enables multipath TCP (MPTCP) for connections if supported
+	// by the operating system. When enabled, connections will use "mptcp"
+	// network type instead of "tcp". Defaults to false.
+	UseMPTCP bool
+
 	// UseOldRequestStyle forces the old method of Requests that utilize
 	// a new Inbox and a new Subscription for each request.
 	UseOldRequestStyle bool
@@ -1335,6 +1340,17 @@ func SetCustomDialer(dialer CustomDialer) Option {
 	}
 }
 
+// UseMPTCP is an Option to enable multipath TCP (MPTCP) for connections.
+// When enabled, the client will attempt to dial using "mptcp" network type
+// instead of "tcp". MPTCP support depends on the operating system.
+// If MPTCP is not available, the connection will fall back to regular TCP.
+func UseMPTCP() Option {
+	return func(o *Options) error {
+		o.UseMPTCP = true
+		return nil
+	}
+}
+
 // UseOldRequestStyle is an Option to force usage of the old Request style.
 func UseOldRequestStyle() Option {
 	return func(o *Options) error {
@@ -2104,10 +2120,24 @@ func (nc *Conn) createConn() (err error) {
 			hosts[i], hosts[j] = hosts[j], hosts[i]
 		})
 	}
+
+	// Determine network type based on UseMPTCP option
+	network := "tcp"
+	if nc.Opts.UseMPTCP {
+		network = "mptcp"
+	}
+
 	for _, host := range hosts {
-		nc.conn, err = dialer.Dial("tcp", host)
+		nc.conn, err = dialer.Dial(network, host)
 		if err == nil {
 			break
+		}
+		// If MPTCP dial failed and it was enabled, try with regular TCP as fallback
+		if nc.Opts.UseMPTCP && network == "mptcp" {
+			nc.conn, err = dialer.Dial("tcp", host)
+			if err == nil {
+				break
+			}
 		}
 	}
 	if err != nil {

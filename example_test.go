@@ -45,6 +45,24 @@ func ExampleConnect() {
 	nc.Close()
 }
 
+// Shows how to enable multipath TCP (MPTCP) for connections.
+func ExampleUseMPTCP() {
+	// Connect with MPTCP enabled. This will attempt to use multipath TCP
+	// if supported by the operating system, with automatic fallback to
+	// regular TCP if MPTCP is not available.
+	nc, _ := nats.Connect("demo.nats.io", nats.UseMPTCP())
+	nc.Close()
+
+	// You can also enable MPTCP via Options
+	opts := nats.Options{
+		Servers:  []string{"demo.nats.io"},
+		UseMPTCP: true,
+	}
+
+	nc, _ = opts.Connect()
+	nc.Close()
+}
+
 type skipTLSDialer struct {
 	dialer  *net.Dialer
 	skipTLS bool

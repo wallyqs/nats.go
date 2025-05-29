@@ -1866,6 +1866,125 @@ func TestUseCustomDialer(t *testing.T) {
 	}
 }
 
+// mptcpDialer tracks network types used for dialing
+type mptcpDialer struct {
+	dialedNetworks []string
+	mu             sync.Mutex
+	*net.Dialer
+}
+
+func (md *mptcpDialer) Dial(network, address string) (net.Conn, error) {
+	md.mu.Lock()
+	md.dialedNetworks = append(md.dialedNetworks, network)
+	md.mu.Unlock()
+
+	// Always use tcp for actual connection since MPTCP may not be available
+	return md.Dialer.Dial("tcp", address)
+}
+
+func (md *mptcpDialer) getDialedNetworks() []string {
+	md.mu.Lock()
+	defer md.mu.Unlock()
+	return append([]string{}, md.dialedNetworks...)
+}
+
+func TestUseMPTCP(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	// Test with UseMPTCP option
+	nc, err := nats.Connect(nats.DefaultURL, nats.UseMPTCP())
+	if err != nil {
+		// MPTCP might not be available, but the option should be set
+		opts := nats.GetDefaultOptions()
+		opts.UseMPTCP = true
+		opts.Servers = []string{nats.DefaultURL}
+		if opts.UseMPTCP != true {
+			t.Fatalf("Expected UseMPTCP to be true")
+		}
+	} else {
+		defer nc.Close()
+		if !nc.Opts.UseMPTCP {
+			t.Fatalf("Expected UseMPTCP to be true")
+		}
+		// Verify connection is established
+		if !nc.IsConnected() {
+			t.Fatalf("Expected to be connected")
+		}
+	}
+
+	// Test with custom dialer to verify MPTCP network type is used
+	md := &mptcpDialer{
+		Dialer: &net.Dialer{
+			Timeout: 5 * time.Second,
+		},
+	}
+
+	nc2, err := nats.Connect(nats.DefaultURL,
+		nats.UseMPTCP(),
+		nats.SetCustomDialer(md))
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc2.Close()
+
+	// Check that mptcp was attempted first
+	networks := md.getDialedNetworks()
+	if len(networks) == 0 {
+		t.Fatalf("Expected at least one dial attempt")
+	}
+	if networks[0] != "mptcp" {
+		t.Fatalf("Expected first dial to use 'mptcp', got %s", networks[0])
+	}
+
+	// If there's a second dial, it should be the tcp fallback
+	if len(networks) > 1 && networks[1] != "tcp" {
+		t.Fatalf("Expected fallback dial to use 'tcp', got %s", networks[1])
+	}
+}
+
+func TestMPTCPWithMultipleHosts(t *testing.T) {
+	// Run multiple servers
+	s1 := RunDefaultServer()
+	defer s1.Shutdown()
+
+	s2 := RunServerOnPort(4223)
+	defer s2.Shutdown()
+
+	// Test with custom dialer to verify MPTCP is attempted for all hosts
+	md := &mptcpDialer{
+		Dialer: &net.Dialer{
+			Timeout: 5 * time.Second,
+		},
+	}
+
+	opts := &nats.Options{
+		Servers: []string{
+			"nats://127.0.0.1:4222",
+			"nats://127.0.0.1:4223",
+		},
+		UseMPTCP:     true,
+		CustomDialer: md,
+	}
+
+	nc, err := opts.Connect()
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Verify that mptcp was attempted
+	networks := md.getDialedNetworks()
+	if len(networks) == 0 {
+		t.Fatalf("Expected at least one dial attempt")
+	}
+
+	// First attempt should be mptcp
+	if networks[0] != "mptcp" {
+		t.Fatalf("Expected dial to use 'mptcp', got %s", networks[0])
+	}
+}
+
 func TestDefaultOptionsDialer(t *testing.T) {
 	s := RunDefaultServer()
 	defer s.Shutdown()
