@@ -63,6 +63,7 @@ const (
 
 	wsScheme    = "ws"
 	wsSchemeTLS = "wss"
+	quicScheme  = "quic"
 
 	wsPMCExtension      = "permessage-deflate" // per-message compression
 	wsPMCSrvNoCtx       = "server_no_context_takeover"
@@ -781,4 +782,8 @@ func wsIsControlFrame(frameType wsOpCode) bool {
 
 func isWebsocketScheme(u *url.URL) bool {
 	return u.Scheme == wsScheme || u.Scheme == wsSchemeTLS
+}
+
+func isQuicScheme(u *url.URL) bool {
+	return u.Scheme == quicScheme
 }

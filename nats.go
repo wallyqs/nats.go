@@ -538,9 +538,10 @@ const (
 	nuidSize = 22
 
 	// Default ports used if none is specified in given URL(s)
-	defaultWSPortString  = "80"
-	defaultWSSPortString = "443"
-	defaultPortString    = "4222"
+	defaultWSPortString   = "80"
+	defaultWSSPortString  = "443"
+	defaultQuicPortString = "4222"
+	defaultPortString     = "4222"
 )
 
 // A Conn represents a bare connection to a nats-server.
@@ -581,6 +582,7 @@ type Conn struct {
 	ar            bool // abort reconnect
 	rqch          chan struct{}
 	ws            bool // true if a websocket connection
+	quic          bool // true if a QUIC connection
 
 	// New style response handler
 	respSub       string               // The wildcard subject
@@ -1837,6 +1839,9 @@ func (nc *Conn) connScheme() string {
 		}
 		return wsScheme
 	}
+	if nc.quic {
+		return quicScheme
+	}
 	if nc.Opts.Secure {
 		return tlsScheme
 	}
@@ -1875,19 +1880,27 @@ func (nc *Conn) addURLToPool(sURL string, implicit, saveTLSName bool) error {
 			sURL += defaultWSPortString
 		case wsSchemeTLS:
 			sURL += defaultWSSPortString
+		case quicScheme:
+			sURL += defaultQuicPortString
 		default:
 			sURL += defaultPortString
 		}
 	}
 
 	isWS := isWebsocketScheme(u)
-	// We don't support mix and match of websocket and non websocket URLs.
+	isQUIC := isQuicScheme(u)
+	// We don't support mix and match of websocket, QUIC, and regular URLs.
 	// If this is the first URL, then we accept and switch the global state
-	// to websocket. After that, we will know how to reject mixed URLs.
+	// to websocket or QUIC. After that, we will know how to reject mixed URLs.
 	if len(nc.srvPool) == 0 {
 		nc.ws = isWS
+		nc.quic = isQUIC
 	} else if isWS && !nc.ws || !isWS && nc.ws {
 		return errors.New("mixing of websocket and non websocket URLs is not allowed")
+	} else if isQUIC && !nc.quic || !isQUIC && nc.quic {
+		return errors.New("mixing of QUIC and non QUIC URLs is not allowed")
+	} else if (isWS || isQUIC) && (nc.ws != isWS || nc.quic != isQUIC) {
+		return errors.New("mixing of different connection types is not allowed")
 	}
 
 	var tlsName string
@@ -2115,6 +2128,11 @@ func (nc *Conn) createConn() (err error) {
 	// Fall back to what we were given.
 	if len(hosts) == 0 {
 		hosts = append(hosts, u.Host)
+	}
+
+	// If scheme is "quic" then branch out to QUIC code directly.
+	if isQuicScheme(u) {
+		return nc.quicInitHandshake(u)
 	}
 
 	// CustomDialer takes precedence. If not set, use Opts.Dialer which
@@ -2514,7 +2532,12 @@ func (nc *Conn) connect() (bool, error) {
 			// that function is now invoked from doReconnect() too.
 			nc.setup()
 
-			err = nc.processConnectInit()
+			// Handle QUIC connections differently due to different protocol flow
+			if nc.quic {
+				err = nc.processQuicConnectInit()
+			} else {
+				err = nc.processConnectInit()
+			}
 
 			if err == nil {
 				nc.current.didConnect = true
