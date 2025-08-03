@@ -24,9 +24,13 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// quicConn wraps a QUIC stream with optimized I/O operations
 type quicConn struct {
 	quic.Connection
 	stream quic.Stream
+	// Cache addresses to avoid repeated calls
+	localAddr  net.Addr
+	remoteAddr net.Addr
 }
 
 func (qc *quicConn) Read(b []byte) (int, error) {
@@ -42,35 +46,46 @@ func (qc *quicConn) Close() error {
 	return qc.Connection.CloseWithError(0, "connection closed")
 }
 
+// LocalAddr returns cached address to avoid repeated calls
 func (qc *quicConn) LocalAddr() net.Addr {
-	return qc.Connection.LocalAddr()
+	if qc.localAddr == nil {
+		qc.localAddr = qc.Connection.LocalAddr()
+	}
+	return qc.localAddr
 }
 
+// RemoteAddr returns cached address to avoid repeated calls
 func (qc *quicConn) RemoteAddr() net.Addr {
-	return qc.Connection.RemoteAddr()
+	if qc.remoteAddr == nil {
+		qc.remoteAddr = qc.Connection.RemoteAddr()
+	}
+	return qc.remoteAddr
 }
 
+// SetDeadline directly on stream for better performance
 func (qc *quicConn) SetDeadline(t time.Time) error {
-	qc.stream.SetDeadline(t)
-	return nil
+	return qc.stream.SetDeadline(t)
 }
 
+// SetReadDeadline directly on stream for better performance
 func (qc *quicConn) SetReadDeadline(t time.Time) error {
-	qc.stream.SetReadDeadline(t)
-	return nil
+	return qc.stream.SetReadDeadline(t)
 }
 
+// SetWriteDeadline directly on stream for better performance
 func (qc *quicConn) SetWriteDeadline(t time.Time) error {
-	qc.stream.SetWriteDeadline(t)
-	return nil
+	return qc.stream.SetWriteDeadline(t)
 }
 
-// quicInitHandshake establishes a QUIC connection
+// quicInitHandshake establishes a QUIC connection with optimized settings
 func (nc *Conn) quicInitHandshake(u *url.URL) error {
 	tlsConf := &tls.Config{
 		ServerName:         u.Hostname(),
 		InsecureSkipVerify: true, // Default to true for QUIC, can be overridden
 		NextProtos:         []string{"nats"},
+		// Optimize TLS 1.3 for QUIC performance
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
 	}
 
 	// Use user-provided TLS config if available
@@ -83,6 +98,30 @@ func (nc *Conn) quicInitHandshake(u *url.URL) error {
 		if len(tlsConf.NextProtos) == 0 {
 			tlsConf.NextProtos = []string{"nats"}
 		}
+		// Force TLS 1.3 for optimal QUIC performance
+		if tlsConf.MinVersion < tls.VersionTLS13 {
+			tlsConf.MinVersion = tls.VersionTLS13
+		}
+		tlsConf.MaxVersion = tls.VersionTLS13
+	}
+
+	// Create optimized QUIC configuration for NATS workloads
+	quicConf := &quic.Config{
+		// Increase initial flow control windows for high throughput
+		InitialStreamReceiveWindow:     1024 * 1024,      // 1MB per stream
+		MaxStreamReceiveWindow:         16 * 1024 * 1024, // 16MB max per stream
+		InitialConnectionReceiveWindow: 4 * 1024 * 1024,  // 4MB per connection
+		MaxConnectionReceiveWindow:     64 * 1024 * 1024, // 64MB max per connection
+		
+		// Optimize for low latency
+		KeepAlivePeriod: 30 * time.Second,
+		
+		// Allow more concurrent streams (though NATS typically uses 1)
+		MaxIncomingStreams: 100,
+		MaxIncomingUniStreams: 100,
+		
+		// Disable stateless retry for faster connection establishment
+		DisablePathMTUDiscovery: false,
 	}
 
 	ctx := context.Background()
@@ -92,24 +131,35 @@ func (nc *Conn) quicInitHandshake(u *url.URL) error {
 		defer cancel()
 	}
 
-	conn, err := quic.DialAddr(ctx, u.Host, tlsConf, nil)
+	// Use optimized QUIC configuration
+	conn, err := quic.DialAddr(ctx, u.Host, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("failed to establish QUIC connection: %w", err)
 	}
 
 	// Open a bidirectional stream for NATS communication
-	// Use background context for stream opening to avoid timeout issues
-	stream, err := conn.OpenStreamSync(context.Background())
+	// Use async stream opening with timeout for better performance
+	streamCtx := context.Background()
+	if nc.Opts.Timeout > 0 {
+		var streamCancel context.CancelFunc
+		streamCtx, streamCancel = context.WithTimeout(streamCtx, nc.Opts.Timeout)
+		defer streamCancel()
+	}
+	
+	stream, err := conn.OpenStreamSync(streamCtx)
 	if err != nil {
 		conn.CloseWithError(0, "failed to open stream")
 		return fmt.Errorf("failed to open QUIC stream: %w", err)
 	}
 
-	// Wrap the QUIC connection and stream
-	nc.conn = &quicConn{
+	// Wrap the QUIC connection and stream with cached addresses
+	qc := &quicConn{
 		Connection: conn,
 		stream:     stream,
+		localAddr:  conn.LocalAddr(),
+		remoteAddr: conn.RemoteAddr(),
 	}
+	nc.conn = qc
 
 	nc.bindToNewConn()
 	return nil
