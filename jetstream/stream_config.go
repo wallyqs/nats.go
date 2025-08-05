@@ -202,6 +202,16 @@ type (
 		// This feature requires nats-server v2.11.0 or later.
 		SubjectDeleteMarkerTTL time.Duration `json:"subject_delete_marker_ttl,omitempty"`
 
+		// AllowMsgCounter allows a stream to use (only) counter CRDTs.
+		AllowMsgCounter bool `json:"allow_msg_counter,omitempty"`
+
+		// AllowAtomicPublish allows atomic batch publishing into the stream.
+		AllowAtomicPublish bool `json:"allow_atomic,omitempty"`
+
+		// AllowAsyncFlush allows replicated streams to asynchronously flush
+		// to the stream, improving throughput.
+		AllowAsyncFlush bool `json:"allow_async_flush,omitempty"`
+
 		// ManagesConsumers indicates if the stream manages its consumers.
 		ManagesConsumers bool `json:"managed_consumers,omitempty"`
 	}

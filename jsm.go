@@ -261,6 +261,9 @@ type StreamConfig struct {
 	// AllowAsyncFlush allows replicated streams to asynchronously flush
 	// to the stream, improving throughput.
 	AllowAsyncFlush bool `json:"allow_async_flush,omitempty"`
+
+	// ManagesConsumers indicates if the stream manages its consumers.
+	ManagesConsumers bool `json:"managed_consumers,omitempty"`
 }
 
 // SubjectTransformConfig is for applying a subject transform (to matching messages) before doing anything else when a new message is received.
