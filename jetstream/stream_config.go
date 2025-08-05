@@ -201,6 +201,9 @@ type (
 		// Enables and sets a duration for adding server markers for delete, purge and max age limits.
 		// This feature requires nats-server v2.11.0 or later.
 		SubjectDeleteMarkerTTL time.Duration `json:"subject_delete_marker_ttl,omitempty"`
+
+		// ManagesConsumers indicates if the stream manages its consumers.
+		ManagesConsumers bool `json:"managed_consumers,omitempty"`
 	}
 
 	// StreamSourceInfo shows information about an upstream stream
