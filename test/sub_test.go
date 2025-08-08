@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/wallyqs/nats.go"
 	"github.com/nats-io/nuid"
 )
 

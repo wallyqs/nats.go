@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/wallyqs/nats.go"
 )
 
 //lint:file-ignore SA1019 Ignore deprecation warnings for EncodedConn

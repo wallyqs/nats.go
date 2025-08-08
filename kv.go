@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go/internal/parser"
+	"github.com/wallyqs/nats.go/internal/parser"
 )
 
 // KeyValueManager is used to manage KeyValue stores.

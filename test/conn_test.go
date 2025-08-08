@@ -34,7 +34,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats-server/v2/test"
 
-	"github.com/nats-io/nats.go"
+	"github.com/wallyqs/nats.go"
 )
 
 func TestDefaultConnection(t *testing.T) {

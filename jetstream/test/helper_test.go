@@ -27,8 +27,8 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
+	"github.com/wallyqs/nats.go"
+	"github.com/wallyqs/nats.go/jetstream"
 
 	natsserver "github.com/nats-io/nats-server/v2/test"
 )

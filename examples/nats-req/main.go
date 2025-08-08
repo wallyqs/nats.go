@@ -19,7 +19,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/wallyqs/nats.go"
 )
 
 // NOTE: Can test with demo servers.

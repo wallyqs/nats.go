@@ -21,7 +21,7 @@ import (
 	"time"
 
 	// Default Encoders
-	"github.com/nats-io/nats.go/encoders/builtin"
+	"github.com/wallyqs/nats.go/encoders/builtin"
 )
 
 //lint:file-ignore SA1019 Ignore deprecation warnings for EncodedConn

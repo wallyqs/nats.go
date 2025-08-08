@@ -28,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/jetstream"
+	"github.com/wallyqs/nats.go"
+	"github.com/wallyqs/nats.go/jetstream"
 )
 
 func TestObjectBasics(t *testing.T) {

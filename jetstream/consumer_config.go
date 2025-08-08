@@ -279,7 +279,7 @@ type (
 	// OrderedConsumerConfig is the configuration of an ordered JetStream
 	// consumer. For more information, see [Ordered Consumers] in README
 	//
-	// [Ordered Consumers]: https://github.com/nats-io/nats.go/blob/main/jetstream/README.md#ordered-consumers
+	// [Ordered Consumers]: https://github.com/wallyqs/nats.go/blob/main/jetstream/README.md#ordered-consumers
 	OrderedConsumerConfig struct {
 		// FilterSubjects allows filtering messages from a stream by subject.
 		// This field is exclusive with FilterSubject. Requires nats-server
