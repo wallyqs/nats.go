@@ -14,11 +14,13 @@
 package nats
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -1159,6 +1161,158 @@ func TestWSNoDeadlockOnAuthFailure(t *testing.T) {
 	}
 
 	tm.Stop()
+}
+
+// TestWSAuthErrorOverWebSocket simulates the scenario described in
+// https://github.com/nats-io/nats.go/issues/2024:
+// A NATS server rejects a WebSocket connection (e.g. expired JWT) by sending
+// a -ERR protocol message in a WebSocket data frame immediately followed by a
+// WebSocket close frame. Prior to the fix, if both frames arrived in the same
+// TCP read, the close frame's io.EOF was returned instead of the -ERR data,
+// causing the client to report a generic EOF rather than the auth error.
+//
+// This test uses a mock WebSocket server to ensure deterministic frame ordering
+// and verifies that nats.Connect returns an appropriate auth-related error.
+func TestWSAuthErrorOverWebSocket(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		errProto    string
+		expectedErr error
+	}{
+		{"authorization violation", AUTHORIZATION_ERR, ErrAuthorization},
+		{"expired users credentials", AUTHENTICATION_EXPIRED_ERR, ErrAuthExpired},
+		{"revoked users credentials", AUTHENTICATION_REVOKED_ERR, ErrAuthRevoked},
+		{"expired account", ACCOUNT_AUTHENTICATION_EXPIRED_ERR, ErrAccountAuthExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("Could not listen: %v", err)
+			}
+			defer l.Close()
+
+			addr := l.Addr().(*net.TCPAddr)
+
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					conn, err := l.Accept()
+					if err != nil {
+						return
+					}
+					handleWSMockConn(t, conn, test.errProto)
+				}
+			}()
+
+			tm := time.AfterFunc(5*time.Second, func() {
+				buf := make([]byte, 1000000)
+				n := runtime.Stack(buf, true)
+				panic(fmt.Sprintf("Test timed out!\n%s\n", buf[:n]))
+			})
+			defer tm.Stop()
+
+			_, err = Connect(
+				fmt.Sprintf("ws://127.0.0.1:%d", addr.Port),
+				MaxReconnects(0),
+			)
+			if err == nil {
+				t.Fatal("Expected auth error, got nil")
+			}
+			// The error should contain the auth error description, not EOF.
+			if strings.Contains(err.Error(), "EOF") {
+				t.Fatalf("Got EOF error instead of auth error: %v", err)
+			}
+			// Check that the underlying auth error was properly tracked.
+			var perr *natsProtoErr
+			if !errors.As(err, &perr) {
+				t.Fatalf("Expected natsProtoErr, got %T: %v", err, err)
+			}
+			if !strings.Contains(strings.ToLower(perr.description), test.errProto) {
+				t.Fatalf("Expected error to contain %q, got: %v", test.errProto, perr.description)
+			}
+
+			l.Close()
+			wg.Wait()
+		})
+	}
+}
+
+// handleWSMockConn handles a single WebSocket connection for the mock server.
+// It performs the WebSocket handshake, sends a NATS INFO, reads the client's
+// CONNECT+PING, then sends a -ERR followed by a WebSocket close frame.
+func handleWSMockConn(t *testing.T, conn net.Conn, errProto string) {
+	t.Helper()
+	defer conn.Close()
+
+	br := bufio.NewReaderSize(conn, 4096)
+
+	// Read the HTTP upgrade request.
+	req, err := http.ReadRequest(br)
+	if err != nil {
+		t.Logf("Mock server: error reading HTTP request: %v", err)
+		return
+	}
+
+	wsKey := req.Header.Get("Sec-WebSocket-Key")
+	if wsKey == "" {
+		t.Logf("Mock server: missing Sec-WebSocket-Key")
+		return
+	}
+
+	// Send the WebSocket upgrade response.
+	resp := &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: 101,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     make(http.Header),
+	}
+	resp.Header.Set("Upgrade", "websocket")
+	resp.Header.Set("Connection", "Upgrade")
+	resp.Header.Set("Sec-Websocket-Accept", wsAcceptKey(wsKey))
+	resp.Write(conn)
+
+	// Helper: write a WebSocket binary frame (server-side, no masking).
+	writeWSFrame := func(opcode byte, payload []byte) {
+		hdr := []byte{0x80 | opcode, byte(len(payload))}
+		conn.Write(hdr)
+		conn.Write(payload)
+	}
+
+	// Send NATS INFO as a WebSocket binary frame.
+	info := []byte("INFO {\"server_id\":\"mock\",\"version\":\"0.0.0\",\"go\":\"go0.0\",\"max_payload\":1048576}\r\n")
+	writeWSFrame(0x02, info)
+
+	// Read and discard the client's WebSocket frames (CONNECT + PING).
+	// The client sends masked frames; we just need to consume them.
+	readBuf := make([]byte, 4096)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	br.Read(readBuf)
+	conn.SetReadDeadline(time.Time{})
+
+	// Send -ERR as a WebSocket binary frame followed immediately by a
+	// close frame. Write them in a single TCP write to maximize the
+	// chance they arrive in the same read buffer on the client side.
+	errMsg := []byte(fmt.Sprintf("-ERR '%s'\r\n", errProto))
+	errFrame := []byte{0x80 | 0x02, byte(len(errMsg))}
+	errFrame = append(errFrame, errMsg...)
+
+	closeBody := "Authentication Failure"
+	closePayloadLen := 2 + len(closeBody)
+	closeFrame := []byte{0x80 | 0x08, byte(closePayloadLen)}
+	// Status 1008 = Policy Violation (appropriate for auth failure)
+	closeFrame = append(closeFrame, 0x03, 0xF0)
+	closeFrame = append(closeFrame, []byte(closeBody)...)
+
+	// Combine into a single write for deterministic testing.
+	combined := append(errFrame, closeFrame...)
+	conn.Write(combined)
+
+	// Give the client a moment to process before closing.
+	time.Sleep(100 * time.Millisecond)
 }
 
 func TestWSProxyPath(t *testing.T) {
