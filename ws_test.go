@@ -1246,22 +1246,207 @@ func handleWSMockConn(t *testing.T, conn net.Conn, errProto string) {
 	t.Helper()
 	defer conn.Close()
 
-	br := bufio.NewReaderSize(conn, 4096)
+	br, ok := wsMockHandshake(t, conn)
+	if !ok {
+		return
+	}
 
-	// Read the HTTP upgrade request.
+	// Send NATS INFO as a WebSocket binary frame.
+	info := []byte("INFO {\"server_id\":\"mock\",\"version\":\"0.0.0\",\"go\":\"go0.0\",\"max_payload\":1048576}\r\n")
+	wsWriteFrame(conn, 0x02, info)
+
+	// Read and discard the client's WebSocket frames (CONNECT + PING).
+	wsMockDrainClient(conn, br)
+
+	// Send -ERR + close frame in a single TCP write.
+	conn.Write(wsMockAuthErrAndClose(errProto))
+
+	// Give the client a moment to process before closing.
+	time.Sleep(100 * time.Millisecond)
+}
+
+// TestWSExpiredAuthOverWebSocket is analogous to TestExpiredAuthentication but
+// over WebSocket. It simulates a JWT that expires mid-session:
+//
+//  1. Client connects over WebSocket successfully (server sends PONG).
+//  2. After a short delay, server sends an async -ERR (e.g. "user authentication
+//     expired") bundled with a WebSocket close frame in a single write.
+//  3. Client reconnects, but now the server rejects the CONNECT with
+//     -ERR 'authorization violation' (also bundled with a close frame).
+//  4. After receiving the same auth error twice, the client closes.
+//
+// The test verifies that:
+//   - The ErrorHandler callback receives the correct auth errors (not EOF).
+//   - The connection's LastError() reflects the auth error.
+//   - The connection is closed after repeated auth failures.
+func TestWSExpiredAuthOverWebSocket(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		errProto    string
+		expectedErr error
+	}{
+		{"expired users credentials", AUTHENTICATION_EXPIRED_ERR, ErrAuthExpired},
+		{"revoked users credentials", AUTHENTICATION_REVOKED_ERR, ErrAuthRevoked},
+		{"expired account", ACCOUNT_AUTHENTICATION_EXPIRED_ERR, ErrAccountAuthExpired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("Could not listen: %v", err)
+			}
+			defer l.Close()
+
+			addr := l.Addr().(*net.TCPAddr)
+
+			wg := sync.WaitGroup{}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				connectCount := 0
+				for {
+					conn, err := l.Accept()
+					if err != nil {
+						return
+					}
+					connectCount++
+					if connectCount == 1 {
+						// First connection: complete successfully, then
+						// send async -ERR after a short delay.
+						handleWSMockExpiredAuth(t, conn, test.errProto, true)
+					} else {
+						// Reconnect: reject immediately with auth violation.
+						handleWSMockExpiredAuth(t, conn, AUTHORIZATION_ERR, false)
+					}
+				}
+			}()
+
+			closedCh := make(chan bool, 1)
+			errCh := make(chan error, 10)
+
+			url := fmt.Sprintf("ws://127.0.0.1:%d", addr.Port)
+			nc, err := Connect(url,
+				ReconnectWait(25*time.Millisecond),
+				ReconnectJitter(0, 0),
+				MaxReconnects(-1),
+				ErrorHandler(func(_ *Conn, _ *Subscription, e error) {
+					select {
+					case errCh <- e:
+					default:
+					}
+				}),
+				ClosedHandler(func(_ *Conn) {
+					closedCh <- true
+				}),
+			)
+			if err != nil {
+				t.Fatalf("Expected to connect, got %v", err)
+			}
+			defer nc.Close()
+
+			// The connection should close after repeated auth failures.
+			if err := WaitTime(closedCh, 5*time.Second); err != nil {
+				t.Fatal("Should have closed after multiple failed attempts")
+			}
+
+			// Verify the LastError is an auth error, not EOF.
+			lastErr := nc.LastError()
+			if lastErr == nil {
+				t.Fatal("Expected LastError to be set")
+			}
+			if strings.Contains(lastErr.Error(), "EOF") {
+				t.Fatalf("LastError should be auth error, not EOF: %v", lastErr)
+			}
+
+			// Verify the async error callback received the right errors.
+			// We expect: first the expired/revoked error, then authorization
+			// violation errors on reconnect attempts.
+			select {
+			case e := <-errCh:
+				if e != test.expectedErr {
+					t.Fatalf("First error: expected %q, got %q", test.expectedErr, e)
+				}
+			default:
+				t.Fatalf("Missing first error %q from ErrorHandler", test.expectedErr)
+			}
+
+			// Subsequent errors should be authorization violations.
+			gotAuthViolation := false
+			for {
+				select {
+				case e := <-errCh:
+					if e == ErrAuthorization {
+						gotAuthViolation = true
+					} else if e != test.expectedErr {
+						t.Fatalf("Unexpected error from ErrorHandler: %v", e)
+					}
+				default:
+					goto done
+				}
+			}
+		done:
+			if !gotAuthViolation {
+				t.Fatal("Expected at least one ErrAuthorization from reconnect attempts")
+			}
+
+			l.Close()
+			wg.Wait()
+		})
+	}
+}
+
+// handleWSMockExpiredAuth handles a mock WebSocket connection for the expired
+// auth test. If initialConnect is true, it sends PONG first (successful
+// connect), waits, then sends the -ERR + close frame. Otherwise, it sends
+// -ERR + close frame immediately (simulating rejection on reconnect).
+func handleWSMockExpiredAuth(t *testing.T, conn net.Conn, errProto string, initialConnect bool) {
+	t.Helper()
+	defer conn.Close()
+
+	br, ok := wsMockHandshake(t, conn)
+	if !ok {
+		return
+	}
+
+	// Send NATS INFO as a WebSocket binary frame.
+	info := []byte("INFO {\"server_id\":\"mock\",\"version\":\"0.0.0\",\"go\":\"go0.0\",\"max_payload\":1048576}\r\n")
+	wsWriteFrame(conn, 0x02, info)
+
+	// Read and discard the client's WebSocket frames (CONNECT + PING).
+	wsMockDrainClient(conn, br)
+
+	if initialConnect {
+		// Send PONG so the client considers itself connected.
+		wsWriteFrame(conn, 0x02, []byte("PONG\r\n"))
+
+		// Wait a bit, then send async -ERR + close in one write.
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// Send -ERR + close frame in a single TCP write.
+	conn.Write(wsMockAuthErrAndClose(errProto))
+
+	time.Sleep(100 * time.Millisecond)
+}
+
+// Mock WebSocket server helpers shared across tests.
+
+// wsMockHandshake reads the client's HTTP upgrade request and responds
+// with a 101 Switching Protocols. Returns a bufio.Reader wrapping the
+// connection for subsequent reads (to consume any data buffered during
+// the HTTP request parsing).
+func wsMockHandshake(t *testing.T, conn net.Conn) (*bufio.Reader, bool) {
+	t.Helper()
+	br := bufio.NewReaderSize(conn, 4096)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		t.Logf("Mock server: error reading HTTP request: %v", err)
-		return
+		return nil, false
 	}
-
 	wsKey := req.Header.Get("Sec-WebSocket-Key")
 	if wsKey == "" {
 		t.Logf("Mock server: missing Sec-WebSocket-Key")
-		return
+		return nil, false
 	}
-
-	// Send the WebSocket upgrade response.
 	resp := &http.Response{
 		Status:     "101 Switching Protocols",
 		StatusCode: 101,
@@ -1274,45 +1459,44 @@ func handleWSMockConn(t *testing.T, conn net.Conn, errProto string) {
 	resp.Header.Set("Connection", "Upgrade")
 	resp.Header.Set("Sec-Websocket-Accept", wsAcceptKey(wsKey))
 	resp.Write(conn)
+	return br, true
+}
 
-	// Helper: write a WebSocket binary frame (server-side, no masking).
-	writeWSFrame := func(opcode byte, payload []byte) {
-		hdr := []byte{0x80 | opcode, byte(len(payload))}
-		conn.Write(hdr)
-		conn.Write(payload)
-	}
-
-	// Send NATS INFO as a WebSocket binary frame.
-	info := []byte("INFO {\"server_id\":\"mock\",\"version\":\"0.0.0\",\"go\":\"go0.0\",\"max_payload\":1048576}\r\n")
-	writeWSFrame(0x02, info)
-
-	// Read and discard the client's WebSocket frames (CONNECT + PING).
-	// The client sends masked frames; we just need to consume them.
-	readBuf := make([]byte, 4096)
+// wsMockDrainClient reads and discards one buffer of client data
+// (CONNECT + PING frames) from the bufio.Reader returned by wsMockHandshake.
+func wsMockDrainClient(conn net.Conn, br *bufio.Reader) {
+	buf := make([]byte, 4096)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	br.Read(readBuf)
+	br.Read(buf)
 	conn.SetReadDeadline(time.Time{})
+}
 
-	// Send -ERR as a WebSocket binary frame followed immediately by a
-	// close frame. Write them in a single TCP write to maximize the
-	// chance they arrive in the same read buffer on the client side.
+// wsMockAuthErrAndClose builds a combined byte buffer containing a
+// -ERR data frame followed by a WebSocket close frame, suitable for
+// a single conn.Write call.
+func wsMockAuthErrAndClose(errProto string) []byte {
 	errMsg := []byte(fmt.Sprintf("-ERR '%s'\r\n", errProto))
-	errFrame := []byte{0x80 | 0x02, byte(len(errMsg))}
-	errFrame = append(errFrame, errMsg...)
+	errFrame := wsFrameBytes(0x02, errMsg)
 
-	closeBody := "Authentication Failure"
-	closePayloadLen := 2 + len(closeBody)
-	closeFrame := []byte{0x80 | 0x08, byte(closePayloadLen)}
-	// Status 1008 = Policy Violation (appropriate for auth failure)
-	closeFrame = append(closeFrame, 0x03, 0xF0)
-	closeFrame = append(closeFrame, []byte(closeBody)...)
+	closeBody := "Auth Error"
+	closePayload := make([]byte, 2+len(closeBody))
+	binary.BigEndian.PutUint16(closePayload, 1008) // 1008 = Policy Violation
+	copy(closePayload[2:], closeBody)
+	closeFrame := wsFrameBytes(0x08, closePayload)
 
-	// Combine into a single write for deterministic testing.
-	combined := append(errFrame, closeFrame...)
-	conn.Write(combined)
+	return append(errFrame, closeFrame...)
+}
 
-	// Give the client a moment to process before closing.
-	time.Sleep(100 * time.Millisecond)
+// wsWriteFrame writes a single WebSocket frame to conn (server-side, no masking).
+func wsWriteFrame(conn net.Conn, opcode byte, payload []byte) {
+	conn.Write(wsFrameBytes(opcode, payload))
+}
+
+// wsFrameBytes creates a WebSocket frame (server-side, no masking) as a byte slice.
+func wsFrameBytes(opcode byte, payload []byte) []byte {
+	frame := []byte{0x80 | opcode, byte(len(payload))}
+	frame = append(frame, payload...)
+	return frame
 }
 
 func TestWSProxyPath(t *testing.T) {
