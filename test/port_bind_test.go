@@ -9,6 +9,137 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+func TestLocalAddrOption(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	// Find a free port to bind to.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find free port: %v", err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	localAddr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: freePort,
+	}
+
+	nc, err := nats.Connect(nats.DefaultURL, nats.LocalAddr(localAddr))
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Verify we can publish and subscribe.
+	sub, err := nc.SubscribeSync("test")
+	if err != nil {
+		t.Fatalf("Unexpected error on subscribe: %v", err)
+	}
+	if err := nc.Publish("test", []byte("hello")); err != nil {
+		t.Fatalf("Unexpected error on publish: %v", err)
+	}
+	nc.Flush()
+
+	msg, err := sub.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error getting message: %v", err)
+	}
+	if string(msg.Data) != "hello" {
+		t.Fatalf("Expected 'hello', got '%s'", string(msg.Data))
+	}
+
+	// Verify the server sees the client connected from the expected port.
+	clients, err := s.Connz(nil)
+	if err != nil {
+		t.Fatalf("Error getting connz: %v", err)
+	}
+	if clients == nil || len(clients.Conns) == 0 {
+		t.Fatal("Expected at least one client connection")
+	}
+
+	found := false
+	for _, ci := range clients.Conns {
+		if ci.Port == freePort {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Expected server to see client connected from port %d", freePort)
+	}
+
+	t.Logf("Successfully connected from local port %d", freePort)
+}
+
+func TestLocalAddrWithDialerOption(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	// Verify that LocalAddr is applied to an existing Dialer.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to find free port: %v", err)
+	}
+	freePort := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	localAddr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: freePort,
+	}
+
+	nc, err := nats.Connect(nats.DefaultURL,
+		nats.Dialer(&net.Dialer{Timeout: 5 * time.Second}),
+		nats.LocalAddr(localAddr),
+	)
+	if err != nil {
+		t.Fatalf("Unexpected error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	// Verify the server sees the client connected from the expected port.
+	clients, err := s.Connz(nil)
+	if err != nil {
+		t.Fatalf("Error getting connz: %v", err)
+	}
+
+	found := false
+	for _, ci := range clients.Conns {
+		if ci.Port == freePort {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Expected server to see client connected from port %d", freePort)
+	}
+
+	t.Logf("Successfully connected from local port %d with custom Dialer", freePort)
+}
+
+func TestLocalAddrBadPort(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	// Use a port that is already in use (the NATS server port).
+	localAddr := &net.TCPAddr{
+		IP:   net.ParseIP("127.0.0.1"),
+		Port: nats.DefaultPort,
+	}
+
+	_, err := nats.Connect(
+		nats.DefaultURL,
+		nats.LocalAddr(localAddr),
+		nats.MaxReconnects(0),
+	)
+	if err == nil {
+		t.Fatal("Expected error when binding to an in-use port")
+	}
+	t.Logf("Got expected error: %v", err)
+}
+
 // portBindDialer implements nats.CustomDialer and binds to a specific local address/port.
 type portBindDialer struct {
 	localAddr  *net.TCPAddr
@@ -75,7 +206,7 @@ func TestCustomDialerPortBinding(t *testing.T) {
 		t.Fatalf("Expected 'hello', got '%s'", string(msg.Data))
 	}
 
-	// Verify the dialer bound to the expected local port.
+	// Verify the dialer was called and the local address matches.
 	if dialer.dialedFrom == nil {
 		t.Fatal("Expected dialedFrom to be set")
 	}

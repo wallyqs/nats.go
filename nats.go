@@ -430,6 +430,11 @@ type Options struct {
 	// a *net.Dialer).
 	CustomDialer CustomDialer
 
+	// LocalAddr is the local address to bind to when connecting to a server.
+	// This can be used to bind to a specific local port or network interface.
+	// Only used when CustomDialer is not set.
+	LocalAddr net.Addr
+
 	// UseOldRequestStyle forces the old method of Requests that utilize
 	// a new Inbox and a new Subscription for each request.
 	UseOldRequestStyle bool
@@ -1166,6 +1171,23 @@ func SetCustomDialer(dialer CustomDialer) Option {
 	}
 }
 
+// LocalAddr is an Option to set the local address to bind to when
+// connecting to a server. This can be used to select a specific
+// local port or network interface for the connection. For example:
+//
+//	nats.Connect(url, nats.LocalAddr(&net.TCPAddr{
+//	    IP:   net.ParseIP("127.0.0.1"),
+//	    Port: 5555,
+//	}))
+//
+// Note: This option is ignored when a CustomDialer is set.
+func LocalAddr(addr net.Addr) Option {
+	return func(o *Options) error {
+		o.LocalAddr = addr
+		return nil
+	}
+}
+
 // UseOldRequestStyle is an Option to force usage of the old Request style.
 func UseOldRequestStyle() Option {
 	return func(o *Options) error {
@@ -1346,8 +1368,11 @@ func (o Options) Connect() (*Conn, error) {
 	// Allow custom Dialer for connecting using a timeout by default
 	if nc.Opts.Dialer == nil {
 		nc.Opts.Dialer = &net.Dialer{
-			Timeout: nc.Opts.Timeout,
+			Timeout:   nc.Opts.Timeout,
+			LocalAddr: nc.Opts.LocalAddr,
 		}
+	} else if nc.Opts.LocalAddr != nil && nc.Opts.Dialer.LocalAddr == nil {
+		nc.Opts.Dialer.LocalAddr = nc.Opts.LocalAddr
 	}
 
 	if err := nc.setupServerPool(); err != nil {
