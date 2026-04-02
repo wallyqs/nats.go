@@ -2559,6 +2559,7 @@ func (nerr *natsProtoErr) Is(err error) bool {
 // applicable. Will wait for a flush to return from the server for error
 // processing.
 func (nc *Conn) sendConnect() error {
+	start := time.Now()
 	// Construct the CONNECT protocol string
 	cProto, err := nc.connectProto()
 	if err != nil {
@@ -2572,6 +2573,13 @@ func (nc *Conn) sendConnect() error {
 	if err := nc.bw.writeDirect(cProto, pingProto); err != nil {
 		return err
 	}
+	fmt.Println("===================================================A", time.Since(start))
+
+	// err = nc.processExpectedInfo()
+	// if err != nil {
+	// 	fmt.Println("===================================================B", time.Since(start), err)
+	// 	return err
+	// }
 
 	// We don't want to read more than we need here, otherwise
 	// we would need to transfer the excess read data to the readLoop.
@@ -2584,6 +2592,7 @@ func (nc *Conn) sendConnect() error {
 		}
 		return err
 	}
+	fmt.Println("===================================================C", time.Since(start))
 
 	// If opts.Verbose is set, handle +OK
 	if nc.Opts.Verbose && proto == okProto {
@@ -2633,7 +2642,12 @@ func (nc *Conn) sendConnect() error {
 
 // reads a protocol line.
 func (nc *Conn) readProto() (string, error) {
-	return nc.br.ReadString('\n')
+	s, err := nc.br.ReadString('\n')
+	if err != nil {
+		fmt.Println("ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", len(s), s, err)
+		return s, err
+	}
+	return s, err
 }
 
 // A control protocol line.
@@ -2991,6 +3005,7 @@ func (nc *Conn) readLoop() {
 			err = nc.parse(buf)
 		}
 		if err != nil {
+			fmt.Println("--------------->", buf)
 			nc.processOpErr(err)
 			break
 		}
@@ -3422,6 +3437,7 @@ func (nc *Conn) processOK() {
 // from the server.
 // This function may update the server pool.
 func (nc *Conn) processInfo(info string) error {
+	fmt.Println("INFO!!!!!!!!!!", info)
 	if info == _EMPTY_ {
 		return nil
 	}

@@ -32,10 +32,11 @@ func TestAuth(t *testing.T) {
 	opts.Port = 8232
 	opts.Username = "derek"
 	opts.Password = "foo"
+	opts.AuthTimeout = float64(1 * time.Nanosecond)
 	s := RunServerWithOptions(&opts)
 	defer s.Shutdown()
 
-	_, err := nats.Connect("nats://127.0.0.1:8232")
+	_, err := nats.Connect("nats://127.0.0.1:8232", nats.Timeout(1700*time.Nanosecond))
 	if err == nil {
 		t.Fatal("Should have received an error while trying to connect")
 	}

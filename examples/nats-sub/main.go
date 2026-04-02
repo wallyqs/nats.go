@@ -14,14 +14,71 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
+	"net"
 	"os"
 	"runtime"
 	"time"
 
+	"net/http/httptrace"
+
 	"github.com/nats-io/nats.go"
 )
+
+type customDialer struct {
+	ctx             context.Context
+	nc              *nats.Conn
+	connectTimeout  time.Duration
+	connectTimeWait time.Duration
+}
+
+func (cd *customDialer) Dial(network, address string) (net.Conn, error) {
+	d := &net.Dialer{
+		FallbackDelay: -1,
+	}
+	start := time.Now()
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(network, addr string) {
+			log.Println("Attempting to connect to server at", addr, time.Since(start))
+		},
+		DNSStart: func(httptrace.DNSStartInfo) {
+			log.Println("DNS Lookup", time.Since(start))
+		},
+		DNSDone:  func(httptrace.DNSDoneInfo) {
+			log.Println("DNS DONE", time.Since(start))
+		},
+		ConnectDone: func(network, addr string, err error) {
+			if err == nil {
+				log.Println(time.Now(), "Established TCP connection", time.Since(start))
+			} else {
+				log.Println("Failed connecting to", addr, time.Since(start))
+			}
+		},
+	}
+	ctx := httptrace.WithClientTrace(cd.ctx, trace)
+	ctx, cancel := context.WithTimeout(ctx, cd.connectTimeout)
+	defer cancel()
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+			if conn, err := d.DialContext(ctx, network, address); err == nil {
+				log.Println("Connected to NATS successfully")
+				return conn, nil
+			} else {
+				log.Println(err, ctx.Err())
+				time.Sleep(cd.connectTimeWait)
+			}
+		}
+	}
+}
 
 // NOTE: Can test with demo servers.
 // nats-sub -s demo.nats.io <subject>
@@ -63,8 +120,25 @@ func main() {
 		showUsageAndExit(1)
 	}
 
+	// -----------------
+	// Parent context cancels connecting/reconnecting altogether.
+	// ctx, cancel := context.WithCancel(context.Background())
+	// defer cancel()
+
+	var err error
+	var nc *nats.Conn
+	// cd := &customDialer{
+	// 	ctx:             ctx,
+	// 	nc:              nc,
+	// 	connectTimeout:  14 * time.Millisecond,
+	// 	connectTimeWait: 1 * time.Second,
+	// }
+	// -----------------
+
 	// Connect Options.
-	opts := []nats.Option{nats.Name("NATS Sample Subscriber")}
+	// opts := []nats.Option{nats.Name("NATS Sample Subscriber"), nats.Timeout(15 * time.Millisecond), nats.SetCustomDialer(cd)}
+	// opts := []nats.Option{nats.Name("NATS Sample Subscriber"), nats.SetCustomDialer(cd)}
+	opts := []nats.Option{nats.Name("NATS Sample Subscriber"), nats.Timeout(20 * time.Millisecond)}
 	opts = setupConnOptions(opts)
 
 	if *userCreds != "" && *nkeyFile != "" {
@@ -96,7 +170,7 @@ func main() {
 	}
 
 	// Connect to NATS
-	nc, err := nats.Connect(*urls, opts...)
+	nc, err = nats.Connect(*urls, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
