@@ -34,8 +34,10 @@ import (
 	"testing"
 	"time"
 
+	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats-server/v2/server"
 	serverTest "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nkeys"
 	"github.com/nats-io/nuid"
 )
 
@@ -1197,6 +1199,79 @@ func TestWSMockServerAuthFailureWithEOF(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// TestWSExpiredJWTAuthReturnsAuthError sets up a websocket server with a full
+// JWT resolver (operator trust + account) and connects with an already-expired
+// user JWT. The server should reject with an auth error, not a transport EOF.
+func TestWSExpiredJWTAuthReturnsAuthError(t *testing.T) {
+	// Create operator key pair.
+	okp, err := nkeys.CreateOperator()
+	if err != nil {
+		t.Fatalf("Error creating operator: %v", err)
+	}
+	opub, _ := okp.PublicKey()
+
+	// Create account key pair and sign its JWT with the operator.
+	akp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatalf("Error creating account: %v", err)
+	}
+	apub, _ := akp.PublicKey()
+
+	ac := jwt.NewAccountClaims(apub)
+	aJWT, err := ac.Encode(okp)
+	if err != nil {
+		t.Fatalf("Error encoding account JWT: %v", err)
+	}
+
+	// Create user key pair and build an already-expired user JWT.
+	ukp, err := nkeys.CreateUser()
+	if err != nil {
+		t.Fatalf("Error creating user: %v", err)
+	}
+	upub, _ := ukp.PublicKey()
+
+	uc := jwt.NewUserClaims(upub)
+	uc.IssuerAccount = apub
+	uc.Expires = time.Now().Add(-time.Hour).Unix() // expired 1 hour ago
+	expiredUserJWT, err := uc.Encode(akp)
+	if err != nil {
+		t.Fatalf("Error encoding user JWT: %v", err)
+	}
+
+	// Configure websocket server with operator trust and account resolver.
+	sopts := testWSGetDefaultOptions(t, false)
+	sopts.TrustedKeys = []string{opub}
+	s := RunServerWithOptions(sopts)
+	defer s.Shutdown()
+
+	mr := &server.MemAccResolver{}
+	mr.Store(apub, aJWT)
+	s.SetAccountResolver(mr)
+
+	// Connect over websocket with the expired JWT.
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d", sopts.Websocket.Port)
+	_, err = Connect(wsURL,
+		NoReconnect(),
+		Timeout(2*time.Second),
+		UserJWT(
+			func() (string, error) { return expiredUserJWT, nil },
+			func(nonce []byte) ([]byte, error) {
+				sig, err := ukp.Sign(nonce)
+				return sig, err
+			},
+		),
+	)
+	// The server should return an auth error, not a transport-level EOF.
+	if err == nil {
+		t.Fatal("Expected error on connect with expired JWT")
+	}
+	if errors.Is(err, ErrAuthorization) || errors.Is(err, ErrAuthExpired) {
+		// Good: got a proper auth error.
+		return
+	}
+	t.Fatalf("Expected auth error (ErrAuthorization or ErrAuthExpired), got: %v", err)
 }
 
 func TestWSProxyPath(t *testing.T) {
