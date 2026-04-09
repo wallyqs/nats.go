@@ -14,11 +14,13 @@
 package nats
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -1114,6 +1116,87 @@ func TestWSNoDeadlockOnAuthFailure(t *testing.T) {
 	}
 
 	tm.Stop()
+}
+
+// TestWSMockServerAuthFailureWithEOF uses a mock websocket server to simulate
+// the exact condition from issue #2024: the server sends -ERR 'Authorization
+// Violation' + close frame and immediately closes the TCP connection, so the
+// error data and EOF may arrive on the same underlying read.
+func TestWSMockServerAuthFailureWithEOF(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	addr := l.Addr().(*net.TCPAddr)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		conn, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Handle WebSocket upgrade handshake.
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		key := req.Header.Get("Sec-Websocket-Key")
+		resp := fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\n"+
+			"Upgrade: websocket\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Sec-WebSocket-Accept: %s\r\n\r\n", wsAcceptKey(key))
+		conn.Write([]byte(resp))
+
+		// Send INFO as an unmasked websocket binary frame.
+		info := []byte(`INFO {"server_id":"mock","version":"2.10.0","proto":1,"nonce":"anonce"}` + "\r\n")
+		frame := make([]byte, 0, 2+len(info))
+		frame = append(frame, byte(wsBinaryMessage)|wsFinalBit, byte(len(info)))
+		frame = append(frame, info...)
+		conn.Write(frame)
+
+		// Read and discard the client's masked CONNECT + PING frames.
+		discard := make([]byte, 4096)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		conn.Read(discard)
+		conn.SetReadDeadline(time.Time{})
+
+		// Build -ERR data frame + close frame in a single buffer and
+		// write them atomically, then close the connection. This makes
+		// it likely that the client's underlying read returns the data
+		// and EOF together.
+		errMsg := []byte("-ERR 'Authorization Violation'\r\n")
+		closeBody := []byte("Authorization Failure")
+		closePayloadLen := 2 + len(closeBody)
+
+		var buf bytes.Buffer
+		// Binary data frame with -ERR.
+		buf.WriteByte(byte(wsBinaryMessage) | wsFinalBit)
+		buf.WriteByte(byte(len(errMsg)))
+		buf.Write(errMsg)
+		// Close control frame (status 1000).
+		buf.WriteByte(byte(wsCloseMessage) | wsFinalBit)
+		buf.WriteByte(byte(closePayloadLen))
+		buf.WriteByte(0x03)
+		buf.WriteByte(0xE8)
+		buf.Write(closeBody)
+
+		conn.Write(buf.Bytes())
+	}()
+
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d", addr.Port)
+	_, err = Connect(wsURL, NoReconnect(), Timeout(2*time.Second))
+	if !errors.Is(err, ErrAuthorization) {
+		t.Fatalf("Expected ErrAuthorization, got: %v", err)
+	}
+
+	wg.Wait()
 }
 
 func TestWSProxyPath(t *testing.T) {
