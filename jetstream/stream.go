@@ -52,6 +52,12 @@ type (
 		// JetStream on a given subject.
 		GetLastMsgForSubject(ctx context.Context, subject string) (*RawStreamMsg, error)
 
+		// GetFirstMsgByTime retrieves the first raw stream message stored in
+		// JetStream with a timestamp at or after startTime. Use
+		// [WithGetMsgSubject] to only consider messages on a given subject.
+		// Returns [ErrMsgNotFound] if no such message exists.
+		GetFirstMsgByTime(ctx context.Context, startTime time.Time, opts ...GetMsgOpt) (*RawStreamMsg, error)
+
 		// DeleteMsg deletes a message from a stream.
 		// On the server, the message is marked as erased, but not overwritten.
 		DeleteMsg(ctx context.Context, seq uint64) error
@@ -258,9 +264,10 @@ type (
 	GetMsgOpt func(*apiMsgGetRequest) error
 
 	apiMsgGetRequest struct {
-		Seq     uint64 `json:"seq,omitempty"`
-		LastFor string `json:"last_by_subj,omitempty"`
-		NextFor string `json:"next_by_subj,omitempty"`
+		Seq       uint64     `json:"seq,omitempty"`
+		LastFor   string     `json:"last_by_subj,omitempty"`
+		NextFor   string     `json:"next_by_subj,omitempty"`
+		StartTime *time.Time `json:"start_time,omitempty"`
 	}
 
 	// apiMsgGetResponse is the response for a Stream get request.
@@ -560,6 +567,18 @@ func (s *stream) GetMsg(ctx context.Context, seq uint64, opts ...GetMsgOpt) (*Ra
 // JetStream on a given subject subject.
 func (s *stream) GetLastMsgForSubject(ctx context.Context, subject string) (*RawStreamMsg, error) {
 	return s.getMsg(ctx, &apiMsgGetRequest{LastFor: subject})
+}
+
+// GetFirstMsgByTime retrieves the first raw stream message stored in
+// JetStream with a timestamp at or after startTime.
+func (s *stream) GetFirstMsgByTime(ctx context.Context, startTime time.Time, opts ...GetMsgOpt) (*RawStreamMsg, error) {
+	req := &apiMsgGetRequest{StartTime: &startTime}
+	for _, opt := range opts {
+		if err := opt(req); err != nil {
+			return nil, err
+		}
+	}
+	return s.getMsg(ctx, req)
 }
 
 func (s *stream) getMsg(ctx context.Context, mreq *apiMsgGetRequest) (*RawStreamMsg, error) {

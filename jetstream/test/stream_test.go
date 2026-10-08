@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	testservice "github.com/synadia-io/orbit.go/ntf-client"
 )
 
 func TestCreateOrUpdateConsumer(t *testing.T) {
@@ -1019,6 +1020,172 @@ func TestGetLastMsgForSubject(t *testing.T) {
 					t.Fatalf("Invalid message data; want: %s; got: %s", test.expectedData, string(msg.Data))
 				}
 			})
+		}
+	})
+}
+
+func TestGetFirstMsgByTime(t *testing.T) {
+	withJSServer(t, func(t *testing.T, _ *nats.Conn, js jetstream.JetStream) {
+		ctx := context.Background()
+		for _, allowDirect := range []bool{false, true} {
+			t.Run(fmt.Sprintf("allow direct: %v", allowDirect), func(t *testing.T) {
+				name := fmt.Sprintf("foo_%v", allowDirect)
+				s, err := js.CreateStream(ctx, jetstream.StreamConfig{
+					Name:        name,
+					Subjects:    []string{name + ".*"},
+					AllowDirect: allowDirect,
+				})
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				publish := func(subj, data string) {
+					t.Helper()
+					if _, err := js.Publish(ctx, name+"."+subj, []byte(data)); err != nil {
+						t.Fatalf("Unexpected error: %v", err)
+					}
+				}
+				// seq 1-2, then a gap, then seq 3-4.
+				publish("A", "msg 1")
+				publish("B", "msg 2")
+				time.Sleep(50 * time.Millisecond)
+				publish("B", "msg 3")
+				publish("A", "msg 4")
+
+				third, err := s.GetMsg(ctx, 3)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+
+				tests := []struct {
+					name        string
+					startTime   time.Time
+					opts        []jetstream.GetMsgOpt
+					expectedSeq uint64
+					withError   error
+				}{
+					{
+						name:        "start time before first message",
+						startTime:   time.Now().Add(-time.Hour),
+						expectedSeq: 1,
+					},
+					{
+						name:        "start time of a message",
+						startTime:   third.Time,
+						expectedSeq: 3,
+					},
+					{
+						name:        "start time with subject",
+						startTime:   third.Time,
+						opts:        []jetstream.GetMsgOpt{jetstream.WithGetMsgSubject(name + ".A")},
+						expectedSeq: 4,
+					},
+					{
+						name:      "start time after last message",
+						startTime: time.Now().Add(time.Hour),
+						withError: jetstream.ErrMsgNotFound,
+					},
+				}
+				for _, test := range tests {
+					t.Run(test.name, func(t *testing.T) {
+						msg, err := s.GetFirstMsgByTime(ctx, test.startTime, test.opts...)
+						if test.withError != nil {
+							if !errors.Is(err, test.withError) {
+								t.Fatalf("Expected error: %v; got: %v", test.withError, err)
+							}
+							return
+						}
+						if err != nil {
+							t.Fatalf("Unexpected error: %v", err)
+						}
+						if msg.Sequence != test.expectedSeq {
+							t.Fatalf("Invalid sequence; want: %d; got: %d", test.expectedSeq, msg.Sequence)
+						}
+					})
+				}
+			})
+		}
+	})
+}
+
+func TestStreamInfoSourceExternalAndError(t *testing.T) {
+	withJSServer(t, func(t *testing.T, _ *nats.Conn, js jetstream.JetStream) {
+		ctx := context.Background()
+		s, err := js.CreateStream(ctx, jetstream.StreamConfig{
+			Name: "agg",
+			Sources: []*jetstream.StreamSource{
+				{Name: "missing"},
+				{Name: "ext", External: &jetstream.ExternalStream{APIPrefix: "$JS.ext.API"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			info, err := s.Info(ctx)
+			if err != nil {
+				return err
+			}
+			if len(info.Sources) != 2 {
+				return fmt.Errorf("expected 2 sources; got %d", len(info.Sources))
+			}
+			for _, si := range info.Sources {
+				switch si.Name {
+				case "missing":
+					if si.External != nil {
+						return fmt.Errorf("expected no external for %q; got %+v", si.Name, si.External)
+					}
+					if si.Error == nil {
+						return fmt.Errorf("expected source error for %q", si.Name)
+					}
+				case "ext":
+					if si.External == nil || si.External.APIPrefix != "$JS.ext.API" {
+						return fmt.Errorf("unexpected external for %q: %+v", si.Name, si.External)
+					}
+				default:
+					return fmt.Errorf("unexpected source %q", si.Name)
+				}
+			}
+			return nil
+		})
+	})
+}
+
+func TestStreamInfoAlternates(t *testing.T) {
+	withJSCluster(t, 3, func(t *testing.T, _ *nats.Conn, js jetstream.JetStream, _ *testservice.Instance) {
+		ctx := context.Background()
+		s, err := js.CreateStream(ctx, jetstream.StreamConfig{Name: "foo", Subjects: []string{"foo"}})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		info, err := s.Info(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if info.Alternates != nil {
+			t.Fatalf("Expected no alternates without mirrors; got %+v", info.Alternates)
+		}
+		if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+			Name:   "foo_mirror",
+			Mirror: &jetstream.StreamSource{Name: "foo"},
+		}); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		info, err = s.Info(ctx)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if len(info.Alternates) != 2 {
+			t.Fatalf("Expected 2 alternates; got %+v", info.Alternates)
+		}
+		names := make(map[string]bool)
+		for _, alt := range info.Alternates {
+			if alt.Cluster == "" {
+				t.Fatalf("Expected cluster to be set on alternate %+v", alt)
+			}
+			names[alt.Name] = true
+		}
+		if !names["foo"] || !names["foo_mirror"] {
+			t.Fatalf("Unexpected alternates: %+v", info.Alternates)
 		}
 	})
 }
