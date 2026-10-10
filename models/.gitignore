@@ -1,3 +1,4 @@
 .tools/
 states/
 *.out
+*_TTrace_*
