@@ -40,11 +40,16 @@ for cfg in "${cfgs[@]}"; do
   [[ "$base" == *_bug ]] && expect_fail=1
   printf '== %s/%s (%s) ... ' "$(basename "$dir")" "$base.cfg" "$spec"
   log="$(mktemp)"
+  meta="$(mktemp -d)"
   set +e
-  (cd "$dir" && java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -deadlock \
-      -config "$base.cfg" -metadir "$(mktemp -d)" "$spec.tla") >"$log" 2>&1
+  (cd "$dir" && java -XX:+UseParallelGC -Djava.io.tmpdir="$meta" -cp "$jar" tlc2.TLC \
+      -workers auto -deadlock -config "$base.cfg" -metadir "$meta/states" "$spec.tla") >"$log" 2>&1
   rc=$?
   set -e
+  # TLC's state queue can reach gigabytes; never leave it behind. Trace dumps
+  # (*_TTrace_*) are regenerated on every violation and are not kept either.
+  rm -rf "$meta"
+  rm -f "$dir/${spec}_TTrace_"*
   # -deadlock above disables TLC's built-in deadlock check; models that care
   # about deadlock state it as an explicit invariant/property instead, so the
   # failure carries a name.
