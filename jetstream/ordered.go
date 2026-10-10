@@ -193,6 +193,11 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 						continue
 					}
 					c.errHandler(c.serial)(sub, err)
+					if errors.Is(err, ErrConnectionClosed) {
+						// errHandler stopped the subscription; do not
+						// subscribe on the closed connection.
+						continue
+					}
 				}
 				c.Lock()
 				if sub.closed.Load() == 1 {
@@ -214,6 +219,9 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 				consumeOpts := innerOpts()
 				c.Unlock()
 				if cc, err := c.currentConsumer.Consume(internalHandler(serial), consumeOpts...); err != nil {
+					if c.js.conn.IsClosed() {
+						err = ErrConnectionClosed
+					}
 					c.errHandler(serial)(sub, err)
 				} else {
 					c.Lock()
@@ -390,10 +398,18 @@ func (s *orderedSubscription) resetMessages() error {
 		if errors.Is(err, errOrderedConsumerClosed) {
 			return ErrMsgIteratorClosed
 		}
+		if errors.Is(err, ErrConnectionClosed) {
+			s.Stop()
+			return fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+		}
 		return err
 	}
 	cc, err := c.currentConsumer.Messages(opts...)
 	if err != nil {
+		if c.js.conn.IsClosed() {
+			s.Stop()
+			return fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+		}
 		return err
 	}
 	c.Lock()
@@ -664,10 +680,19 @@ func (c *orderedConsumer) reset() error {
 		if isClosed {
 			return false, errOrderedConsumerClosed
 		}
+		// A closed connection does not come back: give up instead of
+		// retrying forever. reset() has already stopped the inner
+		// subscription, which would otherwise have reported the close.
+		if c.js.conn.IsClosed() {
+			return false, ErrConnectionClosed
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cons, err = c.js.CreateOrUpdateConsumer(ctx, c.stream, *consumerConfig)
 		if err != nil {
+			if errors.Is(err, nats.ErrConnectionClosed) || c.js.conn.IsClosed() {
+				return false, ErrConnectionClosed
+			}
 			return true, err
 		}
 		return false, nil

@@ -348,7 +348,6 @@ func TestORD6ConsumeSubscribesAfterStop(t *testing.T) {
 // reports ErrConnectionClosed or closes, and Messages' Next never returns.
 // Trace: CloseDuringReset_bug.cfg, OrderedMessages_close_bug.cfg.
 func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
-	harness.KnownBug(t, "ORD-7")
 	t.Run("Consume", func(t *testing.T) {
 		e := newEnv(t, envOpts{relay: true})
 		c := e.ordered(jetstream.OrderedConsumerConfig{})
@@ -396,8 +395,11 @@ func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
 		if !ok {
 			t.Fatal("Next did not return after the connection closed during a reset")
 		}
-		if !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
-			t.Errorf("Next: %v, want ErrMsgIteratorClosed", err)
+		if !errors.Is(err, jetstream.ErrMsgIteratorClosed) || !errors.Is(err, jetstream.ErrConnectionClosed) {
+			t.Errorf("Next: %v, want ErrMsgIteratorClosed and ErrConnectionClosed", err)
+		}
+		if _, err := it.Next(jetstream.NextMaxWait(time.Second)); !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
+			t.Errorf("second Next: %v, want ErrMsgIteratorClosed", err)
 		}
 	})
 }
