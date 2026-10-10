@@ -2114,7 +2114,9 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 func (sub *Subscription) InitialConsumerPending() (uint64, error) {
 	sub.mu.Lock()
 	defer sub.mu.Unlock()
-	if sub.jsi == nil || sub.jsi.consumer == _EMPTY_ {
+	// jsi.pending is set once, when the consumer is created. Do not depend on
+	// jsi.consumer: an ordered consumer clears it while it is being recreated.
+	if sub.jsi == nil {
 		return 0, fmt.Errorf("%w: not a JetStream subscription", ErrTypeSubscription)
 	}
 	return sub.jsi.pending, nil
