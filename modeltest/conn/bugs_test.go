@@ -88,7 +88,6 @@ func TestConn2RemoveStatusListenerDoesNotClose(t *testing.T) {
 // checkDrained (nats.go:5503) without an UNSUB: the server keeps the interest
 // for the life of the connection.
 func TestConn3DrainDuringReconnectLeaksServerInterest(t *testing.T) {
-	harness.KnownBug(t, "CONN-3")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	nc := connect(t, p.URL(), nats.ReconnectWait(20*time.Millisecond))

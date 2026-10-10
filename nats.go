@@ -6148,6 +6148,15 @@ func (nc *Conn) resendSubscriptions() {
 	for sid, s := range subs {
 		adjustedMax := uint64(0)
 		s.mu.Lock()
+		// A draining subscription has already removed its interest (or had
+		// its UNSUB suppressed or lost with the old connection): it stays in
+		// nc.subs only until checkDrained removes it client side, which sends
+		// no UNSUB, so re-subscribing it here would leave the interest on the
+		// server for the life of the connection.
+		if s.draining {
+			s.mu.Unlock()
+			continue
+		}
 		// when resending subscriptions, the permissions error should be cleared
 		// since the user may have fixed the permissions issue
 		s.permissionsErr = nil
