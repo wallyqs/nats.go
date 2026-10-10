@@ -50,7 +50,6 @@ import (
 //
 // Trace: PullConsume_orphan_bug.cfg.
 func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
-	harness.KnownBug(t, "PULL-1")
 	e := newEnv(t)
 	// Missed heartbeats: drop idle heartbeats; hold the 408 of the first pull.
 	e.px.SetFilter(func(f *Frame) Verdict {
@@ -75,15 +74,15 @@ func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
 	subLock := cc.(sync.Locker)
 	subLock.Lock()
 	// The heartbeat timer fires (2x500ms): the status goroutine takes the
-	// ErrNoHeartbeat and waits for sub.Lock (pull.go:395).
-	waitGoroutineAt(t, 10*time.Second, "jetstream/pull.go:395", "Mutex).Lock")
+	// ErrNoHeartbeat and waits for sub.Lock (pull.go:395 on the base).
+	waitGoroutineAt(t, 10*time.Second, statusGoroutine, "Mutex).Lock")
 	// The first pull expires at the server; let its 408 through. The
-	// handler waits for sub.Lock (pull.go:262).
+	// handler waits for sub.Lock (pull.go:262 on the base).
 	if !harness.Eventually(10*time.Second, func() bool { return e.px.Held() > 0 }) {
 		t.Fatal("no 408")
 	}
 	e.px.Release()
-	waitGoroutineAt(t, 10*time.Second, "jetstream/pull.go:262", "Mutex).Lock")
+	waitGoroutineAt(t, 10*time.Second, consumeHandler, "Mutex).Lock")
 	// Stop: pullMessages returns on done and unsubscribes.
 	subs := e.nc.NumSubscriptions()
 	cc.Stop()
@@ -96,10 +95,8 @@ func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
 	// NoOrphanedFetchSend). Closed() alone is not a reliable witness: it
 	// reports closed as soon as the subscription is invalid (PULL-7).
 	if !harness.Eventually(5*time.Second, func() bool { return consumeGoroutines() == base }) {
-		stuck := goroutinesAt("jetstream/pull.go:401", "[chan send") +
-			goroutinesAt("jetstream/pull.go:488", "[chan send")
 		t.Fatalf("%d consume goroutine(s) still running 5s after Stop; %d blocked forever on fetchNext holding sub.Lock",
-			consumeGoroutines()-base, stuck)
+			consumeGoroutines()-base, goroutinesAt("nats.go/jetstream.", "[chan send"))
 	}
 	if !closedWithin(cc, 5*time.Second) {
 		t.Fatal("Closed() not closed after Stop")
@@ -201,7 +198,6 @@ func TestPULL2ConsumeStallsForeverAfterLostConnected(t *testing.T) {
 //
 // Trace: PullConsume_stopafter_bug.cfg (StopAfterRespected).
 func TestPULL3StopAfterExceededAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "PULL-3")
 	e := newEnv(t)
 	const stopAfter = 3
 	var calls atomic.Int64
@@ -247,7 +243,6 @@ func TestPULL3StopAfterExceededAfterReconnect(t *testing.T) {
 //
 // Trace: PullConsume_pendingreset_bug.cfg (NoSilentStall).
 func TestPULL4MessagesStopAfterStallsAfterExpiry(t *testing.T) {
-	harness.KnownBug(t, "PULL-4")
 	e := newEnv(t)
 	e.publish(1)
 	it, err := e.cons.Messages(jetstream.StopAfter(5), jetstream.PullExpiry(time.Second))
@@ -271,7 +266,6 @@ func TestPULL4MessagesStopAfterStallsAfterExpiry(t *testing.T) {
 }
 
 func TestPULL4ConsumeStopAfterStallsAfterExpiry(t *testing.T) {
-	harness.KnownBug(t, "PULL-4")
 	e := newEnv(t)
 	var calls atomic.Int64
 	errs := make(chan error, 10)
@@ -311,7 +305,6 @@ func TestPULL4ConsumeStopAfterStallsAfterExpiry(t *testing.T) {
 // channel is closed, no more messages will be received and processing is
 // complete."
 func TestPULL7ClosedBeforeHandlerReturns(t *testing.T) {
-	harness.KnownBug(t, "PULL-7")
 	e := newEnv(t)
 	e.publish(1)
 	entered := make(chan struct{})
@@ -349,7 +342,6 @@ func TestPULL7ClosedBeforeHandlerReturns(t *testing.T) {
 //
 // Trace: PullMessages_overflow_bug.cfg (NoSlowConsumerDrop).
 func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "PULL-5")
 	e := newEnv(t)
 	var slow atomic.Int64
 	e.nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
@@ -387,6 +379,9 @@ func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
 		t.Fatalf("%d slow consumer drop(s) on the iterator after a reconnect (pulls on the wire: %v, received %d of %d)",
 			n, e.px.PullBatches(), got, 3*max)
 	}
+	if got != 3*max {
+		t.Fatalf("received %d of %d messages (pulls on the wire: %v)", got, 3*max, e.px.PullBatches())
+	}
 }
 
 // PULL-1, Messages() variant: during Drain Next keeps calling checkPending
@@ -398,7 +393,6 @@ func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
 //
 // Trace: PullMessages_orphan_bug.cfg (NoOrphanedFetchSend).
 func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
-	harness.KnownBug(t, "PULL-1")
 	e := newEnv(t)
 	var holdPong atomic.Bool
 	e.px.SetFilter(func(f *Frame) Verdict {
@@ -445,7 +439,7 @@ func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
 		case <-res:
 		case <-time.After(5 * time.Second):
 			t.Fatalf("Next did not return after Drain: %d goroutine(s) blocked on fetchNext in checkPending holding sub.Lock",
-				goroutinesAt("jetstream/pull.go:488", "[chan send"))
+				goroutinesAt("(*pullSubscription).checkPending", "[chan send"))
 		}
 	}
 }
@@ -456,7 +450,6 @@ func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
 // with PullMaxBytes likewise allocates an 8 MB channel (pull.go:534,
 // MaxMessages = 1,000,000 at pull.go:1222).
 func TestPULL9FetchBytesAllocatesChannelsForAMillionMessages(t *testing.T) {
-	harness.KnownBug(t, "PULL-9")
 	e := newEnv(t)
 	e.publish(1)
 	var before, after runtime.MemStats
@@ -466,10 +459,27 @@ func TestPULL9FetchBytesAllocatesChannelsForAMillionMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := 0
 	for range batch.Messages() {
+		got++
 	}
 	runtime.ReadMemStats(&after)
 	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 4<<20 {
 		t.Fatalf("FetchBytes(1024) allocated %d MB", alloc>>20)
+	}
+	if got != 1 {
+		t.Fatalf("FetchBytes(1024) returned %d messages, want 1", got)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	it, err := e.cons.Messages(jetstream.PullMaxBytes(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Stop()
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 4<<20 {
+		t.Fatalf("Messages(PullMaxBytes(1024)) allocated %d MB", alloc>>20)
 	}
 }

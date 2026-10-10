@@ -394,7 +394,7 @@ func TestPullConsumer_checkPending(t *testing.T) {
 	tests := []struct {
 		name                string
 		givenSub            *pullSubscription
-		fetchInProgress     bool
+		fetchQueued         bool
 		shouldSend          bool
 		expectedPullRequest *pullRequest
 	}{
@@ -430,7 +430,7 @@ func TestPullConsumer_checkPending(t *testing.T) {
 			},
 		},
 		{
-			name: "pending msgs below threshold but PR in progress",
+			name: "pending msgs below threshold but previous PR still queued",
 			givenSub: &pullSubscription{
 				pending: pendingMsgs{
 					msgCount: 4,
@@ -440,8 +440,8 @@ func TestPullConsumer_checkPending(t *testing.T) {
 					MaxMessages:       10,
 				},
 			},
-			fetchInProgress: true,
-			shouldSend:      false,
+			fetchQueued: true,
+			shouldSend:  false,
 		},
 		{
 			name: "pending bytes below threshold, send pull request",
@@ -476,18 +476,20 @@ func TestPullConsumer_checkPending(t *testing.T) {
 			shouldSend: false,
 		},
 		{
-			name: "pending bytes below threshold, fetch in progress, no pull request",
+			name: "pending bytes below threshold, previous PR still queued, no pull request",
 			givenSub: &pullSubscription{
 				pending: pendingMsgs{
 					byteCount: 400,
+					msgCount:  1000000,
 				},
 				consumeOpts: &consumeOpts{
+					MaxMessages:    1000000,
 					ThresholdBytes: 500,
 					MaxBytes:       1000,
 				},
 			},
-			fetchInProgress: true,
-			shouldSend:      false,
+			fetchQueued: true,
+			shouldSend:  false,
 		},
 		{
 			name: "StopAfter set, pending msgs below StopAfter, send pull request",
@@ -529,8 +531,16 @@ func TestPullConsumer_checkPending(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			prChan := make(chan *pullRequest, 1)
 			test.givenSub.fetchNext = prChan
-			if test.fetchInProgress {
-				test.givenSub.fetchInProgress.Store(1)
+			if test.fetchQueued {
+				// pullMessages has not picked up the previous request
+				// yet: checkPending must neither block nor replace it.
+				queued := &pullRequest{}
+				prChan <- queued
+				test.givenSub.checkPending()
+				if pr := <-prChan; pr != queued || len(prChan) != 0 {
+					t.Fatalf("Unexpected pull request: %#v", pr)
+				}
+				return
 			}
 			errs := make(chan error, 1)
 			ok := make(chan struct{}, 1)

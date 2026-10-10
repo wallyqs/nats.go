@@ -36,7 +36,7 @@ CONSTANTS
                         \* waiting pull (heartbeats delayed > 2x by the network)
     FastPull,           \* the server never answers a pull (message or 408) before
                         \* pullMessages has run the statement after pull() returned
-    Fixes               \* subset of {"orphan", "steal", "pendingreset", "clamp", "drainrace",
+    Fixes               \* subset of {"orphan", "steal", "pendingreset", "clamp", "drainrace", "fip",
                         \*            "buffered", "unbounded"}
 
 Min(a, b) == IF a < b THEN a ELSE b
@@ -114,16 +114,23 @@ procedure CheckPending()   \* pull.go:461-504
 variables batch = 0;
 {
 cp_eval:
-    if (pending < Thresh /\ fip = 0) {
+    \* With the "fip" fix (PULL-10) the check no longer waits for
+    \* fetchInProgress to clear, and the send never blocks: when fetchNext
+    \* already holds a request, this one is skipped.
+    if (pending < Thresh /\ (fip = 0 \/ "fip" \in Fixes)) {
         batch := LET b == IF StopAfter > 0
                           THEN Min(MaxMsgs - pending, StopAfter - delivered - pending)
                           ELSE MaxMsgs - pending
                  IN IF "clamp" \in Fixes THEN Min(b, MaxMsgs) ELSE b;
         if (batch > 0) {
 cp_send:
-            await CanSendFetch \/ FetchSendDone;
-            if (CanSendFetch) { fetchNext := Append(fetchNext, batch); };
-            pending := IF "pendingreset" \in Fixes THEN pending + batch ELSE MaxMsgs;  \* pull.go:500
+            await CanSendFetch \/ FetchSendDone \/ "fip" \in Fixes;
+            if (CanSendFetch) {
+                fetchNext := Append(fetchNext, batch);
+                pending := IF "pendingreset" \in Fixes THEN pending + batch ELSE MaxMsgs;  \* pull.go:500
+            } else if ("fip" \notin Fixes) {
+                pending := IF "pendingreset" \in Fixes THEN pending + batch ELSE MaxMsgs;
+            };
         };
     };
 cp_ret:
@@ -464,7 +471,7 @@ Init == (* Global variables *)
                                         [] self = "env" -> "e_loop"]
 
 cp_eval(self) == /\ pc[self] = "cp_eval"
-                 /\ IF pending < Thresh /\ fip = 0
+                 /\ IF pending < Thresh /\ (fip = 0 \/ "fip" \in Fixes)
                        THEN /\ batch' = [batch EXCEPT ![self] = LET b == IF StopAfter > 0
                                                                          THEN Min(MaxMsgs - pending, StopAfter - delivered - pending)
                                                                          ELSE MaxMsgs - pending
@@ -484,12 +491,15 @@ cp_eval(self) == /\ pc[self] = "cp_eval"
                                  isConn, req >>
 
 cp_send(self) == /\ pc[self] = "cp_send"
-                 /\ CanSendFetch \/ FetchSendDone
+                 /\ CanSendFetch \/ FetchSendDone \/ "fip" \in Fixes
                  /\ IF CanSendFetch
                        THEN /\ fetchNext' = Append(fetchNext, batch[self])
-                       ELSE /\ TRUE
+                            /\ pending' = (IF "pendingreset" \in Fixes THEN pending + batch[self] ELSE MaxMsgs)
+                       ELSE /\ IF "fip" \notin Fixes
+                                  THEN /\ pending' = (IF "pendingreset" \in Fixes THEN pending + batch[self] ELSE MaxMsgs)
+                                  ELSE /\ TRUE
+                                       /\ UNCHANGED pending
                             /\ UNCHANGED fetchNext
-                 /\ pending' = (IF "pendingreset" \in Fixes THEN pending + batch[self] ELSE MaxMsgs)
                  /\ pc' = [pc EXCEPT ![self] = "cp_ret"]
                  /\ UNCHANGED << conn, reconnects, expires, hbMsgs, hbFires, 
                                  reqs, rbuf, avail, subState, msgs, msgsClosed, 

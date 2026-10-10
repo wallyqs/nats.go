@@ -359,6 +359,14 @@ func waitGoroutineAt(t testing.TB, timeout time.Duration, patterns ...string) {
 	}
 }
 
+// Stack patterns of two of Consume's goroutines: the message handler run by
+// nats.go (the first closure in Consume) and the status goroutine (the
+// third). They name functions, not lines, so they survive edits to pull.go.
+const (
+	consumeHandler  = "jetstream.(*pullConsumer).Consume.func1("
+	statusGoroutine = "jetstream.(*pullConsumer).Consume.func3("
+)
+
 // consumeGoroutines counts goroutines running jetstream pull consumer code:
 // the handler (inside waitForMsgs), the status goroutine, pullMessages and
 // fired heartbeat timers.

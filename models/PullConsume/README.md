@@ -8,12 +8,19 @@ and channel subscription delivery, `Subscription.Drain`, and the
 H5 section; it has no TLA+ model. The model-derived Go tests live in
 `modeltest/pullconsume/`.
 
+**Status on `fix/pull`:** PULL-1, 3, 4, 5, 6, 7, 8, 9, 10 and O-1 are fixed
+in `jetstream/pull.go` (see "Fixed on fix/pull" below and each finding).
+PULL-2's root cause is in `nats.go` (`sendStatusEvent`) and is fixed by the
+nats.go change on `fix/conn`; its reproducers stay gated by
+`harness.KnownBug` here. The `pull.go:<line>` references in this README
+and in the specs are to the base commit, before the fixes.
+
 Run:
 
 ```sh
 TLA2TOOLS=/path/to/tla2tools.jar models/tlc.sh PullConsume      # every cfg below
-cd modeltest && go test -race ./pullconsume/...                 # default: green
-cd modeltest && MODELTEST_KNOWN_BUGS=1 go test -race -run TestPULL ./pullconsume/  # reproducers: fail
+cd modeltest && ./run.sh ./pullconsume/...                      # default: green
+cd modeltest && MODELTEST_KNOWN_BUGS=1 ./run.sh ./pullconsume/...  # only PULL-2 fails (until fix/conn)
 ```
 
 ## What is modeled
@@ -82,11 +89,15 @@ Same `p`, `t`, `env` and `cp_*` as above, plus:
   clock, so this is how "2×heartbeat of silence" is expressed.
 * `FastPull`: if TRUE, the server never answers a pull before `pullMessages`
   has run the statement after `pull()` returned (`fetchInProgress = 0`).
-  Only `PullMessages_fip_bug.cfg` drops it.
+  `PullMessages_fip_bug.cfg` drops it to show PULL-10, and
+  `PullConsume_fip.cfg` / `PullMessages_fip.cfg` drop it to check the fix.
 * Bounds: `StreamMsgs`, `MaxReconnects`, `MaxExpires`, `MaxHBMsgs`,
   `MaxHBFires`, `MaxNext`.
-* `Fixes`: the proposed fixes below, one name per finding. Each `*_bug.cfg`
-  is a passing configuration with exactly one fix removed.
+* `Fixes`: the fixes below, one name per finding. Each `*_bug.cfg` is a
+  passing configuration with exactly one fix removed, i.e. it encodes the
+  old code for that finding and must keep reproducing. `fip` (PULL-10) was
+  added with the fix on `fix/pull`; the `_bug.cfg`s predate it and run
+  without it, which is the old code.
 
 ### Invariants
 
@@ -122,19 +133,21 @@ Same `p`, `t`, `env` and `cp_*` as above, plus:
 
 ## TLC results (measured)
 
-TLC 2026.10.06, `-workers 2`, 1.2 GB heap, on a 4-core machine shared
-with five other model checkers (under heavier load the same runs took
-2-3x longer, e.g. `PullConsume.cfg` 190 s). "States" means distinct states,
-and each passing run explored its state space to the end (0 states left on
-queue).
+TLC 2026.10.06 via `models/tlc.sh` (`-workers auto`), on a 4-core machine
+shared with other agents' model checkers and test runs, after the fixes
+landed on `fix/pull` (passing configs now include `fip`). "States" means
+distinct states, and each passing run explored its state space to the end
+(0 states left on queue). The whole directory takes 451 s.
 
 | Config | Spec | Result | States | Time |
 |---|---|---|---|---|
-| `PullConsume.cfg` | Consume, all fixes, Stop+Closed, reconnect (either), late HB | pass | 3,062,758 | 69 s |
-| `PullConsume_drain.cfg` | Consume, all fixes, Drain+Closed, reconnect (keep) | pass | 3,062,758D | 69 sD |
-| `PullConsume_stopafter.cfg` | Consume, all fixes, StopAfter 1 < MaxMessages 2, Stop | pass | 3,062,758S | 69 sS |
-| `PullMessages.cfg` | Messages, all fixes, 3×Next, Drain, reconnect (either), late HB | pass | 2,679,171 | 59 s |
-| `PullMessages_stopafter.cfg` | Messages, all fixes, StopAfter 1 | pass | 2,679,171S | 59 sS |
+| `PullConsume.cfg` | Consume, all fixes, Stop+Closed, reconnect (either), late HB | pass | 3,074,862 | 88 s |
+| `PullConsume_drain.cfg` | Consume, all fixes, Drain+Closed, reconnect (keep) | pass | 2,507,954 | 73 s |
+| `PullConsume_stopafter.cfg` | Consume, all fixes, StopAfter 1 < MaxMessages 2, Stop | pass | 355,115 | 18 s |
+| `PullConsume_fip.cfg` | Consume, all fixes, `FastPull = FALSE`, StopAfter 1, reconnect (either), Stop+Closed | pass | 761,655 | 24 s |
+| `PullMessages.cfg` | Messages, all fixes, 3×Next, Drain, reconnect (either), late HB | pass | 2,692,188 | 97 s |
+| `PullMessages_stopafter.cfg` | Messages, all fixes, StopAfter 1 | pass | 339,499 | 18 s |
+| `PullMessages_fip.cfg` | Messages, all fixes, `FastPull = FALSE`, 3×Next, Drain, reconnect (either) | pass | 2,368,527 | 91 s |
 | `PullConsume_orphan_bug.cfg` | PULL-1 | `NoOrphanedFetchSend` violated | | |
 | `PullMessages_orphan_bug.cfg` | PULL-1 (Messages) | `NoOrphanedFetchSend` violated | | |
 | `PullConsume_steal_bug.cfg` | PULL-2 | `NoPermanentStall` violated | | |
@@ -149,7 +162,9 @@ queue).
 | `PullMessages_drainrace_bug.cfg` | PULL-8 (Messages) | `DrainKeepsBuffered` violated | | |
 | `PullMessages_fip_bug.cfg` | PULL-10 | `NoSilentStall` violated | | |
 
-Every `_bug` configuration reports its violation within 1-8 s. The
+Every `_bug` configuration reports its violation within 2-9 s (measured
+again after the fixes: the specs changed only by the `fip` switch, which
+the `_bug` configs leave off). The
 counterexamples are 7 to 27 steps long; TLC's breadth-first search makes
 each the shortest one under that configuration.
 
@@ -160,11 +175,17 @@ Medium = wrong results or documented-contract violations users will hit;
 Low = narrow races, performance, cosmetic.
 
 Every "confirmed" finding has a test in `modeltest/pullconsume/bugs_test.go`
-gated by `harness.KnownBug` (it asserts the correct behavior, so it fails
-today). The failure counts below are from `-race -count=3` or `-count=5`
-runs.
+that asserts the correct behavior. The failure counts below were measured
+on the base commit (`-race -count=3` or `-count=5`). On `fix/pull` every
+one of them is a regression test that passes, except PULL-2's, which stay
+gated by `harness.KnownBug` until the nats.go fix.
 
 ### PULL-1 — Stop/Drain while a pull is queued deadlocks the consume; Next hangs during Drain (High, confirmed)
+
+**Fixed on `fix/pull`** (dcae0d3, and for `checkPending` also b1b3c75):
+the status goroutine's two sends go through `sendFetchNext`, which selects
+on `done`; `checkPending`'s send no longer blocks at all (PULL-10). Both
+tests are regression tests now.
 
 `fetchNext` has capacity 1 and is written with a blocking send while
 holding `sub.Lock` in three places: `checkPending` (`pull.go:488`), the
@@ -227,6 +248,13 @@ selects on `done`.
 ```
 
 ### PULL-2 — `StatusChanged` loses events and unregisters itself; Consume can go silent forever (High, confirmed; root cause in nats.go core)
+
+**Not fixed here: the root cause is in `nats.go`**, fixed by the nats.go
+change on `fix/conn` (the same fix as PUB-7/CONN-1). Both tests stay gated
+by `harness.KnownBug`, and the stateful Messages test keeps its reconnects
+below the count that would fill `errs` (see below). No `pull.go`-side
+hardening is proposed: the status goroutine cannot tell a lost event from
+one that never happened.
 
 Same root cause as PUB-7 in `models/PublishAsync/README.md`, found
 independently by that model. This section covers what it does to pull
@@ -314,6 +342,12 @@ Fix: do not use a receive as a closed-probe.
 
 ### PULL-3 — StopAfter exceeded: re-pulls ignore it, and the handler is not guarded (Medium, confirmed)
 
+**Fixed on `fix/pull`** (f090934): the reconnect re-pull is capped by
+StopAfter, a re-pull with batch 0 is not sent, and the handler discards
+messages once Stop was called (`stopped()`, which also covers PULL-8) or
+StopAfter was reached. `TestPULL3...` is a regression test and
+`TestModelConsume` draws StopAfter by default.
+
 * After a reconnect, the status goroutine re-pulls `MaxMessages`
   (`pull.go:375`) with no StopAfter cap.
 * The ErrNoHeartbeat re-pull uses `StopAfter - delivered`
@@ -374,6 +408,11 @@ read in the handler is race-free.)
 
 ### PULL-4 — StopAfter < MaxMessages: after a pull expires nothing is pulled until the heartbeat times out (Medium, confirmed)
 
+**Fixed on `fix/pull`** (d259848): `resetPendingMsgs(batch)` counts the
+batch actually requested, and `checkPending` adds its batch to what is
+outstanding (`min(pending+batch, MaxMessages)`, which is MaxMessages as
+before without StopAfter). Both tests are regression tests.
+
 `resetPendingMsgs` / `checkPending` set `pending.msgCount = MaxMessages`
 (`pull.go:328`, `500`, `387`, `415`), but with StopAfter the pull asks for
 fewer messages (`pull.go:329-332`, `480-482`, `397-400`). The counter then
@@ -421,6 +460,17 @@ Fix (model: `pendingreset`): count what was actually asked for.
 
 ### PULL-5 — Messages(): the channel overflows after a reconnect or a missed heartbeat, and messages are dropped (Medium, confirmed)
 
+**Fixed on `fix/pull`** (1d90d57), as the model's `unbounded` +
+`buffered`: `Messages()` subscribes with an async handler that appends to
+an unbounded `msgQueue`, which `Next` pops from; the pending count on
+ErrNoHeartbeat / errConnected is reset to what is still queued. Drain keeps
+its semantics (the closed handler closes the queue once drained). One
+visible difference: `Next` now returns buffered messages before it looks
+at queued status notifications (before, `select` picked at random).
+`TestPULL5...` is a regression test (it now also checks that all 30
+messages arrive), and `TestModelMessages` reconnects and misses heartbeats
+by default.
+
 `Messages()` buffers in a `ChanSubscribe` channel of exactly `MaxMessages`
 (`pull.go:534`). nats.go never blocks on it: what does not fit is dropped
 as a slow consumer (`nats.go:4013-4022`). On `errConnected` or
@@ -461,6 +511,12 @@ own:
 
 ### PULL-6 — `pending.msgCount` goes negative and a pull asks for more than MaxMessages (Low, model-only)
 
+**Fixed on `fix/pull`** (034713b): `decrementPendingMsgs` floors both
+counts at 0. With StopAfter drawn by default, `TestModelConsume` hit this
+against the real server before the fix (MaxMessages 2, StopAfter 0, a
+reconnect the old pull survived, a pull for 3), so it is no longer
+model-only.
+
 `decrementPendingMsgs` (`pull.go:446`) has no floor, unlike the 408 path
 (`pull.go:773-775`), and `checkPending` computes
 `batch = MaxMessages - pending` (`pull.go:470`).
@@ -482,6 +538,12 @@ Fix (model: `clamp`): `if s.pending.msgCount > 0 { s.pending.msgCount-- }`,
 or `batchSize = min(batchSize, s.consumeOpts.MaxMessages)`.
 
 ### PULL-7 — `Closed()` fires while the message handler is still running (Low, confirmed)
+
+**Fixed on `fix/pull`** (ff49354): the closed handlers set `handlerDone`
+and `Closed()` uses it. If the subscription was closed (with the
+connection) before the closed handler was set, nats.go may never call it,
+so Consume/Messages then run it directly (it is idempotent).
+`TestPULL7...` is a regression test.
 
 `Closed()` returns an already-closed channel when
 `!s.subscription.IsValid()` (`pull.go:846-849`). Stop's Unsubscribe makes
@@ -509,6 +571,10 @@ that.
 ```
 
 ### PULL-8 — Drain/close race: `closed` is set before `draining` (Low, model-only)
+
+**Fixed on `fix/pull`** (9f1fe39) as proposed: `stopped()` waits for
+`done` before it reads `draining`; `Next` and the Consume handler use it,
+and `cleanup` waits for `done` the same way.
 
 `Drain()` does `closed.CompareAndSwap(0,1)`, *then*
 `draining.Store(1)` (`pull.go:828-831`). Two readers can land in that
@@ -538,6 +604,17 @@ before reading `draining`. `Drain` stores `draining` before
 
 ### PULL-9 — FetchBytes allocates ~30 MB of channels per call (Low/performance, confirmed; found while transcribing channel capacities, not through a TLC trace)
 
+**Fixed on `fix/pull`** (1094885), differently from the proposal below:
+`FetchBytes` asks for at most `maxBytes / minSize + 1` messages (capped at
+1,000,000), where `minSize = len("$JS.ACK.<stream>.<consumer>.") + 1`. The
+server counts at least a message's subject and ack reply subject against
+max_bytes (`consumer.go`, `sz = len(subj) + len(ackReply) + len(hdr) +
+len(msg)`), so no more messages can arrive, and `fetch`'s channels are
+sized by that. A server counting less would only return fewer messages
+than fit, which FetchBytes allows. `Messages(PullMaxBytes)` lost its 8 MB
+channel with PULL-5. `TestPULL9...` checks both (4 MB budget) and is a
+regression test.
+
 `FetchBytes` sets `Batch = 1_000_000` (`pull.go:890`), and `fetch` sizes
 both channels by it (`pull.go:935-937`): 16 MB for `chan Msg` plus 16 MB
 for `chan *nats.Msg`, whatever `maxBytes` is. `Messages(PullMaxBytes(...))`
@@ -553,6 +630,17 @@ would deadlock `Messages()`/`Error()`. So either send outside the lock and
 size the channels with a small bound, or grow them on demand.
 
 ### PULL-10 — `fetchInProgress` lost wake-up (Low, model-only, timing-dependent)
+
+**Fixed on `fix/pull`** (b1b3c75), not as sketched below: `checkPending`
+no longer looks at `fetchInProgress` (the field is gone) and its send is
+non-blocking. A request is queued whenever `fetchNext` has room, also while
+the previous one is being sent (the pending count already includes it);
+when `fetchNext` is full, the queued request brings the next message or
+status, which runs the check again. Re-checking from `pullMessages` would
+need `sub.Lock`, which `Next` holds while it waits, so that was not done.
+In the specs this is the `fip` fix: `PullConsume_fip.cfg` and
+`PullMessages_fip.cfg` pass with `FastPull = FALSE`, and
+`PullMessages_fip_bug.cfg` (without `fip`) still reproduces the stall.
 
 `checkPending` does nothing while `fetchInProgress == 1` (`pull.go:467`).
 Nothing re-runs it when `pullMessages` clears the flag (`pull.go:1092`).
@@ -570,6 +658,8 @@ Fix sketch: when `checkPending` skips because of `fetchInProgress`, set a
 the threshold check under `sub.Lock` and pulls directly.
 
 ### O-1 — Fetch leaves its heartbeat timer armed (observation, code review)
+
+**Fixed on `fix/pull`** (6b2a6f1) as proposed.
 
 The fetch goroutine (`pull.go:966-1034`) returns without stopping `hbTimer`
 (`pull.go:958`). For up to 2×heartbeat (10s by default) after a fetch
@@ -619,10 +709,12 @@ reachable. Consume's equivalent was fixed in #2164. Fix:
   environment actions on a real nats-server: it can drop or hold frames
   (heartbeats, 408s, PONGs), cut connections, and record every pull
   request's batch from the wire. The file also has goroutine-stack waiters
-  that park on a `pull.go:<line>` and a `len(chan)` peek, so tests can wait
-  for settled states instead of sleeping.
+  that park on a function (by name, so that edits to `pull.go` do not
+  break them) and a `len(chan)` peek, so tests can wait for settled states
+  instead of sleeping.
 * `bugs_test.go`: one reproducer per confirmed finding (PULL-1, 2, 3, 4, 5,
-  7, 9), gated by `harness.KnownBug`.
+  7, 9). On `fix/pull` all are regression tests except PULL-2's two, which
+  stay gated by `harness.KnownBug` until the nats.go fix.
 * `stateful_test.go`: zizek state machines, `TestModelConsume` and
   `TestModelMessages`.
   * Rules are the models' environment actions: publish, cut, late
@@ -632,14 +724,37 @@ reachable. Consume's equivalent was fixed in #2164. Fix:
     API: `StopAfterRespected`, `BatchWithinMax`, `NoInvalidPull`,
     `NoSlowConsumerDrop`, `NoSilentStall` as a liveness probe, and
     `NoDeadlock`/`DrainKeepsBuffered` on teardown.
-  * By default the draws avoid the known-bug triggers (no StopAfter for
-    Consume; no reconnect or late heartbeat for Messages), and both pass:
-    about 20s each, 6-8 examples, fixed seeds.
-  * With `MODELTEST_KNOWN_BUGS=1` they explore everything and fail on known
-    findings. `TestModelConsume` shrinks to the 2-step PULL-3 trace above.
-    `TestModelMessages` reports the PULL-1 Messages hang and, in an earlier
-    revision of its default mode, found the stale-`errConnected` variant of
-    PULL-5.
+  * Before the fixes the default draws avoided the known-bug triggers (no
+    StopAfter for Consume; no reconnect or late heartbeat for Messages).
+    With `MODELTEST_KNOWN_BUGS=1` they explored everything and failed on
+    known findings: `TestModelConsume` shrank to the 2-step PULL-3 trace
+    above, and `TestModelMessages` reported the PULL-1 Messages hang (and,
+    in an earlier revision of its default mode, the stale-`errConnected`
+    variant of PULL-5).
+  * On `fix/pull` the default run explores the fixed findings: Consume
+    draws StopAfter, Messages reconnects and misses heartbeats. Only
+    PULL-2's trigger is still avoided: Messages makes at most four
+    reconnects in a row without Next (`maxCutsBetweenNext`), so its status
+    goroutine never fills `errs` and stops reading `StatusChanged`;
+    `MODELTEST_KNOWN_BUGS=1` lifts that. Both pass, about 23 s and 29 s,
+    6 and 8 examples, fixed seeds (also 25 examples each with other seeds,
+    82 s and 101 s, green).
+  * Rules that cut the connection first wait (up to 500 ms, without
+    asserting) for messages already on their way to the client. The proxy
+    loses what is in flight and the server redelivers it only after
+    AckWait (30 s); once StopAfter was drawn by default, that environment
+    loss showed up as a spurious NoSilentStall.
+
+Verification of the fixes (measured on `fix/pull`):
+
+* `./run.sh ./pullconsume/...`: green (the two PULL-2 tests skip).
+  With `MODELTEST_KNOWN_BUGS=1` only the two PULL-2 tests fail.
+* The regression tests, copied onto the base commit and run with
+  `MODELTEST_KNOWN_BUGS=1`, all fail there, each with the failure described
+  under its finding (e.g. PULL-5: pulls `[10 10 6 6 6]`, 26 of 30
+  received; PULL-9: 30 MB).
+* `./run.sh ./ordered/...` (the ordered consumer builds on `pull.go`):
+  green.
 
 Notes on zizek:
 

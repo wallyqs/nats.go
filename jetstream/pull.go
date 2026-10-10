@@ -134,12 +134,11 @@ type (
 		id                string
 		consumer          *pullConsumer
 		subscription      *nats.Subscription
-		msgs              chan *nats.Msg
-		msgsClosed        atomic.Uint32
+		msgs              chan *nats.Msg // Fetch
+		queue             *msgQueue      // Messages
 		errs              chan error
 		pending           pendingMsgs
 		hbMonitor         *hbMonitor
-		fetchInProgress   atomic.Uint32
 		closed            atomic.Uint32
 		draining          atomic.Uint32
 		done              chan struct{}
@@ -148,11 +147,27 @@ type (
 		consumeOpts       *consumeOpts
 		delivered         int
 		closedCh          chan struct{}
+		// handlerDone is set by the subscription's closed handler, which
+		// nats.go calls once no message handler runs any more.
+		handlerDone atomic.Bool
 	}
 
 	pendingMsgs struct {
 		msgCount  int
 		byteCount int
+	}
+
+	// msgQueue holds what the subscription of a Messages() iterator
+	// received until Next takes it. It is unbounded: nats.go drops what
+	// does not fit into a channel subscription (slow consumer), and pull
+	// requests that survive a reconnect or a missed heartbeat at the
+	// server, or in the reconnect buffer, are invisible to the client, so
+	// the iterator cannot keep what it asks for within a fixed capacity.
+	msgQueue struct {
+		mu     sync.Mutex
+		msgs   []*nats.Msg
+		closed bool
+		ready  chan struct{} // capacity 1, signaled on push and close
 	}
 
 	MessageBatch interface {
@@ -283,6 +298,12 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			}
 			return
 		}
+		// Messages already buffered when Stop was called, or when StopAfter
+		// was reached, are discarded rather than handed to the user.
+		// sub.delivered is only written on this goroutine.
+		if sub.stopped() || (sub.consumeOpts.StopAfter > 0 && sub.delivered >= sub.consumeOpts.StopAfter) {
+			return
+		}
 		if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 			p.setPinID(pinId)
 		}
@@ -310,10 +331,11 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		}
 		return nil, err
 	}
-	sub.subscription.SetClosedHandler(func(sid string) func(string) {
+	closedHandler := func(sid string) func(string) {
 		return func(subject string) {
 			p.subs.Delete(sid)
 			sub.draining.CompareAndSwap(1, 0)
+			sub.handlerDone.Store(true)
 			sub.Lock()
 			if sub.closedCh != nil {
 				close(sub.closedCh)
@@ -321,15 +343,21 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			}
 			sub.Unlock()
 		}
-	}(sub.id))
+	}(sub.id)
+	sub.subscription.SetClosedHandler(closedHandler)
+	if !sub.subscription.IsValid() {
+		// Closed (with the connection) before the handler was set: nats.go
+		// may not call it. It is safe to run twice.
+		closedHandler(inbox)
+	}
 
 	sub.Lock()
 	// initial pull
-	sub.resetPendingMsgs()
 	batchSize := sub.consumeOpts.MaxMessages
 	if sub.consumeOpts.StopAfter > 0 {
 		batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
 	}
+	sub.resetPendingMsgs(batchSize)
 	if err := sub.pull(&pullRequest{
 		Expires:       consumeOpts.Expires,
 		Batch:         batchSize,
@@ -370,9 +398,13 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							sub.errs <- errConnected
 						}
 
-						sub.fetchNext <- &pullRequest{
+						batchSize := sub.consumeOpts.MaxMessages
+						if sub.consumeOpts.StopAfter > 0 {
+							batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
+						}
+						if batchSize > 0 && sub.sendFetchNext(&pullRequest{
 							Expires:       sub.consumeOpts.Expires,
-							Batch:         sub.consumeOpts.MaxMessages,
+							Batch:         batchSize,
 							MaxBytes:      sub.consumeOpts.MaxBytes,
 							Heartbeat:     sub.consumeOpts.Heartbeat,
 							MinPending:    sub.consumeOpts.MinPending,
@@ -380,11 +412,12 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							Priority:      sub.consumeOpts.Priority,
 							Group:         sub.consumeOpts.Group,
 							PinID:         p.getPinID(),
+						}) {
+							if sub.hbMonitor != nil {
+								sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
+							}
+							sub.resetPendingMsgs(batchSize)
 						}
-						if sub.hbMonitor != nil {
-							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
-						}
-						sub.resetPendingMsgs()
 					}
 					sub.Unlock()
 
@@ -398,7 +431,10 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 					if sub.consumeOpts.StopAfter > 0 {
 						batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
 					}
-					sub.fetchNext <- &pullRequest{
+					// With StopAfter reached (the handler is about to
+					// call Stop), there is nothing left to pull; a batch
+					// of 0 would be rejected by pull() as invalid.
+					if batchSize > 0 && sub.sendFetchNext(&pullRequest{
 						Expires:       sub.consumeOpts.Expires,
 						Batch:         batchSize,
 						MaxBytes:      sub.consumeOpts.MaxBytes,
@@ -408,11 +444,12 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 						Priority:      sub.consumeOpts.Priority,
 						Group:         sub.consumeOpts.Group,
 						PinID:         p.getPinID(),
+					}) {
+						if sub.hbMonitor != nil {
+							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
+						}
+						sub.resetPendingMsgs(batchSize)
 					}
-					if sub.hbMonitor != nil {
-						sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
-					}
-					sub.resetPendingMsgs()
 				}
 				sub.Unlock()
 				if sub.consumeOpts.ErrHandler != nil {
@@ -432,20 +469,30 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 	return sub, nil
 }
 
-// resetPendingMsgs resets pending message count and byte count
-// to the values set in consumeOpts
+// resetPendingMsgs resets pending message count and byte count after a
+// pull request for batch messages replaced every earlier one. The message
+// count is the batch actually requested, which is less than MaxMessages
+// with StopAfter: counting MaxMessages would keep the count at or above
+// the threshold after the request expires partly unfilled, and no new pull
+// request would be sent until the heartbeat timer fires.
 // lock should be held before calling this method
-func (s *pullSubscription) resetPendingMsgs() {
-	s.pending.msgCount = s.consumeOpts.MaxMessages
+func (s *pullSubscription) resetPendingMsgs(batch int) {
+	s.pending.msgCount = batch
 	s.pending.byteCount = s.consumeOpts.MaxBytes
 }
 
-// decrementPendingMsgs decrements pending message count and byte count
+// decrementPendingMsgs decrements pending message count and byte count.
+// Neither goes below 0, as in handleStatusMsg: a reset (on reconnect or a
+// missed heartbeat) forgets requests that may still be alive, and their
+// messages would otherwise drive the counts negative, making checkPending
+// ask for more than MaxMessages (or MaxBytes).
 // lock should be held before calling this method
 func (s *pullSubscription) decrementPendingMsgs(msg *nats.Msg) {
-	s.pending.msgCount--
+	if s.pending.msgCount > 0 {
+		s.pending.msgCount--
+	}
 	if s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize {
-		s.pending.byteCount -= msg.Size()
+		s.pending.byteCount = max(s.pending.byteCount-msg.Size(), 0)
 	}
 }
 
@@ -462,9 +509,8 @@ func (s *pullSubscription) checkPending() {
 	// check if we went below any threshold
 	// we don't want to track bytes threshold if either it's not set or we used
 	// PullMaxMessagesWithBytesLimit
-	if (s.pending.msgCount < s.consumeOpts.ThresholdMessages ||
-		(s.pending.byteCount < s.consumeOpts.ThresholdBytes && s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize)) &&
-		s.fetchInProgress.Load() == 0 {
+	if s.pending.msgCount < s.consumeOpts.ThresholdMessages ||
+		(s.pending.byteCount < s.consumeOpts.ThresholdBytes && s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize) {
 
 		var batchSize, maxBytes int
 		batchSize = s.consumeOpts.MaxMessages - s.pending.msgCount
@@ -485,7 +531,15 @@ func (s *pullSubscription) checkPending() {
 			if s.consumer != nil {
 				pinID = s.consumer.getPinID()
 			}
-			s.fetchNext <- &pullRequest{
+			// The send never blocks. If the previous request is still
+			// queued (pullMessages has not picked it up yet), this check
+			// runs again on the next message or status, which that
+			// request brings. A request may be queued while pullMessages
+			// is still sending the previous one: skipping it then would
+			// lose the wake-up when the server answers the previous
+			// request in full before pullMessages gets back to fetchNext.
+			select {
+			case s.fetchNext <- &pullRequest{
 				Expires:       s.consumeOpts.Expires,
 				Batch:         batchSize,
 				MaxBytes:      maxBytes,
@@ -495,11 +549,31 @@ func (s *pullSubscription) checkPending() {
 				MinPending:    s.consumeOpts.MinPending,
 				MinAckPending: s.consumeOpts.MinAckPending,
 				Priority:      s.consumeOpts.Priority,
+			}:
+				// Count what was asked for: with StopAfter the batch can
+				// be smaller than the gap to MaxMessages. When only bytes
+				// are tracked the batch is MaxMessages, and so is the count.
+				s.pending.msgCount = min(s.pending.msgCount+batchSize, s.consumeOpts.MaxMessages)
+				s.pending.byteCount = s.consumeOpts.MaxBytes
+			default:
 			}
-
-			s.pending.msgCount = s.consumeOpts.MaxMessages
-			s.pending.byteCount = s.consumeOpts.MaxBytes
 		}
+	}
+}
+
+// sendFetchNext hands a pull request to pullMessages, waiting for room in
+// fetchNext. It gives up, and returns false, once Stop or Drain was
+// called: pullMessages returns on done without reading fetchNext again,
+// and every caller holds the subscription lock, so a blocking send would
+// hang forever (and with it everything else that needs the lock,
+// including the subscription's closed handler).
+// lock should be held before calling this method
+func (s *pullSubscription) sendFetchNext(req *pullRequest) bool {
+	select {
+	case s.fetchNext <- req:
+		return true
+	case <-s.done:
+		return false
 	}
 }
 
@@ -531,27 +605,25 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 	p.Lock()
 	subject := p.js.apiSubject(fmt.Sprintf(apiRequestNextT, p.stream, p.name))
 
-	msgs := make(chan *nats.Msg, consumeOpts.MaxMessages)
-
 	consumeID := nuid.Next()
 	sub := &pullSubscription{
 		id:          consumeID,
 		consumer:    p,
 		done:        make(chan struct{}, 1),
-		msgs:        msgs,
+		queue:       &msgQueue{ready: make(chan struct{}, 1)},
 		errs:        make(chan error, 10),
 		fetchNext:   make(chan *pullRequest, 1),
 		consumeOpts: consumeOpts,
 	}
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING)
 	inbox := p.js.conn.NewInbox()
-	sub.subscription, err = p.js.conn.ChanSubscribe(inbox, sub.msgs)
+	sub.subscription, err = p.js.conn.Subscribe(inbox, sub.queue.push)
 	if err != nil {
 		p.Unlock()
 		p.js.conn.RemoveStatusListener(sub.connStatusChanged)
 		return nil, err
 	}
-	sub.subscription.SetClosedHandler(func(sid string) func(string) {
+	closedHandler := func(sid string) func(string) {
 		return func(subject string) {
 			if sub.draining.Load() != 1 {
 				// if we're not draining, subscription can be closed as soon
@@ -560,12 +632,20 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 				// in Next
 				p.subs.Delete(sid)
 			}
-			sub.closeMsgs()
+			sub.handlerDone.Store(true)
+			sub.queue.close()
 		}
-	}(sub.id))
+	}(sub.id)
+	sub.subscription.SetClosedHandler(closedHandler)
 
 	p.subs.Store(sub.id, sub)
 	p.Unlock()
+
+	if !sub.subscription.IsValid() {
+		// Closed (with the connection) before the handler was set: nats.go
+		// may not call it. It is safe to run twice.
+		closedHandler(inbox)
+	}
 
 	go sub.pullMessages(subject)
 
@@ -647,9 +727,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 
 	s.Lock()
 	defer s.Unlock()
-	drainMode := s.draining.Load() == 1
-	closed := s.closed.Load() == 1
-	if closed && !drainMode {
+	if s.stopped() {
 		// Check if iterator was closed due to connection closure
 		if s.consumer.js.conn.IsClosed() {
 			return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
@@ -670,22 +748,22 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 
 	for {
 		s.checkPending()
-		select {
-		case msg, ok := <-s.msgs:
-			if !ok {
-				// if msgs channel is closed, it means that subscription was either drained or stopped
-				// or that the connection was closed. In the latter case
-				// nothing called Stop, so stop here to let pullMessages
-				// and the status goroutine exit. It is a no-op otherwise.
-				s.Stop()
-				s.consumer.subs.Delete(s.id)
-				s.draining.CompareAndSwap(1, 0)
-				// Check if iterator was closed due to connection closure
-				if s.consumer.js.conn.IsClosed() {
-					return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
-				}
-				return nil, ErrMsgIteratorClosed
+		msg, open := s.queue.pop()
+		if msg == nil && !open {
+			// if the queue is closed, it means that subscription was either drained or stopped
+			// or that the connection was closed. In the latter case
+			// nothing called Stop, so stop here to let pullMessages
+			// and the status goroutine exit. It is a no-op otherwise.
+			s.Stop()
+			s.consumer.subs.Delete(s.id)
+			s.draining.CompareAndSwap(1, 0)
+			// Check if iterator was closed due to connection closure
+			if s.consumer.js.conn.IsClosed() {
+				return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
 			}
+			return nil, ErrMsgIteratorClosed
+		}
+		if msg != nil {
 			if hbMonitor != nil {
 				hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
 			}
@@ -707,9 +785,14 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 			s.decrementPendingMsgs(msg)
 			s.incrementDeliveredMsgs()
 			return s.consumer.js.toJSMsg(msg), nil
+		}
+		select {
+		case <-s.queue.ready:
 		case err := <-s.errs:
+			// The pending count is reset to what is still queued: those
+			// messages were pulled already.
 			if errors.Is(err, ErrNoHeartbeat) {
-				s.pending.msgCount = 0
+				s.pending.msgCount = s.queue.len()
 				s.pending.byteCount = 0
 				if s.consumeOpts.ReportMissingHeartbeats {
 					return nil, err
@@ -726,7 +809,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				if s.consumeOpts.notifyOnReconnect {
 					return nil, errConnected
 				}
-				s.pending.msgCount = 0
+				s.pending.msgCount = s.queue.len()
 				s.pending.byteCount = 0
 				if hbMonitor != nil {
 					hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
@@ -832,6 +915,19 @@ func (s *pullSubscription) Drain() {
 	close(s.done)
 }
 
+// stopped reports whether Stop was called, as opposed to Drain or
+// neither. Drain sets closed before draining, so a reader that finds
+// closed set waits for done, which Stop and Drain close only after that;
+// reading draining right away could take a Drain for a Stop and discard
+// the buffered messages.
+func (s *pullSubscription) stopped() bool {
+	if s.closed.Load() == 0 {
+		return false
+	}
+	<-s.done
+	return s.draining.Load() == 0
+}
+
 // Closed returns a channel that is closed when consuming is
 // fully stopped/drained. When the channel is closed, no more messages
 // will be received and processing is complete.
@@ -843,7 +939,10 @@ func (s *pullSubscription) Closed() <-chan struct{} {
 		closedCh = make(chan struct{})
 		s.closedCh = closedCh
 	}
-	if !s.subscription.IsValid() {
+	// The subscription becomes invalid as soon as Stop unsubscribes, while
+	// the message handler may still be running; only the closed handler
+	// tells that processing is complete.
+	if s.handlerDone.Load() {
 		close(s.closedCh)
 		s.closedCh = nil
 	}
@@ -887,7 +986,7 @@ func (p *pullConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, error) 
 // FetchBytes is used to retrieve up to a provided bytes from the stream.
 func (p *pullConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBatch, error) {
 	req := &pullRequest{
-		Batch:     defaultBatchMaxBytesOnly,
+		Batch:     p.fetchBytesBatch(maxBytes),
 		MaxBytes:  maxBytes,
 		Expires:   DefaultExpires,
 		Heartbeat: unset,
@@ -916,6 +1015,23 @@ func (p *pullConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBatch,
 	}
 
 	return p.fetch(req)
+}
+
+// fetchBytesBatch returns the batch size of a FetchBytes request: the most
+// messages that can fit in maxBytes, capped at defaultBatchMaxBytesOnly.
+// The server counts at least a message's subject and its ack reply subject
+// against max_bytes, and the ack subject starts with
+// "$JS.ACK.<stream>.<consumer>.", so no more messages than that can ever
+// arrive. fetch sizes its buffers by the batch: asking for a million
+// messages allocated about 30 MB of channels on every call, whatever
+// maxBytes was. A server that counted less would at worst return fewer
+// messages than fit, which FetchBytes ("up to maxBytes") allows.
+func (p *pullConsumer) fetchBytesBatch(maxBytes int) int {
+	if maxBytes <= 0 {
+		return defaultBatchMaxBytesOnly
+	}
+	minMsgSize := len("$JS.ACK.") + len(p.stream) + 1 + len(p.name) + 1 + 1 // + a 1-byte subject
+	return min(maxBytes/minMsgSize+1, defaultBatchMaxBytesOnly)
 }
 
 // FetchNoWait sends a single request to retrieve given number of messages.
@@ -966,6 +1082,11 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 	go func(res *fetchResult) {
 		defer sub.subscription.Unsubscribe()
 		defer close(res.msgs)
+		if hbTimer != nil {
+			// A timer left armed keeps the subscription (and the
+			// connection) reachable until it fires.
+			defer hbTimer.Stop()
+		}
 		for {
 			select {
 			case msg := <-msgs:
@@ -1075,8 +1196,6 @@ func (s *pullSubscription) pullMessages(subject string) {
 	for {
 		select {
 		case req := <-s.fetchNext:
-			s.fetchInProgress.Store(1)
-
 			if err := s.pull(req, subject); err != nil {
 				if errors.Is(err, ErrMsgIteratorClosed) {
 					s.cleanup()
@@ -1089,7 +1208,6 @@ func (s *pullSubscription) pullMessages(subject string) {
 				case <-s.done:
 				}
 			}
-			s.fetchInProgress.Store(0)
 		case <-s.done:
 			s.cleanup()
 			return
@@ -1097,10 +1215,49 @@ func (s *pullSubscription) pullMessages(subject string) {
 	}
 }
 
-func (s *pullSubscription) closeMsgs() {
-	if s.msgsClosed.CompareAndSwap(0, 1) {
-		close(s.msgs)
+// push appends msg and wakes Next up. It never blocks, so the nats.go
+// subscription delivering into it never accumulates messages either.
+func (q *msgQueue) push(msg *nats.Msg) {
+	q.mu.Lock()
+	q.msgs = append(q.msgs, msg)
+	q.mu.Unlock()
+	q.signal()
+}
+
+// close marks the end of the messages; Next still returns the ones
+// queued.
+func (q *msgQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.signal()
+}
+
+func (q *msgQueue) signal() {
+	select {
+	case q.ready <- struct{}{}:
+	default:
 	}
+}
+
+// pop removes and returns the oldest message, or nil if there is none;
+// open reports whether more can still arrive.
+func (q *msgQueue) pop() (msg *nats.Msg, open bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.msgs) == 0 {
+		return nil, !q.closed
+	}
+	msg = q.msgs[0]
+	q.msgs[0] = nil
+	q.msgs = q.msgs[1:]
+	return msg, true
+}
+
+func (q *msgQueue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.msgs)
 }
 
 func (s *pullSubscription) scheduleHeartbeatCheck(dur time.Duration) *hbMonitor {
@@ -1139,6 +1296,11 @@ func (s *pullSubscription) cleanup() {
 	if s.subscription == nil || !s.subscription.IsValid() {
 		s.closed.Store(1)
 		return
+	}
+	if s.closed.Load() == 1 {
+		// Drain sets closed before draining: wait until Stop or Drain
+		// has published which of the two it was (see stopped).
+		<-s.done
 	}
 	drainMode := s.draining.Load() == 1
 	if drainMode {
