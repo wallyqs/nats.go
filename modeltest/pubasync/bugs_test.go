@@ -24,18 +24,19 @@ import (
 )
 
 // Each test below reproduces one counterexample of models/PublishAsync
-// (models/PublishAsync/PUB*_bug.cfg) against the real library. They assert
-// the correct behavior, so they fail today and are skipped unless
+// (models/PublishAsync/PUB*_bug.cfg) against the real library and asserts
+// the correct behavior. Tests for fixed findings are regression tests; those
+// still gated by harness.KnownBug fail on this code and are skipped unless
 // MODELTEST_KNOWN_BUGS=1.
 
-// PUB-1: the ack-timeout callback (publish.go:373-405) runs the
+// PUB-1: the ack-timeout callback (publish.go:373-405) ran the
 // MsgErrHandler while holding js.publisher's mutex. A handler that calls back
 // into the publisher -- PublishAsyncPending, or re-publishing the message as
-// MsgErrHandler's doc suggests ("for possible retransmitting") -- deadlocks
-// the timer goroutine, and with it every later publisher call.
+// MsgErrHandler's doc suggests ("for possible retransmitting") -- deadlocked
+// the timer goroutine, and with it every later publisher call. Fixed: the
+// handler now runs after Unlock, like on every other resolution path.
 // Model: PUB1_timeout_reentrant_bug.cfg (NoSelfDeadlock).
 func TestPUB1TimeoutErrHandlerReentry(t *testing.T) {
-	harness.KnownBug(t, "PUB-1")
 	entered := make(chan struct{}, 1)
 	returned := make(chan struct{}, 1)
 	e := newEnv(t, []jetstream.JetStreamOpt{

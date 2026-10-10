@@ -1099,11 +1099,11 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 		if js.opts.ackTimeout > 0 {
 			paf.timeout = time.AfterFunc(js.opts.ackTimeout, func() {
 				js.mu.Lock()
-				defer js.mu.Unlock()
 
 				if _, ok := js.pafs[id]; !ok {
 					// paf has already been resolved
 					// while waiting for the lock
+					js.mu.Unlock()
 					return
 				}
 
@@ -1122,15 +1122,23 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 					paf.errCh <- paf.err
 				}
 
-				// call error callback if set
-				if js.opts.aecb != nil {
-					js.opts.aecb(js, paf.msg, ErrAsyncPublishTimeout)
-				}
-
-				// check on anyone one waiting on done status.
+				// check on anyone one waiting on done status; the channel is
+				// closed after the error callback has run.
+				var dch chan struct{}
 				if js.dch != nil && len(js.pafs) == 0 {
-					close(js.dch)
+					dch = js.dch
 					js.dch = nil
+				}
+				cb := js.opts.aecb
+				js.mu.Unlock()
+
+				// call error callback if set, outside the lock: it may call
+				// back into the publisher (e.g. to retransmit the message).
+				if cb != nil {
+					cb(js, paf.msg, ErrAsyncPublishTimeout)
+				}
+				if dch != nil {
+					close(dch)
 				}
 			})
 		}

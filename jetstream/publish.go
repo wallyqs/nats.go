@@ -372,11 +372,11 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 		if js.publisher.ackTimeout > 0 {
 			paf.timeout = time.AfterFunc(js.publisher.ackTimeout, func() {
 				js.publisher.Lock()
-				defer js.publisher.Unlock()
 
 				if _, ok := js.publisher.acks[id]; !ok {
 					// paf has already been resolved
 					// while waiting for the lock
+					js.publisher.Unlock()
 					return
 				}
 
@@ -386,21 +386,16 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 				// check on anyone stalled and waiting.
 				js.maybeUnstall()
 
-				// send error to user
-				paf.err = ErrAsyncPublishTimeout
-				if paf.errCh != nil {
-					paf.errCh <- paf.err
-				}
+				// check on anyone one waiting on done status; the channel is
+				// closed after the error has been reported.
+				dch := js.takeDoneChIfEmpty()
 
-				// call error callback if set
-				if js.publisher.asyncPublisherOpts.aecb != nil {
-					js.publisher.asyncPublisherOpts.aecb(js, paf.msg, ErrAsyncPublishTimeout)
-				}
-
-				// check on anyone one waiting on done status.
-				if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
-					close(js.publisher.doneCh)
-					js.publisher.doneCh = nil
+				// send error to user and call the error callback, after
+				// releasing the lock: the callback may call back into the
+				// publisher (e.g. to retransmit the message).
+				js.handleAsyncErrAndUnlock(paf, ErrAsyncPublishTimeout)
+				if dch != nil {
+					close(dch)
 				}
 			})
 		}
@@ -677,6 +672,18 @@ func (js *jetStream) maybeUnstall() {
 		close(js.publisher.stallCh)
 		js.publisher.stallCh = nil
 	}
+}
+
+// takeDoneChIfEmpty detaches doneCh if nothing is pending any more, so
+// that the caller can close it once it has reported the outcome of the
+// last future. Lock should be held.
+func (js *jetStream) takeDoneChIfEmpty() chan struct{} {
+	if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
+		dch := js.publisher.doneCh
+		js.publisher.doneCh = nil
+		return dch
+	}
+	return nil
 }
 
 // clearPAF will remove a PubAckFuture that was registered.

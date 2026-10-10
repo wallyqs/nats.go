@@ -36,9 +36,8 @@ func legacyJS(t *testing.T, e *env, opts ...nats.JSOpt) nats.JetStreamContext {
 }
 
 // PUB-1 in js.go: the ack-timeout callback (js.go PublishMsgAsync,
-// time.AfterFunc(js.opts.ackTimeout, ...)) also calls aecb under js.mu.
+// time.AfterFunc(js.opts.ackTimeout, ...)) also called aecb under js.mu.
 func TestPUB1LegacyTimeoutErrHandlerReentry(t *testing.T) {
-	harness.KnownBug(t, "PUB-1")
 	e := newEnv(t, nil)
 	entered := make(chan struct{}, 1)
 	returned := make(chan struct{}, 1)
