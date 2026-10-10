@@ -373,26 +373,19 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 			paf.timeout = time.AfterFunc(js.publisher.ackTimeout, func() {
 				js.publisher.Lock()
 
-				if _, ok := js.publisher.acks[id]; !ok {
+				// ack timed out, remove from pending acks
+				dch, ok := js.clearPAF(id)
+				if !ok {
 					// paf has already been resolved
 					// while waiting for the lock
 					js.publisher.Unlock()
 					return
 				}
 
-				// ack timed out, remove from pending acks
-				delete(js.publisher.acks, id)
-
-				// check on anyone stalled and waiting.
-				js.maybeUnstall()
-
-				// check on anyone one waiting on done status; the channel is
-				// closed after the error has been reported.
-				dch := js.takeDoneChIfEmpty()
-
 				// send error to user and call the error callback, after
 				// releasing the lock: the callback may call back into the
-				// publisher (e.g. to retransmit the message).
+				// publisher (e.g. to retransmit the message). Anyone waiting
+				// on done status is notified after that.
 				js.handleAsyncErrAndUnlock(paf, ErrAsyncPublishTimeout)
 				if dch != nil {
 					close(dch)
@@ -415,8 +408,29 @@ func (js *jetStream) PublishMsgAsync(m *nats.Msg, opts ...PublishOpt) (PubAckFut
 		Header:  m.Header,
 	}
 	if err := js.conn.PublishMsg(pubMsg); err != nil {
-		js.clearPAF(id)
-		return nil, err
+		js.publisher.Lock()
+		dch, ok := js.clearPAF(id)
+		if !ok {
+			// The future was already resolved -- and reported -- by the ack
+			// timer, a reconnect or CleanupPublisher while we were
+			// publishing; it carries that error, do not report this one too.
+			js.publisher.Unlock()
+			return paf, nil
+		}
+		if o.pafRetry == nil {
+			js.publisher.Unlock()
+			if dch != nil {
+				close(dch)
+			}
+			return nil, err
+		}
+		// The caller of a retry is the 503 timer, not the user: the
+		// future carries the error.
+		js.handleAsyncErrAndUnlock(paf, err)
+		if dch != nil {
+			close(dch)
+		}
+		return paf, nil
 	}
 
 	return paf, nil
@@ -503,14 +517,12 @@ func (js *jetStream) handleAsyncReply(m *nats.Msg) {
 				if paf == nil {
 					return
 				}
-				_, err := js.PublishMsgAsync(paf.msg, func(po *pubOpts) error {
+				// A failed retry resolves the future itself, and only if
+				// it was still pending: nothing to do with the result.
+				_, _ = js.PublishMsgAsync(paf.msg, func(po *pubOpts) error {
 					po.pafRetry = paf
 					return nil
 				})
-				if err != nil {
-					js.publisher.Lock()
-					js.handleAsyncErrAndUnlock(paf, err)
-				}
 			})
 			js.publisher.Unlock()
 			return
@@ -686,12 +698,17 @@ func (js *jetStream) takeDoneChIfEmpty() chan struct{} {
 	return nil
 }
 
-// clearPAF will remove a PubAckFuture that was registered.
-func (js *jetStream) clearPAF(id string) {
-	js.publisher.Lock()
+// clearPAF will remove a PubAckFuture that was registered, if it is still
+// pending, and wake anyone stalled. It reports whether the future was still
+// pending, and returns doneCh if this emptied the publisher: the caller
+// closes it once it has reported the future's outcome. Lock should be held.
+func (js *jetStream) clearPAF(id string) (chan struct{}, bool) {
+	if _, ok := js.publisher.acks[id]; !ok {
+		return nil, false
+	}
 	delete(js.publisher.acks, id)
 	js.maybeUnstall()
-	js.publisher.Unlock()
+	return js.takeDoneChIfEmpty(), true
 }
 
 func (paf *pubAckFuture) Ok() <-chan *PubAck {
