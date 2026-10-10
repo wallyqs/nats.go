@@ -307,7 +307,6 @@ func TestPULL4ConsumeStopAfterStallsAfterExpiry(t *testing.T) {
 // channel is closed, no more messages will be received and processing is
 // complete."
 func TestPULL7ClosedBeforeHandlerReturns(t *testing.T) {
-	harness.KnownBug(t, "PULL-7")
 	e := newEnv(t)
 	e.publish(1)
 	entered := make(chan struct{})

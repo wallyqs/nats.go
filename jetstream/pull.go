@@ -148,6 +148,9 @@ type (
 		consumeOpts       *consumeOpts
 		delivered         int
 		closedCh          chan struct{}
+		// handlerDone is set by the subscription's closed handler, which
+		// nats.go calls once no message handler runs any more.
+		handlerDone atomic.Bool
 	}
 
 	pendingMsgs struct {
@@ -316,10 +319,11 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 		}
 		return nil, err
 	}
-	sub.subscription.SetClosedHandler(func(sid string) func(string) {
+	closedHandler := func(sid string) func(string) {
 		return func(subject string) {
 			p.subs.Delete(sid)
 			sub.draining.CompareAndSwap(1, 0)
+			sub.handlerDone.Store(true)
 			sub.Lock()
 			if sub.closedCh != nil {
 				close(sub.closedCh)
@@ -327,7 +331,13 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			}
 			sub.Unlock()
 		}
-	}(sub.id))
+	}(sub.id)
+	sub.subscription.SetClosedHandler(closedHandler)
+	if !sub.subscription.IsValid() {
+		// Closed (with the connection) before the handler was set: nats.go
+		// may not call it. It is safe to run twice.
+		closedHandler(inbox)
+	}
 
 	sub.Lock()
 	// initial pull
@@ -595,7 +605,7 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 		p.js.conn.RemoveStatusListener(sub.connStatusChanged)
 		return nil, err
 	}
-	sub.subscription.SetClosedHandler(func(sid string) func(string) {
+	closedHandler := func(sid string) func(string) {
 		return func(subject string) {
 			if sub.draining.Load() != 1 {
 				// if we're not draining, subscription can be closed as soon
@@ -604,12 +614,20 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 				// in Next
 				p.subs.Delete(sid)
 			}
+			sub.handlerDone.Store(true)
 			sub.closeMsgs()
 		}
-	}(sub.id))
+	}(sub.id)
+	sub.subscription.SetClosedHandler(closedHandler)
 
 	p.subs.Store(sub.id, sub)
 	p.Unlock()
+
+	if !sub.subscription.IsValid() {
+		// Closed (with the connection) before the handler was set: nats.go
+		// may not call it. It is safe to run twice.
+		closedHandler(inbox)
+	}
 
 	go sub.pullMessages(subject)
 
@@ -898,7 +916,10 @@ func (s *pullSubscription) Closed() <-chan struct{} {
 		closedCh = make(chan struct{})
 		s.closedCh = closedCh
 	}
-	if !s.subscription.IsValid() {
+	// The subscription becomes invalid as soon as Stop unsubscribes, while
+	// the message handler may still be running; only the closed handler
+	// tells that processing is complete.
+	if s.handlerDone.Load() {
 		close(s.closedCh)
 		s.closedCh = nil
 	}
