@@ -246,7 +246,6 @@ func TestPULL3StopAfterExceededAfterReconnect(t *testing.T) {
 //
 // Trace: PullConsume_pendingreset_bug.cfg (NoSilentStall).
 func TestPULL4MessagesStopAfterStallsAfterExpiry(t *testing.T) {
-	harness.KnownBug(t, "PULL-4")
 	e := newEnv(t)
 	e.publish(1)
 	it, err := e.cons.Messages(jetstream.StopAfter(5), jetstream.PullExpiry(time.Second))
@@ -270,7 +269,6 @@ func TestPULL4MessagesStopAfterStallsAfterExpiry(t *testing.T) {
 }
 
 func TestPULL4ConsumeStopAfterStallsAfterExpiry(t *testing.T) {
-	harness.KnownBug(t, "PULL-4")
 	e := newEnv(t)
 	var calls atomic.Int64
 	errs := make(chan error, 10)

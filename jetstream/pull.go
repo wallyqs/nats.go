@@ -325,11 +325,11 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 
 	sub.Lock()
 	// initial pull
-	sub.resetPendingMsgs()
 	batchSize := sub.consumeOpts.MaxMessages
 	if sub.consumeOpts.StopAfter > 0 {
 		batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
 	}
+	sub.resetPendingMsgs(batchSize)
 	if err := sub.pull(&pullRequest{
 		Expires:       consumeOpts.Expires,
 		Batch:         batchSize,
@@ -384,7 +384,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							if sub.hbMonitor != nil {
 								sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
 							}
-							sub.resetPendingMsgs()
+							sub.resetPendingMsgs(sub.consumeOpts.MaxMessages)
 						}
 					}
 					sub.Unlock()
@@ -413,7 +413,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 						if sub.hbMonitor != nil {
 							sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
 						}
-						sub.resetPendingMsgs()
+						sub.resetPendingMsgs(batchSize)
 					}
 				}
 				sub.Unlock()
@@ -434,11 +434,15 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 	return sub, nil
 }
 
-// resetPendingMsgs resets pending message count and byte count
-// to the values set in consumeOpts
+// resetPendingMsgs resets pending message count and byte count after a
+// pull request for batch messages replaced every earlier one. The message
+// count is the batch actually requested, which is less than MaxMessages
+// with StopAfter: counting MaxMessages would keep the count at or above
+// the threshold after the request expires partly unfilled, and no new pull
+// request would be sent until the heartbeat timer fires.
 // lock should be held before calling this method
-func (s *pullSubscription) resetPendingMsgs() {
-	s.pending.msgCount = s.consumeOpts.MaxMessages
+func (s *pullSubscription) resetPendingMsgs(batch int) {
+	s.pending.msgCount = batch
 	s.pending.byteCount = s.consumeOpts.MaxBytes
 }
 
@@ -498,7 +502,10 @@ func (s *pullSubscription) checkPending() {
 				MinAckPending: s.consumeOpts.MinAckPending,
 				Priority:      s.consumeOpts.Priority,
 			}) {
-				s.pending.msgCount = s.consumeOpts.MaxMessages
+				// Count what was asked for: with StopAfter the batch can
+				// be smaller than the gap to MaxMessages. When only bytes
+				// are tracked the batch is MaxMessages, and so is the count.
+				s.pending.msgCount = min(s.pending.msgCount+batchSize, s.consumeOpts.MaxMessages)
 				s.pending.byteCount = s.consumeOpts.MaxBytes
 			}
 		}
