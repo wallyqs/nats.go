@@ -41,7 +41,7 @@ Deadlocks and hangs:
   makes the reset retry forever; `Next` never returns.
 - **KV-3** — purging or expiring not-yet-delivered initial values means a
   watcher's "initial values done" marker never arrives, so `Keys()` and
-  `History()` block until their context ends.
+  `History()` block until their context ends. (Fixed on `fix/kv`.)
 
 Lost or wrong data:
 
@@ -51,6 +51,7 @@ Lost or wrong data:
 - **KV-1 / KV-2** — the legacy ordered push consumer's reset drops
   last-per-subject delivery (stale revisions, deleted keys in `Keys()`), or
   restarts from sequence 1 (`UpdatesOnly` watchers replay history).
+  (Fixed on `fix/kv`, with KV-4…8.)
 - **ORD-2** — `FetchNoWait` on an ordered consumer never advances the
   cursor, so the next fetch re-delivers the same messages.
 - **ORD-4** — after a reset, the ordered `Consume` handler can run for two

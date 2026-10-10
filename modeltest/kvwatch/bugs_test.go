@@ -13,7 +13,8 @@
 
 package kvwatch
 
-// Reproducers that need no test hooks.
+// Regression tests for the model's counterexamples that need no test hooks,
+// and the KV-9 reproducer (a nats-server bug, still gated).
 
 import (
 	"context"
@@ -34,11 +35,11 @@ func stackContains(fn string) bool {
 
 // KV-2: an UpdatesOnly watcher that has not received an update yet when
 // the server restarts. The R1 memory ordered consumer is gone; after
-// 2 x 5s without heartbeats activityCheck resets it from jsi.sseq+1 = 1
-// (js.go:2516-2522, 2274) and the watcher replays every stored value as
-// if it were new. Model: KV2_reset_from_one_bug.cfg (NoStaleEntry).
+// 2 x 5s without heartbeats activityCheck resets it from jsi.sseq+1, which
+// was 1, and the watcher replayed every stored value as if it were new.
+// Fixed: jsi.sseq starts at the consumer's Delivered.Stream (js.go).
+// Model: KV2_reset_from_one_bug.cfg (NoStaleEntry).
 func TestKV2UpdatesOnlyReplaysHistoryAfterServerRestart(t *testing.T) {
-	harness.KnownBug(t, "KV-2")
 	if testing.Short() {
 		t.Skip("waits for the 10s heartbeat check")
 	}
@@ -65,13 +66,13 @@ func TestKV2UpdatesOnlyReplaysHistoryAfterServerRestart(t *testing.T) {
 // consumer creation and otherwise waits for a message with delta 0. If the
 // initial values it has not received yet are removed without a new
 // message (MaxAge, PurgeDeletes(), a stream purge), no message ever
-// arrives and the marker is never sent: Watch users never see "initial
-// values done" and Keys()/History() hang until their context ends.
-// The server is held mid-delivery by flow control while the watcher's
-// reader is slow (the callback blocks on the full w.updates). Model:
-// KV3_marker_stuck_bug.cfg (NoStuckInit).
+// arrives and the marker was never sent: Watch users never saw "initial
+// values done" and Keys()/History() hung until their context ended.
+// Fixed: an idle watcher asks ConsumerInfo whether anything is left
+// (kv.go checkInit). The server is held mid-delivery by flow control while
+// the watcher's reader is slow (the callback blocks on the full
+// w.updates). Model: KV3_marker_stuck_bug.cfg (NoStuckInit).
 func TestKV3MarkerNeverSentWhenPendingInitialValuesAreRemoved(t *testing.T) {
-	harness.KnownBug(t, "KV-3")
 	e := newEnv(t, 1)
 	ctx := context.Background()
 	for i := 0; i < 260; i++ {
@@ -118,12 +119,12 @@ func TestKV3MarkerNeverSentWhenPendingInitialValuesAreRemoved(t *testing.T) {
 }
 
 // KV-5: KeyLister.Stop() is documented for stopping before all keys were
-// read, but the lister goroutine sends on kl.keys without a select
-// (kv.go:1449): once the caller stops reading it blocks forever, Keys() is
-// never closed, and the watcher callback stays blocked on w.updates.
-// Model: KV5_listkeys_leak_bug.cfg (NoLeakAfterStop).
+// read, but the lister goroutine sent on kl.keys without a select: once
+// the caller stopped reading it blocked forever, Keys() was never closed,
+// and the watcher callback stayed blocked on w.updates. Fixed: the lister
+// also selects on Stop, and the callback gives up a send once the watcher
+// is stopped (KV-6). Model: KV5_listkeys_leak_bug.cfg (NoLeakAfterStop).
 func TestKV5ListKeysStopLeaksGoroutines(t *testing.T) {
-	harness.KnownBug(t, "KV-5")
 	e := newEnv(t, 1)
 	for i := 0; i < 1000; i++ {
 		e.put(t, keyN(i), "v")
@@ -137,10 +138,14 @@ func TestKV5ListKeysStopLeaksGoroutines(t *testing.T) {
 	if err := kl.Stop(); err != nil {
 		t.Fatal(err)
 	}
-	if !harness.Eventually(3*time.Second, func() bool {
-		return !stackContains("jetstream.(*kvs).ListKeys.func1")
-	}) {
-		t.Fatal("ListKeys goroutine still running 3s after KeyLister.Stop()")
+	// The lister goroutine and the watcher's update callback.
+	for _, fn := range []string{"jetstream.newKeyLister.func1", "jetstream.(*kvs).WatchFiltered.func1"} {
+		if !harness.Eventually(3*time.Second, func() bool { return !stackContains(fn) }) {
+			t.Fatalf("%s still running 3s after KeyLister.Stop()", fn)
+		}
+	}
+	// Keys() is closed.
+	for range kl.Keys() {
 	}
 }
 

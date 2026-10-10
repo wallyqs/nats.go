@@ -42,7 +42,11 @@ CONSTANTS
     MaxRemoves,    \* removals of a stored message without a marker
     MaxCancels,    \* context cancellations of the Watch/Keys context
     UserStops,     \* TRUE: a Watch/ListKeys user may call Stop early
-    Fixes          \* subset of {"reset","marker","keysctx","lister",
+    InfoAtCreate,  \* TRUE: the consumer-create response is the info taken
+                   \* when the consumer was created, before delivery starts
+                   \* (nats-server consumer.go:1909-1910); FALSE: built at
+                   \* any point afterwards (older servers)
+    Fixes          \* subset of {"reset","recount","marker","keysctx","lister",
                    \*            "stopdrain","closedh","pendingerr"}
 
 ASSUME Filter \subseteq Keys /\ History \in 1..3 /\ ChanCap >= 1
@@ -60,7 +64,7 @@ VARIABLES
     envDone,      \* the environment has stopped acting
     \* ---- client subscription (nats.go / js.go) ----
     gen,          \* current sid generation (applyNewSID)
-    jsi,          \* [dseq, sseq, pending, named, skipLE]
+    jsi,          \* [dseq, sseq, pending, named, skipLE, lps, rebase, left]
     resetting,    \* a reset goroutine is in flight
     resetStart,   \* the start sequence it was given (js.go:2274)
     plist,        \* async pending list (pHead..pTail)
@@ -72,6 +76,8 @@ VARIABLES
     ch,           \* w.updates contents (Seq of entries / nil markers)
     chClosed,
     wClosed,      \* fix "closedh": watcher-level closed flag
+    wseen,        \* fixes "recount"/"marker": [cons, dseq] of the last message
+                  \* the callback handled (cons = consumer gen + 1, 0 = none)
     cbPc, cur,    \* waitForMsgs / callback program counter, current msg
     setupPc,
     \* ---- users ----
@@ -80,7 +86,7 @@ VARIABLES
     lpc, lkey,    \* ListKeys lister goroutine pc and key being sent
     keysCh, keysClosed, uAband,
     \* ---- ghosts ----
-    snap,         \* [latest: key->seq, op: key->op, last, floor, initSet]
+    snap,         \* [latest: key->seq, op: key->op, last, collapse, initSet, info0]
     everLive, touched,
     sentRevs, sentMax, lastRev, markers,
     gotKeys,
@@ -88,13 +94,14 @@ VARIABLES
 
 vars == <<log, srv, net, budget, envDone, gen, jsi, resetting, resetStart,
           plist, subClosed, pDoneSet, wmu, initDone, initPending, received,
-          ch, chClosed, wClosed, cbPc, cur, setupPc, mode, ign, user, upc,
+          ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode, ign, user, upc,
           lpc, lkey, keysCh, keysClosed, uAband, snap, everLive, touched,
           sentRevs, sentMax, lastRev, markers, gotKeys, bad>>
 
 -----------------------------------------------------------------------------
 (* Helpers *)
 Max(a, b) == IF a >= b THEN a ELSE b
+Min(a, b) == IF a <= b THEN a ELSE b
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
 MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 Range(s) == {s[i] : i \in 1..Len(s)}
@@ -125,6 +132,12 @@ Floor(k) == CASE mode = "LPS"    -> snap.latest[k]
 
 Fixed(f) == f \in Fixes
 
+\* ConsumerInfo of consumer c: NumPending + Delivered.Consumer,
+\* Delivered.Consumer and Delivered.Stream (the server's next sequence - 1;
+\* for a last-per-subject consumer the head of its skip list - 1).
+Info(c) == [pending |-> Cardinality(Pending(c)) + c.dseq, dcons |-> c.dseq,
+            dstream |-> IF Len(c.lss) > 0 THEN Head(c.lss) - 1 ELSE c.next - 1]
+
 -----------------------------------------------------------------------------
 Init ==
     /\ log = <<>>
@@ -134,7 +147,8 @@ Init ==
                  removes |-> MaxRemoves, cancels |-> MaxCancels]
     /\ envDone = FALSE
     /\ gen = 0
-    /\ jsi = [dseq |-> 1, sseq |-> 0, pending |-> 0, named |-> FALSE, skipLE |-> 0]
+    /\ jsi = [dseq |-> 1, sseq |-> 0, pending |-> 0, named |-> FALSE, skipLE |-> 0,
+              lps |-> FALSE, rebase |-> TRUE, left |-> 0]
     /\ resetting = FALSE
     /\ resetStart = 0
     /\ plist = <<>>
@@ -147,8 +161,9 @@ Init ==
     /\ ch = <<>>
     /\ chClosed = FALSE
     /\ wClosed = FALSE
+    /\ wseen = [cons |-> 0, dseq |-> 0]
     /\ cbPc = "idle"
-    /\ cur = [key |-> "none", rev |-> 0, op |-> "PUT", delta |-> 0]
+    /\ cur = [key |-> "none", rev |-> 0, op |-> "PUT", delta |-> 0, gen |-> 0, dseq |-> 0]
     /\ setupPc = "init"
     /\ mode \in Modes
     /\ ign \in IgnoreOpts
@@ -166,7 +181,8 @@ Init ==
     /\ keysClosed = FALSE
     /\ uAband = FALSE
     /\ snap = [latest |-> [k \in Keys |-> 0], op |-> [k \in Keys |-> "PUT"],
-               last |-> 0, floor |-> 0, collapse |-> 0, initSet |-> {}]
+               last |-> 0, collapse |-> 0, initSet |-> {},
+               info0 |-> [pending |-> 0, dcons |-> 0, dstream |-> 0]]
     /\ everLive = {}
     /\ touched = {}
     /\ sentRevs = {}
@@ -198,7 +214,7 @@ Put(k) ==
     /\ everLive' = IF Created THEN everLive \cup {k} ELSE everLive
     /\ UNCHANGED <<srv, net, budget, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    touched, sentRevs, sentMax, lastRev, markers, gotKeys, bad>>
 
@@ -213,7 +229,7 @@ Del(k, op) ==
     /\ touched' = IF Created THEN touched \cup {k} ELSE touched
     /\ UNCHANGED <<srv, net, budget, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, sentRevs, sentMax, lastRev, markers, gotKeys, bad>>
 
@@ -230,7 +246,7 @@ Removed(S) ==
     /\ touched' = IF Created THEN touched \cup {log[s].key : s \in S} ELSE touched
     /\ UNCHANGED <<srv, net, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, sentRevs, sentMax, lastRev, markers, gotKeys, bad>>
 
@@ -246,7 +262,7 @@ NetDrop ==
     /\ budget' = [budget EXCEPT !.drops = @ - 1]
     /\ UNCHANGED <<log, srv, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -262,7 +278,7 @@ ServerRestart ==
     /\ budget' = [budget EXCEPT !.restarts = @ - 1]
     /\ UNCHANGED <<log, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -280,7 +296,7 @@ CtxCancel ==
     /\ budget' = [budget EXCEPT !.cancels = @ - 1]
     /\ UNCHANGED <<log, net, envDone, gen, jsi, resetting, resetStart,
                    plist, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -290,7 +306,7 @@ EnvQuit ==
     /\ envDone' = TRUE
     /\ UNCHANGED <<log, srv, net, budget, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -319,7 +335,7 @@ ServerStep ==
             IN Deliver(s, [srv EXCEPT !.next = s + 1])
     /\ UNCHANGED <<log, budget, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -335,7 +351,7 @@ ServerHB ==
                            key |-> "none", op |-> "PUT", delta |-> srv.dseq])
     /\ UNCHANGED <<log, srv, budget, envDone, gen, jsi, resetting, resetStart,
                    plist, subClosed, pDoneSet, wmu, initDone, initPending,
-                   received, ch, chClosed, wClosed, cbPc, cur, setupPc, mode,
+                   received, ch, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode,
                    ign, user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, markers,
                    gotKeys, bad>>
@@ -350,6 +366,17 @@ ResetBegin ==
     /\ resetting' = TRUE
     /\ resetStart' = jsi.sseq + 1
     /\ jsi' = [jsi EXCEPT !.named = FALSE]   \* jsi.consumer = "" (js.go:2376)
+
+\* Fix "reset", commitOrderedMsg: the last-per-subject phase ends when an
+\* upper bound of what is left of it reaches 0. The bound is the num_pending
+\* (d) of the first message of each consumer, counted down, and capped by
+\* each message's own num_pending.
+TrackLPS(j, d) ==
+    IF ~j.lps THEN j
+    ELSE LET left == IF j.rebase THEN d ELSE Min(Max(j.left, 1) - 1, d)
+         IN IF left = 0
+            THEN [j EXCEPT !.lps = FALSE, !.skipLE = 0, !.left = 0, !.rebase = FALSE]
+            ELSE [j EXCEPT !.left = left, !.rebase = FALSE]
 
 \* Would processing m start a reset?
 TriggersReset(m) ==
@@ -379,13 +406,15 @@ ClientRecv ==
           THEN \* fix "reset": re-sent LPS entry already delivered
                /\ jsi' = [jsi EXCEPT !.dseq = m.dseq + 1]
                /\ UNCHANGED <<gen, resetting, resetStart, plist>>
-          ELSE \* queue on the async list; commitOrderedMsg (js.go:2202-2207)
+          ELSE \* queue on the async list; commitOrderedMsg (js.go)
                /\ plist' = Append(plist, [key |-> m.key, rev |-> m.sseq,
-                                          op |-> m.op, delta |-> m.delta])
-               /\ jsi' = [jsi EXCEPT !.dseq = m.dseq + 1, !.sseq = m.sseq]
+                                          op |-> m.op, delta |-> m.delta,
+                                          gen |-> m.gen, dseq |-> m.dseq])
+               /\ jsi' = TrackLPS([jsi EXCEPT !.dseq = m.dseq + 1, !.sseq = m.sseq],
+                                   m.delta)
                /\ UNCHANGED <<gen, resetting, resetStart>>
     /\ UNCHANGED <<log, srv, budget, envDone, subClosed, pDoneSet, wmu,
-                   initDone, initPending, received, ch, chClosed, wClosed, cbPc,
+                   initDone, initPending, received, ch, chClosed, wClosed, wseen, cbPc,
                    cur, setupPc, mode, ign, user, upc, lpc, lkey, keysCh,
                    keysClosed, uAband, snap, everLive, touched, sentRevs,
                    sentMax, lastRev, markers, gotKeys, bad>>
@@ -399,40 +428,34 @@ HbTimeout ==
     /\ ResetBegin
     /\ UNCHANGED <<log, srv, net, budget, envDone, plist, subClosed, pDoneSet,
                    wmu, initDone, initPending, received, ch, chClosed, wClosed,
-                   cbPc, cur, setupPc, mode, ign, user, upc, lpc, lkey, keysCh,
+                   wseen, cbPc, cur, setupPc, mode, ign, user, upc, lpc, lkey, keysCh,
                    keysClosed, uAband, snap, everLive, touched, sentRevs,
                    sentMax, lastRev, markers, gotKeys, bad>>
 
 \* The reset goroutine (js.go:2343-2410): jsi.dseq = 1, new consumer
 \* DeliverByStartSequence(resetStart), jsi.consumer = name. If the sub was
 \* closed meanwhile the consumer is deleted again (js.go:2404-2411).
-\* Fix "reset": while the LPS initial phase is not over, recreate with
-\* DeliverLastPerSubject and skip seqs <= jsi.sseq; otherwise never start
-\* below the creation floor (ConsumerInfo.Delivered.Stream).
+\* Fix "reset": while the ordered consumer's last-per-subject phase is not
+\* over (jsi.lps, see TrackLPS), recreate it with DeliverLastPerSubject and
+\* skip seqs <= jsi.sseq (the start sequence itself comes from
+\* Delivered.Stream when nothing was delivered yet, see SetupInfo).
 ResetCreate ==
     /\ resetting
     /\ resetting' = FALSE
-    /\ LET lpsAgain == Fixed("reset") /\ mode = "LPS" /\ ~initDone
-           start == IF Fixed("reset") THEN Max(resetStart, snap.floor + 1)
-                    ELSE resetStart
+    /\ LET lpsAgain == Fixed("reset") /\ jsi.lps
            newC == NewConsumer(gen, Sorted(LpsSeqs), Len(log) + 1)
-           \* entries still owed: already queued + what the new LPS consumer
-           \* will hand over beyond the skip point
-           owed == received + Len(plist) + (IF cbPc = "send" THEN 1 ELSE 0)
-                   + Cardinality({s \in Pending(newC) : s > jsi.sseq})
        IN /\ jsi' = [jsi EXCEPT !.dseq = 1, !.named = TRUE,
                                 !.skipLE = IF lpsAgain THEN jsi.sseq ELSE @,
-                                !.pending = IF lpsAgain THEN owed ELSE @]
-          /\ initPending' = IF lpsAgain /\ setupPc = "done" THEN owed ELSE initPending
+                                !.rebase = IF lpsAgain THEN TRUE ELSE @]
           \* (the LPS restart collapses writes made so far to their latest
           \* revision, like LPS does for writes made before the watch)
           /\ snap' = IF lpsAgain THEN [snap EXCEPT !.collapse = Len(log)] ELSE snap
           /\ srv' = IF subClosed THEN DeadConsumer
                     ELSE IF lpsAgain THEN newC
-                    ELSE NewConsumer(gen, <<>>, start)
+                    ELSE NewConsumer(gen, <<>>, resetStart)
     /\ UNCHANGED <<log, net, budget, envDone, gen, resetStart, plist, subClosed,
-                   pDoneSet, wmu, initDone, received, ch, chClosed,
-                   wClosed, cbPc, cur, setupPc, mode, ign, user, upc, lpc, lkey,
+                   pDoneSet, wmu, initDone, initPending, received, ch, chClosed,
+                   wClosed, wseen, cbPc, cur, setupPc, mode, ign, user, upc, lpc, lkey,
                    keysCh, keysClosed, uAband, everLive, touched,
                    sentRevs, sentMax, lastRev, markers, gotKeys, bad>>
 
@@ -484,13 +507,27 @@ CbUnchanged == UNCHANGED <<log, srv, net, budget, envDone, gen, jsi, resetting,
 \* kv.go:1322-1330: initial-phase accounting, done right after the entry
 \* was handed over (or skipped), still under w.mu. Ends the callback (w.mu
 \* released) unless the marker is due.
+\* Fix "recount" (the kv.go half of KV-1): on the first message, and on the
+\* first message of a recreated consumer, what is still owed is re-counted
+\* from that message's num_pending (the first message never lowers the
+\* creation-time count). The callback also records which consumer's
+\* message it handled (wseen).
 Check(c) ==
-    IF ~initDone /\ ~(Fixed("closedh") /\ wClosed)
-    THEN /\ received' = received + 1
-         /\ IF received + 1 >= initPending \/ c.delta = 0
-            THEN initDone' = TRUE /\ cbPc' = "nil" /\ wmu' = "cb"
-            ELSE cbPc' = "idle" /\ wmu' = "none" /\ UNCHANGED initDone
-    ELSE cbPc' = "idle" /\ wmu' = "none" /\ UNCHANGED <<received, initDone>>
+    LET r1 == received + 1
+        ip == IF ~Fixed("recount") THEN initPending
+              ELSE IF wseen.cons = 0 THEN Max(initPending, r1 + c.delta)
+              ELSE IF wseen.cons # c.gen + 1 THEN r1 + c.delta
+              ELSE initPending
+    IN
+    /\ wseen' = IF Fixed("recount") \/ Fixed("marker")
+                THEN [cons |-> c.gen + 1, dseq |-> c.dseq] ELSE wseen
+    /\ IF ~initDone /\ ~(Fixed("closedh") /\ wClosed)
+       THEN /\ received' = r1
+            /\ initPending' = ip
+            /\ IF r1 >= ip \/ c.delta = 0
+               THEN initDone' = TRUE /\ cbPc' = "nil" /\ wmu' = "cb"
+               ELSE cbPc' = "idle" /\ wmu' = "none" /\ UNCHANGED initDone
+       ELSE cbPc' = "idle" /\ wmu' = "none" /\ UNCHANGED <<received, initDone, initPending>>
 
 SkipEntry(c) == (ign /\ IsDel(c.op)) \/ (Fixed("closedh") /\ wClosed)
 
@@ -502,9 +539,10 @@ CbPop ==
        /\ cur' = c /\ plist' = Tail(plist)
        /\ IF SkipEntry(c)
           THEN Check(c)
-          ELSE cbPc' = "send" /\ wmu' = "cb" /\ UNCHANGED <<received, initDone>>
+          ELSE /\ cbPc' = "send" /\ wmu' = "cb"
+               /\ UNCHANGED <<received, initDone, initPending, wseen>>
     /\ CbUnchanged
-    /\ UNCHANGED <<initPending, ch, chClosed, wClosed, sentRevs, sentMax,
+    /\ UNCHANGED <<ch, chClosed, wClosed, sentRevs, sentMax,
                    lastRev, markers, bad>>
 
 \* nats.go:3833-3836 + 3871-3877: closed -> leave the loop, call pDone.
@@ -514,7 +552,7 @@ CbExit ==
     /\ plist' = <<>>
     /\ CbUnchanged
     /\ UNCHANGED <<cur, wmu, initDone, initPending, received, ch, chClosed,
-                   wClosed, sentRevs, sentMax, lastRev, markers, bad>>
+                   wClosed, wseen, sentRevs, sentMax, lastRev, markers, bad>>
 
 \* Fix "stopdrain": a blocked send gives up once the watcher is stopped.
 GiveUp == Fixed("stopdrain") /\ subClosed
@@ -527,9 +565,10 @@ CbSend ==
           /\ Check(cur)
        \/ /\ GiveUp /\ Len(ch) >= ChanCap
           /\ cbPc' = "idle" /\ wmu' = "none"
-          /\ UNCHANGED <<ch, bad, sentRevs, sentMax, lastRev, received, initDone>>
+          /\ UNCHANGED <<ch, bad, sentRevs, sentMax, lastRev, received, initDone,
+                         initPending, wseen>>
     /\ CbUnchanged
-    /\ UNCHANGED <<plist, cur, initPending, chClosed, wClosed, markers>>
+    /\ UNCHANGED <<plist, cur, chClosed, wClosed, markers>>
 
 \* kv.go:1328: w.updates <- nil.
 CbNil ==
@@ -541,7 +580,7 @@ CbNil ==
     /\ cbPc' = "idle" /\ wmu' = "none"
     /\ CbUnchanged
     /\ UNCHANGED <<plist, cur, initDone, initPending, received, chClosed,
-                   wClosed, sentRevs, sentMax, lastRev>>
+                   wClosed, wseen, sentRevs, sentMax, lastRev>>
 
 \* The closed handler (kv.go:1366-1370), run by waitForMsgs at exit.
 CbClose ==
@@ -554,13 +593,13 @@ CbClose ==
     /\ cbPc' = "done"
     /\ CbUnchanged
     /\ UNCHANGED <<plist, cur, wmu, initDone, initPending, received, ch,
-                   sentRevs, sentMax, lastRev, markers>>
+                   wseen, sentRevs, sentMax, lastRev, markers>>
 
 -----------------------------------------------------------------------------
 (* The WatchFiltered goroutine (kv.go:1342-1386).                          *)
 
 SetupUnchanged == UNCHANGED <<log, net, budget, envDone, resetting, resetStart,
-                   plist, subClosed, cbPc, cur, mode, ign, user, upc, lpc, lkey,
+                   plist, subClosed, wseen, cbPc, cur, mode, ign, user, upc, lpc, lkey,
                    keysCh, keysClosed, uAband, everLive, touched, sentRevs,
                    sentMax, lastRev, gotKeys>>
 
@@ -580,32 +619,39 @@ SetupStart ==
                          [] mode = "RESUME" -> {s \in LiveSeqs : log[s].key \in Filter
                                                                 /\ s >= ResumeRev}
                          [] OTHER -> {}
-           \* ConsumerInfo.Delivered.Stream at creation
-           floor == CASE mode = "LPS"    -> Len(log)   \* once the initial phase is over
-                      [] mode = "ALL"    -> 0
-                      [] mode = "NEW"    -> Len(log)
-                      [] mode = "RESUME" -> ResumeRev - 1
-       IN /\ srv' = NewConsumer(0, lss, next)
+           newC == NewConsumer(0, lss, next)
+       IN /\ srv' = newC
+          \* (info0: the info the server snapshots at creation, see InfoAtCreate)
           /\ snap' = [latest |-> [k \in Keys |-> IF k \in Filter THEN LatestOf(k) ELSE 0],
                       op |-> [k \in Keys |-> IF LatestOf(k) > 0
                                              THEN log[LatestOf(k)].op ELSE "PUT"],
-                      last |-> Len(log), floor |-> floor, collapse |-> 0,
+                      last |-> Len(log), collapse |-> 0,
+                      info0 |-> Info(newC),
                       initSet |-> {s \in initSet0 : ~(ign /\ IsDel(log[s].op))}]
           /\ everLive' = {k \in Filter : LatestOf(k) > 0 /\ log[LatestOf(k)].op = "PUT"}
+    \* js.go: an ordered DeliverLastPerSubject consumer starts in its
+    \* last-per-subject phase (fix "reset").
+    /\ jsi' = [jsi EXCEPT !.lps = Fixed("reset") /\ mode = "LPS"]
     /\ setupPc' = "info"
-    /\ UNCHANGED <<log, net, budget, envDone, gen, jsi, resetting, resetStart,
+    /\ UNCHANGED <<log, net, budget, envDone, gen, resetting, resetStart,
                    plist, subClosed, pDoneSet, initDone, initPending, received,
-                   ch, chClosed, wClosed, cbPc, cur, mode, ign, user, upc, lpc,
+                   ch, chClosed, wClosed, wseen, cbPc, cur, mode, ign, user, upc, lpc,
                    lkey, keysCh, keysClosed, uAband, touched, sentRevs, sentMax,
                    lastRev, markers, gotKeys, bad>>
 
 \* The consumer-create response: jsi.pending = NumPending + Delivered
 \* (js.go:2027), from the server state at the time the info is built
-\* (deliveries and writes may already have happened).
+\* (deliveries and writes may already have happened unless InfoAtCreate).
+\* Fix "reset": with nothing delivered yet, jsi.sseq starts at
+\* Delivered.Stream; an empty last-per-subject set ends that phase.
 SetupInfo ==
     /\ setupPc = "info"
-    /\ jsi' = [jsi EXCEPT !.pending = Cardinality(Pending(srv)) + srv.dseq,
-                          !.named = TRUE]
+    /\ LET info == IF InfoAtCreate THEN snap.info0 ELSE Info(srv) IN
+       jsi' = [jsi EXCEPT !.pending = info.pending,
+                          !.named = TRUE,
+                          !.sseq = IF Fixed("reset") /\ info.dcons = 0 /\ @ = 0
+                                   THEN info.dstream ELSE @,
+                          !.lps = IF info.pending = 0 /\ jsi.rebase THEN FALSE ELSE @]
     /\ setupPc' = "closedh"
     /\ UNCHANGED <<srv, gen, pDoneSet, wmu, initDone, initPending, received, ch,
                    chClosed, wClosed, snap, markers, bad>>
@@ -642,23 +688,27 @@ SetupPending ==
     /\ SetupUnchanged
 
 -----------------------------------------------------------------------------
-(* Fix "marker": when the consumer is idle and every delivered message has *)
-(* been handled, a still-open initial phase is over (ConsumerInfo check).  *)
+(* Fix "marker" (kv.go watcher.checkInit, run by a timer while the initial *)
+(* phase is open): sub.ConsumerInfo() succeeds (jsi.consumer set, consumer *)
+(* alive) and reports NumPending = 0; sub.Pending() = 0 and w.mu is free   *)
+(* (nothing queued, the callback is idle); and Delivered.Consumer is 0, or *)
+(* the callback last handled that consumer's message number              *)
+(* Delivered.Consumer (no message of it lost or still on the way). The   *)
+(* ConsumerInfo snapshot and the check under w.mu are merged into one     *)
+(* step.                                                                   *)
 IdleMarker ==
     /\ Fixed("marker")
     /\ setupPc = "done" /\ ~initDone /\ ~subClosed /\ mode # "NEW"
-    /\ srv.alive /\ srv.gen = gen /\ ~resetting /\ Pending(srv) = {}
-    \* ConsumerInfo: NumPending = 0 and Delivered.Consumer equals what the
-    \* client accepted from this consumer (no undetected gap) ...
-    /\ srv.dseq = jsi.dseq - 1
-    \* ... and the callback has handled all of it.
-    /\ net = <<>> /\ plist = <<>> /\ cbPc = "idle" /\ wmu = "none"
+    /\ jsi.named /\ srv.alive /\ srv.gen = gen /\ Pending(srv) = {}
+    /\ plist = <<>> /\ cbPc = "idle" /\ wmu = "none"
+    /\ \/ srv.dseq = 0
+       \/ wseen.cons = srv.gen + 1 /\ wseen.dseq = srv.dseq
     /\ Len(ch) < ChanCap
     /\ initDone' = TRUE
     /\ SendMarker
     /\ UNCHANGED <<log, srv, net, budget, envDone, gen, jsi, resetting,
                    resetStart, plist, subClosed, pDoneSet, wmu, initPending,
-                   received, chClosed, wClosed, cbPc, cur, setupPc, mode, ign,
+                   received, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode, ign,
                    user, upc, lpc, lkey, keysCh, keysClosed, uAband, snap,
                    everLive, touched, sentRevs, sentMax, lastRev, gotKeys>>
 
@@ -667,7 +717,7 @@ IdleMarker ==
 
 UserUnchanged == UNCHANGED <<log, net, budget, envDone, gen, jsi, resetting,
                    resetStart, plist, pDoneSet, wmu, initDone, initPending,
-                   received, chClosed, wClosed, cbPc, cur, setupPc, mode, ign,
+                   received, chClosed, wClosed, wseen, cbPc, cur, setupPc, mode, ign,
                    user, snap, everLive, touched, sentRevs, sentMax, lastRev,
                    markers>>
 

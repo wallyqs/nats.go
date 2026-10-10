@@ -38,15 +38,19 @@ per-message TTL markers (handled like deletes by `kv.go:1298-1304`).
 |---|---|
 | `KVWatch.tla` | the spec |
 | `KVWatch.cfg` | baseline: every mode, `IgnoreDeletes` on/off, Watch user, concurrent Put/Delete/Purge, no faults — passes |
-| `KVWatch_fixed_lps.cfg`, `_remove`, `_restart`, `_keys`, `_listkeys`, `_stop` | all proposed fixes (`Fixes` constant) under message loss / removals / a server restart / ctx cancel / early Stop — pass |
+| `KVWatch_fixed_lps.cfg`, `_remove`, `_restart`, `_keys`, `_listkeys`, `_stop` | the fixes as applied on `fix/kv` (`Fixes` constant, `InfoAtCreate = TRUE`) under message loss / removals / a server restart / ctx cancel / early Stop — pass |
 | `KVWatch_history_faults.cfg` | today's code (+ only the KV-8 fix), IncludeHistory watcher under message loss and a server restart — passes |
-| `KV*_bug.cfg` | counterexample reproducers, one per finding — must violate |
+| `KV*_bug.cfg` | counterexample reproducers, one per finding, encoding the code before the fixes — must violate |
 
 Run: `TLA2TOOLS=/path/to/tla2tools.jar models/tlc.sh KVWatch`.
 
 ## Action → code map
 
-Line numbers are for this checkout (`jetstream/kv.go`, `js.go`, `nats.go`).
+Line numbers are for the code before the fixes (the models commit); the
+fixes on `fix/kv` shift them. The `Fixes` constant names what each fix
+changes: `reset` and `recount` (KV-1, with the `js.go` start floor of KV-2
+in `reset`), `marker` (KV-3), `keysctx` (KV-4), `lister` (KV-5),
+`stopdrain` (KV-6), `closedh` (KV-7), `pendingerr` (KV-8).
 
 | TLA+ action | Code |
 |---|---|
@@ -72,7 +76,8 @@ Line numbers are for this checkout (`jetstream/kv.go`, `js.go`, `nats.go`).
 | `NetDrop` | a delivered message lost before `processMsg` (reconnect; `AddMsgFilter` in tests) |
 | `ServerRestart` | R1 memory ordered consumer lost, in-flight bytes lost, client re-SUBs |
 | `CtxCancel` | `js.go:2068-2073` `<-ctx.Done(); sub.Unsubscribe()` |
-| `IdleMarker` | fix for KV-3 only (not in today's code) |
+| `IdleMarker` | fix `marker`: `jetstream/kv.go` `watcher.checkInit` (timer while the initial phase is open and idle) |
+| `TrackLPS` | fix `reset`: `js.go` `commitOrderedMsg`, end of the ordered consumer's last-per-subject phase (`jsi.lps`) |
 
 ## Invariants
 
@@ -116,37 +121,54 @@ exited and closed `Keys()`.
 - Flow control is not modeled; its effect (the server holding back part of
   the initial set while the reader is slow) is just one interleaving of
   `ServerStep` with environment actions.
-- Fixes are modeled at the level of what they decide (e.g. KV-3's check is
-  an action enabled when ConsumerInfo would report nothing pending and
-  everything delivered handled), not their Go code.
+- Fixes are modeled at the level of what they decide, following the Go
+  code on `fix/kv`: `IdleMarker` merges `checkInit`'s ConsumerInfo /
+  `sub.Pending()` snapshot and its check under `w.mu` into one step (a
+  message delivered in between is newer than the snapshot, so a marker
+  before it is still complete).
+- `InfoAtCreate`: current servers build the consumer-create response from
+  the info taken at creation, before the delivery goroutine starts
+  (nats-server `consumer.go:1909-1910`, v2.15.0), so `Delivered.Consumer`
+  is 0 there. The KV-2 fix relies on that; with `InfoAtCreate = FALSE`
+  (older servers, the response built at any point later) a response that
+  already counts a delivered message seeds nothing, and if that message is
+  lost a reset still starts at sequence 1, as before. The fixed
+  configs set it TRUE, everything else FALSE (as the model was).
 
 ## TLC results
 
 Measured on this machine (4 cores shared with other jobs), TLC 2026.10.06,
-`-workers auto`, `models/tlc.sh` settings.
+`-workers auto`, `models/tlc.sh` settings, with the fixes as applied on
+`fix/kv`.
 
-| Config | Result | Distinct states | Depth / trace | Time |
+| Config | Result | Distinct states | Depth | Time |
 |---|---|---:|---:|---:|
-| `KVWatch.cfg` (baseline, 4 modes × IgnoreDeletes, MaxSeq 3, History 2) | pass | 4,812,460 | depth 26 | 142 s |
-| `KVWatch_history_faults.cfg` (today's code + KV-8 fix, IncludeHistory, 1 drop + 1 restart, MaxSeq 2) | pass | 414,936 | depth 28 | 21 s |
-| `KVWatch_fixed_lps.cfg` (all fixes, LPS, 1 drop) | pass | 3,874,704 | depth 33 | 118 s |
-| `KVWatch_fixed_remove.cfg` (all fixes, LPS × IgnoreDeletes, 1 removal) | pass | 7,867,476 | depth 27 | 225 s |
-| `KVWatch_fixed_restart.cfg` (all fixes, New/Resume/All, 1 restart) | pass | 7,763,272 | depth 29 | 224 s |
-| `KVWatch_fixed_keys.cfg` (all fixes, Keys()/History(), 1 ctx cancel) | pass | 12,937,360 | depth 30 | 275 s |
-| `KVWatch_fixed_listkeys.cfg` (all fixes, ListKeys + early Stop, 1 ctx cancel) | pass | 16,239,638 | depth 37 | 320 s |
-| `KVWatch_fixed_stop.cfg` (all fixes, Watch + early Stop, 1 ctx cancel) | pass | 10,411,406 | depth 30 | 280 s |
-| `KV1_stale_reset_bug.cfg` | `NoStaleEntry` violated | 1,353,016 | 16 states | 24 s |
-| `KV1_keys_deleted_bug.cfg` | `KeysSound` violated | 3,457,469 | 20 states | 62 s |
-| `KV2_reset_from_one_bug.cfg` | `NoStaleEntry` violated | 58,730 | 14 states | 4 s |
-| `KV3_marker_stuck_bug.cfg` | `NoStuckInit` violated | 9,129 | 8 states | 2 s |
-| `KV4_keys_ctx_bug.cfg` | `KeysNoSilentTruncation` violated | 16,210 | 11 states | 3 s |
-| `KV5_listkeys_leak_bug.cfg` | `NoLeakAfterStop` violated | 81,924 | 17 states | 6 s |
-| `KV6_keys_stop_leak_bug.cfg` | `NoLeakAfterStop` violated | 626,391 | 17 states | 17 s |
-| `KV7_closed_handler_bug.cfg` | `NoLeakAfterStop` violated | 1,092 | 9 states | 2 s |
-| `KV8_pending_err_bug.cfg` | `MarkerComplete` violated | 1,294,893 | 17 states | 35 s |
+| `KVWatch.cfg` (baseline, 4 modes × IgnoreDeletes, MaxSeq 3, History 2) | pass | 4,812,460 | 26 | 183 s |
+| `KVWatch_history_faults.cfg` (code before the fixes + KV-8 fix, IncludeHistory, 1 drop + 1 restart, MaxSeq 2) | pass | 433,872 | 28 | 17 s |
+| `KVWatch_fixed_lps.cfg` (all fixes, LPS, 1 drop) | pass | 2,116,668 | 33 | 74 s |
+| `KVWatch_fixed_remove.cfg` (all fixes, LPS × IgnoreDeletes, 1 removal) | pass | 3,805,624 | 27 | 79 s |
+| `KVWatch_fixed_restart.cfg` (all fixes, New/Resume/All, 1 restart) | pass | 2,927,236 | 29 | 54 s |
+| `KVWatch_fixed_keys.cfg` (all fixes, Keys()/History(), 1 ctx cancel) | pass | 5,578,984 | 30 | 150 s |
+| `KVWatch_fixed_listkeys.cfg` (all fixes, ListKeys + early Stop, 1 ctx cancel) | pass | 7,066,390 | 37 | 171 s |
+| `KVWatch_fixed_stop.cfg` (all fixes, Watch + early Stop, 1 ctx cancel) | pass | 5,065,454 | 30 | 141 s |
+| `KV1_stale_reset_bug.cfg` | `NoStaleEntry` violated | 1,403,390 | 16 | 38 s |
+| `KV1_keys_deleted_bug.cfg` | `KeysSound` violated | 3,330,161 | 21 | 80 s |
+| `KV2_reset_from_one_bug.cfg` | `NoStaleEntry` violated | 59,050 | 13 | 6 s |
+| `KV3_marker_stuck_bug.cfg` | `NoStuckInit` violated | 9,093 | 8 | 3 s |
+| `KV4_keys_ctx_bug.cfg` | `KeysNoSilentTruncation` violated | 23,262 | 10 | 4 s |
+| `KV5_listkeys_leak_bug.cfg` | `NoLeakAfterStop` violated | 82,827 | 18 | 6 s |
+| `KV6_keys_stop_leak_bug.cfg` | `NoLeakAfterStop` violated | 629,194 | 19 | 22 s |
+| `KV7_closed_handler_bug.cfg` | `NoLeakAfterStop` violated | 1,056 | 9 | 2 s |
+| `KV8_pending_err_bug.cfg` | `MarkerComplete` violated | 1,690,788 | 17 | 41 s |
 
-Times are wall clock on a loaded machine; the fixed configs with users are
-the slowest (~5 min). Total for the directory: about 30 minutes.
+Total for the directory: 16.5 minutes (`models/tlc.sh KVWatch`, wall
+clock). The fixed configs explore fewer states than the earlier proposed
+fixes did (the KV-3 check and the KV-1 phase now follow the Go code), the
+baseline is unchanged.
+
+Ablation (`KVWatch_fixed_lps.cfg`, measured): without `reset` `Safety` is
+violated (617,470 distinct states), without `recount` too (1,341,122);
+without `marker` it still passes (no removals in that config).
 
 ## Findings
 
@@ -175,68 +197,50 @@ marker. `KV1_keys_deleted_bug.cfg`: a put@1, a del@2, gap → `Keys() = [a]`.
 Triggers: any lost message during the initial phase — a reconnect while a
 large watch/Keys() is streaming, a slow-consumer drop.
 
-Status: **confirmed** — `TestKV1ResetDuringInitialPhaseDeliversStaleRevision`
+Status: **fixed on `fix/kv`** (`1cdd710`); was **confirmed** — `TestKV1ResetDuringInitialPhaseDeliversStaleRevision`
 (`[a@1 b@2=b1 c@3 <nil>]`: stale b@2, marker before b@4),
 `TestKV1KeysReturnsDeletedKeyAfterReset` (`Keys() = [a b c]`, b deleted),
 and found independently by the zizek machine `TestKVWatchModelFaults`
 (shrunk: put b, delete b, drop next b, `Keys() = [b]`).
 
-Proposed fix (sketch; js.go owns the reset, kv.go owns the count): while an
-ordered consumer created with DeliverLastPerSubject has not finished its
-initial set, recreate it with DeliverLastPerSubject again and skip what was
-already handed over; tell the watcher how many entries are still owed.
+Fix on `fix/kv` (no new API):
 
-```diff
---- a/js.go
-+++ b/js.go
-@@ type jsSub struct {
- 	sseq    uint64
-+	// Ordered LPS consumer still in its initial set: a reset recreates it
-+	// with DeliverLastPerSubject and drops sseq <= skipTo.
-+	lpsInit bool
-+	skipTo  uint64
-@@ func (sub *Subscription) checkOrderedMsgs(m *Msg) (bool, orderedSeqs) {
- 	if dseq != jsi.dseq {
- 		return true, orderedSeqs{}
- 	}
-+	if sseq <= jsi.skipTo {
-+		// Re-sent by an LPS restart; already delivered. Advance, don't queue.
-+		jsi.dseq++
-+		return false, orderedSeqs{skip: true}
-+	}
- 	return false, orderedSeqs{dseq: dseq, sseq: sseq}
-@@ func (sub *Subscription) resetOrderedConsumer(sseq uint64) {
--		cfg.DeliverPolicy = DeliverByStartSequencePolicy
--		cfg.OptStartSeq = sseq
-+		if jsi.lpsInit {
-+			cfg.DeliverPolicy = DeliverLastPerSubjectPolicy
-+			cfg.OptStartSeq = 0
-+			jsi.skipTo = sseq - 1
-+		} else {
-+			cfg.DeliverPolicy = DeliverByStartSequencePolicy
-+			cfg.OptStartSeq = sseq
-+		}
-@@ (after upsertConsumer of the reset)
-+		if jsi.lpsInit {
-+			jsi.pending = cinfo.NumPending + cinfo.Delivered.Consumer // re-read by kv.go
-+			jsi.resets++
-+		}
---- a/jetstream/kv.go
-+++ b/jetstream/kv.go
-@@ update := func(m *nats.Msg) {
-+		// An LPS restart re-counts what is still owed (InitialConsumerPending
-+		// returns the new value, minus entries skipped as already delivered).
-+		if !w.initDone && sub.OrderedResets() != w.resets { ... recompute w.initPending ... }
-@@ after the marker is sent
-+		sub.EndOrderedLPSInit() // lpsInit = false: later resets resume by sequence
-```
+- `js.go`: an ordered consumer created with DeliverLastPerSubject tracks
+  whether it may still be delivering the last message per subject
+  (`jsi.lps`). While it may, a reset recreates it with
+  DeliverLastPerSubject and drops what the new consumer sends again up to
+  the last delivered stream sequence (`jsi.lpsSkip`, still advancing the
+  delivery sequence). The phase ends when an upper bound of what is left
+  of the set reaches 0: the num_pending of the first message of each
+  consumer, counted down per delivered message and capped by each
+  message's own num_pending. Both only over-estimate, so it never ends
+  early; it ends late by the messages written between the consumer's
+  creation and its first delivery, or by initial values removed before
+  delivery, or as soon as a message reports num_pending 0. A create
+  response with nothing pending ends it at once. After it, resets resume
+  by sequence as before. This is the legacy ordered consumer, so it also
+  applies to `js.Subscribe(..., nats.OrderedConsumer(),
+  nats.DeliverLastPerSubject())` (`TestKV1LegacyOrderedLastPerSubjectReset`).
+- `jetstream/kv.go` and legacy `kv.go`: the watcher re-counts what is
+  owed when the consumer changes. On the first message of a recreated
+  consumer (consumer token of the reply subject) `initPending = received +
+  num_pending`; on the very first message `initPending = max(initPending,
+  received + num_pending)`, which also covers a consumer recreated before
+  anything was delivered.
+
+Model: fixes `reset` (js.go) and `recount` (kv.go). `KVWatch_fixed_lps.cfg`
+passes with both and fails without either (`Safety`: NoStaleEntry without
+`reset`, MarkerComplete without `recount`, measured).
 
 Trade-off (also in the model, ghost `snap.collapse`): an LPS restart
 collapses updates written during the initial phase to their latest
 revision, as LPS already does for writes made before the watch.
-`KVWatch_fixed_lps.cfg` checks the fixed behavior, including the re-count
-(without it the marker comes early — TLC found that in a first version of
-the fix).
+
+Residual (two faults at once, not in the fixed configs): a reset in the
+initial phase after which every remaining initial value is removed without
+a new message. The new consumer then delivers only messages that are
+dropped as already delivered, so the KV-3 check never sees its delivery
+sequence handled, and the marker waits for the next write.
 
 ### KV-2 — a reset before the first delivered message starts at sequence 1 (High)
 
@@ -251,7 +255,7 @@ below `r`; an LPS watcher whose first message was lost gets full history
 Trace (`KV2_reset_from_one_bug.cfg`, 14 states): a@1; UpdatesOnly watch;
 server restart; heartbeat timeout → reset from 1 → a@1 delivered.
 
-Status: **confirmed, no test hooks needed** —
+Status: **fixed on `fix/kv`** (`a143322`); was **confirmed, no test hooks needed** —
 `TestKV2UpdatesOnlyReplaysHistoryAfterServerRestart` (embedded server
 restart, ~15 s: delivers `[a@1 b@2 c@3]`, want `[c@3]`); fast variants
 `TestKV2UpdatesOnlyReplaysHistoryAfterLostFirstUpdate`,
@@ -260,25 +264,16 @@ consumer (`js.go`) issue; by code reading it affects every legacy ordered
 consumer created with DeliverNew / a start sequence / a start time that is
 reset before its first message, not only KV.
 
-Proposed fix: seed the tracker with the consumer's start floor.
-
-```diff
---- a/js.go
-+++ b/js.go
-@@ func (js *js) subscribe(...)
- 			sub.jsi.dc = true
- 			sub.jsi.pending = info.NumPending + info.Delivered.Consumer
-+			// Resume point for ordered resets before the first message:
-+			// where the consumer started, not the start of the stream.
-+			if o.ordered && sub.jsi.sseq == 0 && info.Delivered.Consumer == 0 {
-+				sub.jsi.sseq = info.Delivered.Stream
-+			}
-```
-
-(`Delivered.Stream` is the start floor when nothing was delivered yet:
-DeliverNew → last seq, ByStartSequence(r) → r-1. If messages were already
-delivered when the info was built, the first message handed over sets
-`sseq` as today.)
+Fix on `fix/kv`, as proposed: `js.subscribe` seeds `jsi.sseq` with the
+create response's `Delivered.Stream` when its `Delivered.Consumer` is 0
+(current servers, see `InfoAtCreate`). For every legacy ordered consumer a
+reset before the first message then resumes where the consumer started:
+DeliverNew → the last sequence at creation + 1, ByStartSequence(r) → r,
+ByStartTime → the sequence found for that time, DeliverLast → the last
+message, DeliverAll → the first sequence, DeliverLastPerSubject → the
+first sequence of the skip list (it resets with KV-1's fix anyway). Older
+servers that build the response after delivery started are unchanged
+(the first message seeds it, as before).
 
 ### KV-3 — the marker is never sent when owed initial values are removed (High)
 
@@ -296,44 +291,26 @@ A later write to a watched key unblocks it (its `delta` is 0). The legacy
 Trace (`KV3_marker_stuck_bug.cfg`, 8 states): a@1; watch (pending 1); a
 removed before delivery; nothing is ever delivered.
 
-Status: **confirmed** — `TestKV3MarkerNeverSentWhenPendingInitialValuesAreRemoved`:
+Status: **fixed on `fix/kv`** (`88fb7fc`); was **confirmed** — `TestKV3MarkerNeverSentWhenPendingInitialValuesAreRemoved`:
 280 keys, the reader is slow so flow control stalls the server with 12
 values undelivered; those are purged; 268 entries arrive and no marker.
 
-Proposed fix (sketch): when the watcher is idle in its initial phase, ask
-the server.
-
-```diff
---- a/jetstream/kv.go
-+++ b/jetstream/kv.go
-@@ type watcher struct {
- 	received    uint64
-+	idleCheck   *time.Timer
-@@ WatchFiltered, after initPending is set
-+		w.idleCheck = time.AfterFunc(idleInitCheck, w.checkIdleInit)
-+
-+// checkIdleInit ends a stuck initial phase: nothing pending on the server
-+// and every delivered message handled means nothing more is owed.
-+func (w *watcher) checkIdleInit() {
-+	ci, err := w.sub.ConsumerInfo()
-+	w.mu.Lock()
-+	defer w.mu.Unlock()
-+	if w.initDone || w.closed {
-+		return
-+	}
-+	if err == nil && ci.NumPending == 0 && ci.Delivered.Consumer == w.handledFromConsumer() {
-+		w.initDone = true
-+		w.updates <- nil
-+		return
-+	}
-+	w.idleCheck.Reset(idleInitCheck)
-+}
-```
+Fix on `fix/kv` (`jetstream/kv.go`; legacy `kv.go` keeps its
+`initDoneTimer`): while the initial phase is open, a timer
+(`kvWatchInitCheck`, 2 s, restarted by every message) runs
+`watcher.checkInit`: `sub.ConsumerInfo()` and `sub.Pending()`, then, under
+`w.mu`, the marker if NumPending is 0, nothing is queued, and
+`Delivered.Consumer` is 0 or equals the delivery sequence of the last
+message the callback handled from that same consumer. Otherwise it checks
+again later. Cost: one ConsumerInfo request per 2 s while a watcher waits
+for initial values without receiving any.
 
 The `Delivered.Consumer` comparison matters: TLC showed that a check on
 `NumPending == 0` alone fires while a lost message is still undetected
-(marker before the lost initial value is redelivered). A plain timer like
-legacy's would also fire early while flow control stalls a slow reader.
+(marker before the lost initial value is redelivered). "Nothing queued"
+keeps it from firing while entries of a replaced consumer still wait for
+the callback (`Delivered.Consumer` of the new one is then 0). A plain timer like legacy's would also fire
+early while flow control stalls a slow reader.
 
 ### KV-4 — Keys()/History() return a truncated result with no error when the context ends (Medium)
 
@@ -346,32 +323,20 @@ function returns the keys collected so far with a nil error (or
 
 Trace (`KV4_keys_ctx_bug.cfg`, 11 states).
 
-Status: **confirmed** — `TestKV4KeysContextCancelSilentlyTruncates`: 50
+Status: **fixed on `fix/kv`** (`c46d166`) for `Keys()` and `History()`; was **confirmed** — `TestKV4KeysContextCancelSilentlyTruncates`: 50
 keys, cancel after 25 are read → `Keys()` returns 25 keys, nil.
 
-Proposed fix:
+Fix on `fix/kv` (both packages): when `Updates()` is closed before the
+marker, `Keys()` and `History()` return the context's error, else
+`ErrConnectionClosed` if the connection is closed, else
+`ErrConsumerDeleted`. **Behavior change:** they used to return the partial
+result with a nil error, or `ErrNoKeysFound` / `ErrKeyNotFound`. In the
+legacy package the context is the one given with `nats.Context`.
 
-```diff
-@@ func (kv *kvs) Keys(ctx context.Context, opts ...WatchOpt) ([]string, error) {
- 	var keys []string
-+	complete := false
- 	for entry := range watcher.Updates() {
- 		if entry == nil {
-+			complete = true
- 			break
- 		}
- 		keys = append(keys, entry.Key())
- 	}
-+	if !complete {
-+		if err := ctx.Err(); err != nil {
-+			return nil, err
-+		}
-+		return nil, nats.ErrConnectionClosed
-+	}
-```
-
-(same for `History`; `ListKeys` needs an error surface, e.g. the `Error()`
-the legacy `KeyLister` gained in #1889.)
+Not fixed: `ListKeys` / `ListKeysFiltered` in `jetstream` still just close
+`Keys()`; reporting it needs an API addition (an `Error()` on
+`jetstream.KeyLister`, like `KeyValueLister` has), left to the
+maintainers.
 
 ### KV-5 — KeyLister.Stop() leaks the lister goroutine and the watcher callback (Medium)
 
@@ -385,25 +350,15 @@ receive side.
 
 Trace (`KV5_listkeys_leak_bug.cfg`).
 
-Status: **confirmed** — `TestKV5ListKeysStopLeaksGoroutines`: 1000 keys,
+Status: **fixed on `fix/kv`** (`461e8ca`); was **confirmed** — `TestKV5ListKeysStopLeaksGoroutines`: 1000 keys,
 read one, `Stop()`: `ListKeys.func1` and `WatchFiltered.func1` are still
 blocked 3 s later.
 
-Proposed fix:
-
-```diff
-@@ ListKeys / ListKeysFiltered lister goroutine
--				kl.keys <- entry.Key()
-+				select {
-+				case kl.keys <- entry.Key():
-+				case <-ctx.Done():
-+					return
-+				case <-kl.stop: // closed by keyLister.Stop()
-+					return
-+				}
-```
-
-plus KV-6's fix so the callback blocked on `w.updates` is released.
+Fix on `fix/kv` (both packages): `KeyLister.Stop()` closes a `stop`
+channel that the lister goroutine selects on next to its send (and, in
+`jetstream`, next to `ctx.Done()`); with KV-6's fix the callback blocked on
+`w.updates` gives up, so `Updates()` and `Keys()` are closed.
+`TestKV5ListKeysStopLeaksGoroutines` checks both goroutines are gone.
 
 ### KV-6 — Keys()/ListKeys()/History() can leak the watcher callback after Stop (Low)
 
@@ -416,28 +371,17 @@ runs). Same for a `Watch` user who calls `Stop()` and stops reading.
 
 Trace (`KV6_keys_stop_leak_bug.cfg`, 17 states, `ChanCap = 1`).
 
-Status: **model-only**. A Go reproduction attempt (20 000 keys, 600 updates
+Status: **fixed on `fix/kv`** (`461e8ca`); was **model-only**. A Go reproduction attempt (20 000 keys, 600 updates
 queued behind the last initial value) did not hit it: flow control keeps
 the server from running ahead, and only ~10 updates arrived in the ~1 ms
 between the marker and `Stop()`. It needs a sustained write rate well above
 what flow control lets through in that window, so it is real but unlikely.
 
-Proposed fix: make the callback's sends abandonable.
-
-```diff
-@@ type watcher struct {
-+	stopped chan struct{} // closed by Stop() (once)
-@@ update callback
--			w.updates <- entry
-+			select {
-+			case w.updates <- entry:
-+			case <-w.stopped:
-+				return
-+			}
-```
-
-(same for the marker send; `Stop()` closes `w.stopped` before
-`Unsubscribe`.)
+Fix on `fix/kv` (both packages): every send of the update callback (and
+of the marker, also from the legacy `initDoneTimer` and the KV-3 check)
+selects on a `stopped` channel closed by `Stop()` before it unsubscribes,
+and on the watch context (which unsubscribes too). Model: fix
+`stopdrain`.
 
 ### KV-7 — Updates() is never closed if the context ends right after Subscribe returns (Low)
 
@@ -449,12 +393,14 @@ w.Updates()` blocks forever.
 
 Trace (`KV7_closed_handler_bug.cfg`, 9 states).
 
-Status: **model-only** (the window is a few instructions; not reproduced).
+Status: **fixed on `fix/kv`** (`461e8ca`); was **model-only** (the window is a few instructions; not reproduced).
 
-Proposed fix: after `SetClosedHandler` (still under `w.mu`), if
-`!sub.IsValid()`, close `w.updates` and mark the watcher closed; the
-handler and the callback check that flag (close once, no sends after).
-Checked as fix `closedh` in `KVWatch_fixed_stop.cfg` and `KVWatch_fixed_keys.cfg`.
+Fix on `fix/kv` (both packages), as proposed: after the closed handler is
+installed (legacy: `sub.pDone`, under `sub.mu`), if the subscription is
+already closed, `Updates()` (and legacy `Error()`) is closed there; a
+`closed` flag under `w.mu` makes the close happen once and stops later
+sends. Checked as fix `closedh` in `KVWatch_fixed_stop.cfg` and
+`KVWatch_fixed_keys.cfg`.
 
 ### KV-8 — a reset racing InitialConsumerPending sends the marker after the first entry (Low)
 
@@ -475,10 +421,13 @@ arrives the marker is never sent (`NoStuckInit`) until a write comes in.
 Trigger: a server restart / heartbeat gap reset in flight while
 `WatchFiltered` reads the pending count.
 
-Status: **model-only** (needs a reset within the first round trip).
+Status: **fixed on `fix/kv`** (`69365b6`); was **model-only** (needs a reset within the first round trip).
 
-Proposed fix: `InitialConsumerPending` should not depend on the consumer
-name (`jsi.pending` is set once at creation); check `sub.jsi == nil` only.
+Fix on `fix/kv`, as proposed: `InitialConsumerPending` checks only
+`sub.jsi == nil` (`jsi.pending` is set once, at creation). KV-1's re-count
+on the first message covers the first flavor as well.
+`KV8_pending_err_bug.cfg` keeps `Fixes = {"reset"}` (the `js.go` half of
+KV-1 only) and still reproduces it.
 
 ### KV-9 — nats-server file store: purge by subject + purge by sequence hide stored values (server, High; not nats.go)
 
@@ -519,14 +468,16 @@ default zizek machine leaves out `expire` so it tests the client.
 | Test | Kind |
 |---|---|
 | `TestKVWatchModel` | zizek state machine (rules = model actions: put, del/purge, removeKey, watch in every mode/filter with writes racing the initial delivery, stop, keys, listKeys/listKeysFiltered, history), invariants = the model's, against a reference stream; passes |
-| `TestKVWatchModelFaults` (`internal_testing`) | the same plus `dropNext` (NetDrop via `AddMsgFilter`); KnownBug KV-1/KV-2 |
-| `TestKV1*`, `TestKV2*`, `TestKV3*`, `TestKV4*`, `TestKV5*`, `TestKV9*` | deterministic reproducers, `harness.KnownBug` |
+| `TestKVWatchModelFaults` (`internal_testing`) | the same plus `dropNext` (NetDrop via `AddMsgFilter`); found KV-1/KV-2, passes since the fixes (40 examples, about 5 minutes: a lost last message is noticed at the next 5 s heartbeat) |
+| `TestKV1*`, `TestKV2*`, `TestKV3*`, `TestKV4*`, `TestKV5*` | deterministic regression tests from the counterexamples (failed before the fixes) |
+| `TestKV1LegacyOrderedLastPerSubjectReset` (`internal_testing`) | KV-1's fix for a plain legacy ordered consumer with DeliverLastPerSubject: no replay during the initial set, resume by sequence after it |
+| `TestKV9*` | nats-server reproducer, `harness.KnownBug` |
 
 ```
 cd modeltest
-go test -race ./kvwatch/...                                   # passes, KnownBug tests skipped
-go test -race -tags=internal_testing ./kvwatch/...            # same
-MODELTEST_KNOWN_BUGS=1 go test -race -tags=internal_testing ./kvwatch/...  # reproduces
+go test -race ./kvwatch/...                                   # passes, KV-9 skipped
+go test -race -tags=internal_testing ./kvwatch/...            # same, plus the fault machine
+MODELTEST_KNOWN_BUGS=1 go test -race -tags=internal_testing ./kvwatch/...  # KV-9 fails
 ```
 
 zizek note: `RunSteps` uses swarm-style rule subsets and a per-step stop

@@ -1213,14 +1213,29 @@ func purge() KVDeleteOpt {
 	})
 }
 
+// How long a watcher still waiting for its initial values may go without a
+// message before it asks the server whether any are left (see checkInit).
+const kvWatchInitCheck = 2 * time.Second
+
 // Implementation for Watch
 type watcher struct {
 	mu          sync.Mutex
 	updates     chan KeyValueEntry
 	sub         *nats.Subscription
+	ctx         context.Context
 	initDone    bool
 	initPending uint64
 	received    uint64
+	// Consumer and delivery sequence of the last message handled.
+	consumer string
+	dseq     uint64
+	// Ends an initial phase whose last values are gone, see checkInit.
+	initCheck *time.Timer
+	// Closed by Stop, so that an update blocked on a full channel gives up.
+	stopped  chan struct{}
+	stopOnce sync.Once
+	// updates has been closed.
+	closed bool
 }
 
 // Updates returns the interior channel.
@@ -1236,7 +1251,72 @@ func (w *watcher) Stop() error {
 	if w == nil {
 		return nil
 	}
+	w.stopOnce.Do(func() { close(w.stopped) })
 	return w.sub.Unsubscribe()
+}
+
+// send puts e (nil for the initial values marker) on w.updates, blocking
+// while the channel is full. It gives up and returns false once the watcher
+// is stopped or its context ends: the reader may be gone, and the update
+// callback would otherwise block forever, holding w.mu and the
+// subscription's goroutine, and Updates() would never be closed.
+// w.mu must be held.
+func (w *watcher) send(e KeyValueEntry) bool {
+	select {
+	case w.updates <- e:
+		return true
+	case <-w.stopped:
+	case <-w.ctx.Done():
+	}
+	return false
+}
+
+// endInit marks the initial values as delivered and sends the marker.
+// w.mu must be held.
+func (w *watcher) endInit() {
+	w.initDone = true
+	if w.initCheck != nil {
+		w.initCheck.Stop()
+	}
+	w.send(nil)
+}
+
+// close closes w.updates once; no update is sent after that.
+// w.mu must be held.
+func (w *watcher) close() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	if w.initCheck != nil {
+		w.initCheck.Stop()
+	}
+	close(w.updates)
+}
+
+// checkInit ends an initial phase that cannot end otherwise: when values
+// still owed are removed without a new message (MaxAge, PurgeDeletes, a
+// stream purge), received never reaches initPending and no message carries
+// delta 0. It runs once the watcher has been idle for kvWatchInitCheck and
+// sends the marker if the consumer has nothing pending and every message it
+// delivered was handled here, so nothing was lost on the way either.
+func (w *watcher) checkInit() {
+	if !w.sub.IsValid() {
+		return
+	}
+	ci, err := w.sub.ConsumerInfo()
+	queued, _, qerr := w.sub.Pending()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.initDone || w.closed {
+		return
+	}
+	if err == nil && qerr == nil && queued == 0 && ci.NumPending == 0 &&
+		(ci.Delivered.Consumer == 0 || (ci.Name == w.consumer && ci.Delivered.Consumer == w.dseq)) {
+		w.endInit()
+		return
+	}
+	w.initCheck.Reset(kvWatchInitCheck)
 }
 
 // WatchFiltered will watch for any updates to keys that match the provided
@@ -1273,7 +1353,10 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	}
 
 	// We will block below on placing items on the chan. That is by design.
-	w := &watcher{updates: make(chan KeyValueEntry, 256)}
+	w := &watcher{updates: make(chan KeyValueEntry, 256), ctx: ctx, stopped: make(chan struct{})}
+	if w.ctx == nil {
+		w.ctx = context.Background()
+	}
 
 	update := func(m *nats.Msg) {
 		tokens, err := parser.GetMetadataFields(m.Reply)
@@ -1304,8 +1387,12 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			}
 		}
 		delta := parser.ParseNum(tokens[parser.AckNumPendingTokenPos])
+		consumer := tokens[parser.AckConsumerTokenPos]
 		w.mu.Lock()
 		defer w.mu.Unlock()
+		if w.closed {
+			return
+		}
 		if !o.ignoreDeletes || (op != KeyValueDelete && op != KeyValuePurge) {
 			entry := &kve{
 				bucket:   kv.name,
@@ -1316,18 +1403,32 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 				delta:    delta,
 				op:       op,
 			}
-			w.updates <- entry
+			if !w.send(entry) {
+				return
+			}
 		}
 		// Check if done and initial values.
 		if !w.initDone {
 			w.received++
-			// Use the stable initPending value set at consumer creation.
+			// The ordered consumer is recreated after a lost message or
+			// heartbeat. In the last-per-subject phase that collapses
+			// what was written meanwhile into the last value per key, so
+			// what is still owed is what the new consumer has pending
+			// after this message. The first message also covers a consumer
+			// recreated before anything was delivered.
+			if w.consumer == "" {
+				w.initPending = max(w.initPending, w.received+delta)
+			} else if consumer != w.consumer {
+				w.initPending = w.received + delta
+			}
 			// We're done if we've received all expected messages OR there are no more pending.
 			if w.received >= w.initPending || delta == 0 {
-				w.initDone = true
-				w.updates <- nil
+				w.endInit()
+			} else if w.initCheck != nil {
+				w.initCheck.Reset(kvWatchInitCheck)
 			}
 		}
+		w.consumer, w.dseq = consumer, parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos])
 	}
 
 	// Used ordered consumer to deliver results.
@@ -1361,29 +1462,34 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	if err != nil {
 		return nil, err
 	}
+	w.sub = sub
 	sub.SetClosedHandler(func(_ string) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		close(w.updates)
+		w.close()
 	})
+	// The context may have ended, and the subscription been closed, before
+	// the handler was installed. It would then never run.
+	if !sub.IsValid() {
+		w.close()
+		return w, nil
+	}
 	// If there were no pending messages at the time of the creation
 	// of the consumer, send the marker.
 	// Skip if UpdatesOnly() is set, since there will never be updates initially.
 	if !o.updatesOnly {
 		initialPending, err := sub.InitialConsumerPending()
-		if err == nil {
-			if initialPending == 0 {
-				w.initDone = true
-				w.updates <- nil
-			} else {
-				w.initPending = initialPending
-			}
+		if err == nil && initialPending == 0 {
+			w.initDone = true
+			w.updates <- nil
+		} else {
+			w.initPending = initialPending
+			w.initCheck = time.AfterFunc(kvWatchInitCheck, w.checkInit)
 		}
 	} else {
 		// if UpdatesOnly was used, mark initialization as complete
 		w.initDone = true
 	}
-	w.sub = sub
 	return w, nil
 }
 
@@ -1410,20 +1516,65 @@ func (kv *kvs) Keys(ctx context.Context, opts ...WatchOpt) ([]string, error) {
 	var keys []string
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(keys) == 0 {
+				return nil, ErrNoKeysFound
+			}
+			slices.Sort(keys)
+			return slices.Compact(keys), nil
 		}
 		keys = append(keys, entry.Key())
 	}
-	if len(keys) == 0 {
-		return nil, ErrNoKeysFound
+	// Updates() was closed before all keys were received.
+	return nil, kv.watchClosedErr(ctx)
+}
+
+// watchClosedErr tells why a watcher's updates were closed before all of
+// its initial values were received.
+func (kv *kvs) watchClosedErr(ctx context.Context) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	slices.Sort(keys)
-	return slices.Compact(keys), nil
+	if kv.js.conn.IsClosed() {
+		return ErrConnectionClosed
+	}
+	return ErrConsumerDeleted
 }
 
 type keyLister struct {
-	watcher KeyWatcher
-	keys    chan string
+	watcher  KeyWatcher
+	keys     chan string
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// newKeyLister lists the keys of watcher's initial values on kl.keys.
+func newKeyLister(ctx context.Context, watcher KeyWatcher) *keyLister {
+	kl := &keyLister{watcher: watcher, keys: make(chan string, 256), stop: make(chan struct{})}
+	go func() {
+		defer close(kl.keys)
+		defer watcher.Stop()
+		for {
+			select {
+			case entry, ok := <-watcher.Updates():
+				if !ok || entry == nil { // nil: all initial values are received
+					return
+				}
+				// The caller may stop reading: see Stop.
+				select {
+				case kl.keys <- entry.Key():
+				case <-kl.stop:
+					return
+				case <-ctx.Done():
+					return
+				}
+			case <-kl.stop:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return kl
 }
 
 // ListKeys will return all keys.
@@ -1435,24 +1586,7 @@ func (kv *kvs) ListKeys(ctx context.Context, opts ...WatchOpt) (KeyLister, error
 	if err != nil {
 		return nil, err
 	}
-	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
-
-	go func() {
-		defer close(kl.keys)
-		defer watcher.Stop()
-		for {
-			select {
-			case entry := <-watcher.Updates():
-				if entry == nil {
-					return
-				}
-				kl.keys <- entry.Key()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return kl, nil
+	return newKeyLister(ctx, watcher), nil
 }
 
 // ListKeysFiltered returns a KeyLister for filtered keys in the bucket.
@@ -1463,35 +1597,16 @@ func (kv *kvs) ListKeysFiltered(ctx context.Context, filters ...string) (KeyList
 	if err != nil {
 		return nil, err
 	}
-
-	// Reuse the existing keyLister implementation
-	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
-
-	go func() {
-		defer close(kl.keys)
-		defer watcher.Stop()
-
-		for {
-			select {
-			case entry := <-watcher.Updates():
-				if entry == nil { // Indicates all initial values are received
-					return
-				}
-				kl.keys <- entry.Key()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return kl, nil
+	return newKeyLister(ctx, watcher), nil
 }
 
 func (kl *keyLister) Keys() <-chan string {
 	return kl.keys
 }
 
+// Stop stops the listing; Keys() is closed.
 func (kl *keyLister) Stop() error {
+	kl.stopOnce.Do(func() { close(kl.stop) })
 	return kl.watcher.Stop()
 }
 
@@ -1507,14 +1622,15 @@ func (kv *kvs) History(ctx context.Context, key string, opts ...WatchOpt) ([]Key
 	var entries []KeyValueEntry
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(entries) == 0 {
+				return nil, ErrKeyNotFound
+			}
+			return entries, nil
 		}
 		entries = append(entries, entry)
 	}
-	if len(entries) == 0 {
-		return nil, ErrKeyNotFound
-	}
-	return entries, nil
+	// Updates() was closed before the whole history was received.
+	return nil, kv.watchClosedErr(ctx)
 }
 
 // Bucket returns the current bucket name.

@@ -22,7 +22,6 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/modeltest/harness"
 	zizek "github.com/wallyqs/zizek.go"
 )
 
@@ -46,15 +45,16 @@ func (s *kvMachine) dropNext(tc *zizek.TestCase) error {
 	return nil
 }
 
-// TestKVWatchModelFaults adds message loss to TestKVWatchModel. zizek finds
-// KV-1 (stale revision / premature marker after a reset in the initial
+// TestKVWatchModelFaults adds message loss to TestKVWatchModel. It used to
+// find KV-1 (stale revision / premature marker after a reset in the initial
 // phase) and KV-2 (UpdatesOnly / ResumeFromRevision replay from seq 1).
+// A lost message that is the last one is only noticed at the next idle
+// heartbeat (5s), so examples are slow: 40 of them take about 5 minutes.
 func TestKVWatchModelFaults(t *testing.T) {
-	harness.KnownBug(t, "KV-1/KV-2")
 	f := newFixture(t)
 	extra := []zizek.Rule[kvMachine]{{Name: "dropNext", Apply: (*kvMachine).dropNext}}
 	err := zizek.Check(f.property(extra, 30, 15*time.Second),
-		zizek.Config{Examples: 100, Seed: 3, MaxShrinks: 40})
+		zizek.Config{Examples: 40, Seed: 3, MaxShrinks: 40})
 	f.logStats()
 	if err != nil {
 		t.Fatal(err)
