@@ -700,7 +700,7 @@ func (f *kvFixture) newMachine(tc *zizek.TestCase, settle time.Duration) (*kvMac
 	}
 	ctx := context.Background()
 	name := fmt.Sprintf("M%d", f.bucket.Add(1))
-	kv, err := f.js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: name, History: uint8(hist)})
+	kv, err := f.createBucket(ctx, jetstream.KeyValueConfig{Bucket: name, History: uint8(hist)})
 	if err != nil {
 		return nil, err
 	}
@@ -721,6 +721,27 @@ func (f *kvFixture) newMachine(tc *zizek.TestCase, settle time.Duration) (*kvMac
 	tc.Note(fmt.Sprintf("bucket %s history=%d", name, hist))
 	return &kvMachine{t: f.t, ctx: ctx, srv: f.srv, wnc: wnc, kv: kv, wkv: wkv,
 		stream: stream, bucket: name, ref: &refStream{history: int(hist)}, settle: settle}, nil
+}
+
+// errCodeStreamStoreFailed is nats-server's "error creating store for
+// stream" (NewJSStreamStoreFailedError).
+const errCodeStreamStoreFailed jetstream.ErrorCode = 10049
+
+// createBucket creates a bucket, retrying while the server cannot create
+// its file store. Under CPU load the embedded nats-server intermittently
+// answers 10049 for a fresh, uniquely named bucket; that is the
+// environment, not the client under test, and reporting it failed about one
+// run in ten of TestKVWatchModel on loaded machines (and the shrinker then
+// discarded the cause as "shrunk example no longer fails").
+func (f *kvFixture) createBucket(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
+	for attempt := 0; ; attempt++ {
+		kv, err := f.js.CreateKeyValue(ctx, cfg)
+		var apiErr *jetstream.APIError
+		if err == nil || attempt == 9 || !errors.As(err, &apiErr) || apiErr.ErrorCode != errCodeStreamStoreFailed {
+			return kv, err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 func (f *kvFixture) property(extra []zizek.Rule[kvMachine], steps int, settle time.Duration) func(tc *zizek.TestCase) error {
