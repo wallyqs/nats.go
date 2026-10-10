@@ -956,8 +956,10 @@ func (kv *kvs) Keys(opts ...WatchOpt) ([]string, error) {
 }
 
 type keyLister struct {
-	watcher KeyWatcher
-	keys    chan string
+	watcher  KeyWatcher
+	keys     chan string
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // ListKeys will return all keys.
@@ -969,7 +971,7 @@ func (kv *kvs) ListKeys(opts ...WatchOpt) (KeyLister, error) {
 	if err != nil {
 		return nil, err
 	}
-	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
+	kl := &keyLister{watcher: watcher, keys: make(chan string, 256), stop: make(chan struct{})}
 
 	go func() {
 		defer close(kl.keys)
@@ -978,7 +980,12 @@ func (kv *kvs) ListKeys(opts ...WatchOpt) (KeyLister, error) {
 			if entry == nil {
 				return
 			}
-			kl.keys <- entry.Key()
+			// The caller may stop reading: see Stop.
+			select {
+			case kl.keys <- entry.Key():
+			case <-kl.stop:
+				return
+			}
 		}
 	}()
 	return kl, nil
@@ -988,7 +995,9 @@ func (kl *keyLister) Keys() <-chan string {
 	return kl.keys
 }
 
+// Stop stops the listing; Keys() is closed.
 func (kl *keyLister) Stop() error {
+	kl.stopOnce.Do(func() { close(kl.stop) })
 	return kl.watcher.Stop()
 }
 
@@ -1031,6 +1040,11 @@ type watcher struct {
 	errCh         chan error
 	// Consumer of the last message handled.
 	consumer string
+	// Closed by Stop, so that an update blocked on a full channel gives up.
+	stopped  chan struct{}
+	stopOnce sync.Once
+	// updates has been closed.
+	closed bool
 }
 
 // Context returns the context for the watcher if set.
@@ -1054,7 +1068,42 @@ func (w *watcher) Stop() error {
 	if w == nil {
 		return nil
 	}
+	w.stopOnce.Do(func() { close(w.stopped) })
 	return w.sub.Unsubscribe()
+}
+
+// send puts e (nil for the initial values marker) on w.updates, blocking
+// while the channel is full. It gives up and returns false once the watcher
+// is stopped or its context ends: the reader may be gone, and the update
+// callback would otherwise block forever, holding w.mu and the
+// subscription's goroutine, and Updates() would never be closed.
+// w.mu must be held.
+func (w *watcher) send(e KeyValueEntry) bool {
+	var done <-chan struct{}
+	if w.ctx != nil {
+		done = w.ctx.Done()
+	}
+	select {
+	case w.updates <- e:
+		return true
+	case <-w.stopped:
+	case <-done:
+	}
+	return false
+}
+
+// close closes w.updates and w.errCh once; nothing is sent after that.
+// w.mu must be held.
+func (w *watcher) close() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	if w.initDoneTimer != nil {
+		w.initDoneTimer.Stop()
+	}
+	close(w.updates)
+	close(w.errCh)
 }
 
 // Error returns a channel that will receive any error that occurs during watching.
@@ -1108,6 +1157,7 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 		updates: make(chan KeyValueEntry, 256),
 		ctx:     o.ctx,
 		errCh:   make(chan error, 1),
+		stopped: make(chan struct{}),
 	}
 
 	update := func(m *Msg) {
@@ -1133,6 +1183,9 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 		consumer := tokens[parser.AckConsumerTokenPos]
 		w.mu.Lock()
 		defer w.mu.Unlock()
+		if w.closed {
+			return
+		}
 		if !o.ignoreDeletes || (op != KeyValueDelete && op != KeyValuePurge) {
 			entry := &kve{
 				bucket:   kv.name,
@@ -1143,7 +1196,9 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 				delta:    delta,
 				op:       op,
 			}
-			w.updates <- entry
+			if !w.send(entry) {
+				return
+			}
 		}
 		// Check if done and initial values.
 		// Skip if UpdatesOnly() is set, since there will never be updates initially.
@@ -1167,7 +1222,7 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 					w.initDoneTimer.Stop()
 				}
 				w.initDone = true
-				w.updates <- nil
+				w.send(nil)
 			} else if w.initDoneTimer != nil {
 				w.initDoneTimer.Reset(kv.js.opts.wait)
 			}
@@ -1220,13 +1275,13 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 				w.initDoneTimer = time.AfterFunc(kv.js.opts.wait, func() {
 					w.mu.Lock()
 					defer w.mu.Unlock()
-					if !w.initDone {
+					if !w.initDone && !w.closed {
 						w.initDone = true
 						select {
 						case w.errCh <- ErrKeyWatcherTimeout:
 						default:
 						}
-						w.updates <- nil
+						w.send(nil)
 					}
 				})
 			}
@@ -1239,11 +1294,12 @@ func (kv *kvs) WatchFiltered(keys []string, opts ...WatchOpt) (KeyWatcher, error
 	sub.pDone = func(_ string) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		if w.initDoneTimer != nil {
-			w.initDoneTimer.Stop()
-		}
-		close(w.updates)
-		close(w.errCh)
+		w.close()
+	}
+	// The context may have ended, and the subscription been closed, before
+	// pDone was set. It would then never be called.
+	if sub.closed {
+		w.close()
 	}
 
 	sub.mu.Unlock()

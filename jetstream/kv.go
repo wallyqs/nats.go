@@ -1218,11 +1218,17 @@ type watcher struct {
 	mu          sync.Mutex
 	updates     chan KeyValueEntry
 	sub         *nats.Subscription
+	ctx         context.Context
 	initDone    bool
 	initPending uint64
 	received    uint64
 	// Consumer of the last message handled.
 	consumer string
+	// Closed by Stop, so that an update blocked on a full channel gives up.
+	stopped  chan struct{}
+	stopOnce sync.Once
+	// updates has been closed.
+	closed bool
 }
 
 // Updates returns the interior channel.
@@ -1238,7 +1244,34 @@ func (w *watcher) Stop() error {
 	if w == nil {
 		return nil
 	}
+	w.stopOnce.Do(func() { close(w.stopped) })
 	return w.sub.Unsubscribe()
+}
+
+// send puts e (nil for the initial values marker) on w.updates, blocking
+// while the channel is full. It gives up and returns false once the watcher
+// is stopped or its context ends: the reader may be gone, and the update
+// callback would otherwise block forever, holding w.mu and the
+// subscription's goroutine, and Updates() would never be closed.
+// w.mu must be held.
+func (w *watcher) send(e KeyValueEntry) bool {
+	select {
+	case w.updates <- e:
+		return true
+	case <-w.stopped:
+	case <-w.ctx.Done():
+	}
+	return false
+}
+
+// close closes w.updates once; no update is sent after that.
+// w.mu must be held.
+func (w *watcher) close() {
+	if w.closed {
+		return
+	}
+	w.closed = true
+	close(w.updates)
 }
 
 // WatchFiltered will watch for any updates to keys that match the provided
@@ -1275,7 +1308,10 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	}
 
 	// We will block below on placing items on the chan. That is by design.
-	w := &watcher{updates: make(chan KeyValueEntry, 256)}
+	w := &watcher{updates: make(chan KeyValueEntry, 256), ctx: ctx, stopped: make(chan struct{})}
+	if w.ctx == nil {
+		w.ctx = context.Background()
+	}
 
 	update := func(m *nats.Msg) {
 		tokens, err := parser.GetMetadataFields(m.Reply)
@@ -1309,6 +1345,9 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 		consumer := tokens[parser.AckConsumerTokenPos]
 		w.mu.Lock()
 		defer w.mu.Unlock()
+		if w.closed {
+			return
+		}
 		if !o.ignoreDeletes || (op != KeyValueDelete && op != KeyValuePurge) {
 			entry := &kve{
 				bucket:   kv.name,
@@ -1319,7 +1358,9 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 				delta:    delta,
 				op:       op,
 			}
-			w.updates <- entry
+			if !w.send(entry) {
+				return
+			}
 		}
 		// Check if done and initial values.
 		if !w.initDone {
@@ -1338,7 +1379,7 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			// We're done if we've received all expected messages OR there are no more pending.
 			if w.received >= w.initPending || delta == 0 {
 				w.initDone = true
-				w.updates <- nil
+				w.send(nil)
 			}
 		}
 		w.consumer = consumer
@@ -1375,11 +1416,18 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	if err != nil {
 		return nil, err
 	}
+	w.sub = sub
 	sub.SetClosedHandler(func(_ string) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		close(w.updates)
+		w.close()
 	})
+	// The context may have ended, and the subscription been closed, before
+	// the handler was installed. It would then never run.
+	if !sub.IsValid() {
+		w.close()
+		return w, nil
+	}
 	// If there were no pending messages at the time of the creation
 	// of the consumer, send the marker.
 	// Skip if UpdatesOnly() is set, since there will never be updates initially.
@@ -1397,7 +1445,6 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 		// if UpdatesOnly was used, mark initialization as complete
 		w.initDone = true
 	}
-	w.sub = sub
 	return w, nil
 }
 
@@ -1436,8 +1483,40 @@ func (kv *kvs) Keys(ctx context.Context, opts ...WatchOpt) ([]string, error) {
 }
 
 type keyLister struct {
-	watcher KeyWatcher
-	keys    chan string
+	watcher  KeyWatcher
+	keys     chan string
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// newKeyLister lists the keys of watcher's initial values on kl.keys.
+func newKeyLister(ctx context.Context, watcher KeyWatcher) *keyLister {
+	kl := &keyLister{watcher: watcher, keys: make(chan string, 256), stop: make(chan struct{})}
+	go func() {
+		defer close(kl.keys)
+		defer watcher.Stop()
+		for {
+			select {
+			case entry, ok := <-watcher.Updates():
+				if !ok || entry == nil { // nil: all initial values are received
+					return
+				}
+				// The caller may stop reading: see Stop.
+				select {
+				case kl.keys <- entry.Key():
+				case <-kl.stop:
+					return
+				case <-ctx.Done():
+					return
+				}
+			case <-kl.stop:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return kl
 }
 
 // ListKeys will return all keys.
@@ -1449,24 +1528,7 @@ func (kv *kvs) ListKeys(ctx context.Context, opts ...WatchOpt) (KeyLister, error
 	if err != nil {
 		return nil, err
 	}
-	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
-
-	go func() {
-		defer close(kl.keys)
-		defer watcher.Stop()
-		for {
-			select {
-			case entry := <-watcher.Updates():
-				if entry == nil {
-					return
-				}
-				kl.keys <- entry.Key()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-	return kl, nil
+	return newKeyLister(ctx, watcher), nil
 }
 
 // ListKeysFiltered returns a KeyLister for filtered keys in the bucket.
@@ -1477,35 +1539,16 @@ func (kv *kvs) ListKeysFiltered(ctx context.Context, filters ...string) (KeyList
 	if err != nil {
 		return nil, err
 	}
-
-	// Reuse the existing keyLister implementation
-	kl := &keyLister{watcher: watcher, keys: make(chan string, 256)}
-
-	go func() {
-		defer close(kl.keys)
-		defer watcher.Stop()
-
-		for {
-			select {
-			case entry := <-watcher.Updates():
-				if entry == nil { // Indicates all initial values are received
-					return
-				}
-				kl.keys <- entry.Key()
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	return kl, nil
+	return newKeyLister(ctx, watcher), nil
 }
 
 func (kl *keyLister) Keys() <-chan string {
 	return kl.keys
 }
 
+// Stop stops the listing; Keys() is closed.
 func (kl *keyLister) Stop() error {
+	kl.stopOnce.Do(func() { close(kl.stop) })
 	return kl.watcher.Stop()
 }
 
