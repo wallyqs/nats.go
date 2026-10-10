@@ -50,15 +50,16 @@ for cfg in "${cfgs[@]}"; do
   # failure carries a name.
   if [[ $expect_fail -eq 1 ]]; then
     if [[ $rc -ne 0 ]] && grep -q "is violated" "$log"; then
-      echo "violation reproduced: $(grep -m1 'is violated' "$log")"
+      echo "violation reproduced: $(grep -m1 'is violated' "$log" || true)"
     else
       echo "EXPECTED A VIOLATION, got none"; tail -20 "$log"; status=1
     fi
   else
     if [[ $rc -eq 0 ]]; then
-      echo "ok ($(grep -m1 'distinct states found' "$log" | sed 's/.* \([0-9,]*\) distinct states found.*/\1 distinct states/'))"
+      # The last "distinct states found" line is TLC's final count.
+      echo "ok ($(grep 'distinct states found' "$log" | tail -1 | sed 's/.* \([0-9,]*\) distinct states found.*/\1 distinct states/'))"
     else
-      echo "FAILED"; grep -E "is violated|Error|error" "$log" | head -5; status=1
+      echo "FAILED"; { grep -E "is violated|Error|error" "$log" || tail -20 "$log"; } | head -20; status=1
       echo "   full log: $log"
       continue
     fi
