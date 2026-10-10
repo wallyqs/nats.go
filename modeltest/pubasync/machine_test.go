@@ -603,10 +603,11 @@ func TestPublishAsyncMachine(t *testing.T) {
 }
 
 // TestPublishAsyncMachineStallCleanup adds a caller parked in the
-// max-pending stall, so that CleanupPublisher can meet it (PUB-2). zizek shrinks to
-// publish, publish, stalled_publish, cleanup -> lost stall wakeup.
+// max-pending stall, so that CleanupPublisher can meet it (PUB-2, and the
+// PUB-6 window right after the wakeup). Before the fixes zizek shrank to
+// publish, publish, error_ack, publish, stalled_publish, cleanup -> lost
+// stall wakeup.
 func TestPublishAsyncMachineStallCleanup(t *testing.T) {
-	harness.KnownBug(t, "PUB-2")
 	extra := []zizek.Rule[pubMachine]{{Name: "stalled_publish", Apply: (*pubMachine).stallPublish}}
 	if err := runMachine(t, extra, zizek.Config{Seed: 7, Examples: 80, SuppressTooSlow: true}); err != nil {
 		t.Fatal(err)

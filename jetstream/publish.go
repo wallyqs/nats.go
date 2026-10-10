@@ -447,6 +447,11 @@ const (
 func (js *jetStream) newAsyncReply() error {
 	js.publisher.Lock()
 	defer js.publisher.Unlock()
+	return js.ensureAsyncReplyLocked()
+}
+
+// ensureAsyncReplyLocked is newAsyncReply with the lock held.
+func (js *jetStream) ensureAsyncReplyLocked() error {
 	if js.publisher.replySub == nil {
 		// Create our wildcard reply subject.
 		sha := sha256.New()
@@ -653,6 +658,15 @@ func (js *jetStream) registerPAF(paf *pubAckFuture, stallWait time.Duration) (st
 				continue
 			case <-timer.C:
 				return "", ErrTooManyStalledMsgs
+			}
+		}
+		// CleanupPublisher ran since newAsyncReply (it clears the prefix
+		// along with the reply subscription): never register under a
+		// prefix nobody listens on, the future would never be resolved.
+		if js.publisher.replyPrefix == "" {
+			if err := js.ensureAsyncReplyLocked(); err != nil {
+				js.publisher.Unlock()
+				return "", fmt.Errorf("nats: error creating async reply handler: %s", err)
 			}
 		}
 		// Allocate a unique reply token under the insert lock.

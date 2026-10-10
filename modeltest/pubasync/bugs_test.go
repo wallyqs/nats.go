@@ -64,35 +64,50 @@ func TestPUB1TimeoutErrHandlerReentry(t *testing.T) {
 	}
 }
 
-// PUB-2: CleanupPublisher (jetstream.go:1295-1315) deletes every pending
-// future but never calls maybeUnstall, so a PublishMsgAsync parked in
-// registerPAF's stall (publish.go:626-640) is not woken although the
-// publisher is now empty; it sleeps out its whole stall wait and fails with
+// PUB-2: CleanupPublisher (jetstream.go:1295-1315) deleted every pending
+// future but never called maybeUnstall, so a PublishMsgAsync parked in
+// registerPAF's stall (publish.go:626-640) was not woken although the
+// publisher was now empty; it slept out its whole stall wait and failed with
 // ErrTooManyStalledMsgs. Model: PUB2_cleanup_stall_bug.cfg (NoLostStallWakeup).
+//
+// Once woken, the caller registers right after CleanupPublisher removed the
+// reply subscription: exactly the PUB-6 window, so the test also checks
+// that its future is acked (PUB6_cleanup_orphan_bug.cfg, NoOrphanedFuture).
 func TestPUB2CleanupDoesNotWakeStalledPublisher(t *testing.T) {
-	harness.KnownBug(t, "PUB-2")
 	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncMaxPending(1)})
 	if _, err := e.js.PublishAsync("silent.a", nil); err != nil { // holds the only slot
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
+	type result struct {
+		paf jetstream.PubAckFuture
+		err error
+	}
+	done := make(chan result, 1)
 	go func() {
-		_, err := e.js.PublishAsync("s.b", nil, jetstream.WithStallWait(3*time.Second))
-		done <- err
+		paf, err := e.js.PublishAsync("s.b", nil, jetstream.WithStallWait(3*time.Second))
+		done <- result{paf, err}
 	}()
 	waitGoroutine(t, "the max-pending stall", "[select", "registerPAF")
 	e.js.CleanupPublisher()
-	if n := e.js.PublishAsyncPending(); n != 0 {
-		t.Fatalf("pending after cleanup = %d", n)
-	}
 	start := time.Now()
+	var r result
 	select {
-	case err := <-done:
-		if errors.Is(err, jetstream.ErrTooManyStalledMsgs) {
-			t.Fatalf("PUB-2: stalled publish failed with %v after %v although CleanupPublisher emptied the publisher", err, time.Since(start))
+	case r = <-done:
+		if r.err != nil {
+			t.Fatalf("PUB-2: stalled publish failed with %v after %v although CleanupPublisher emptied the publisher", r.err, time.Since(start))
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("PUB-2: stalled publish still parked 1s after CleanupPublisher emptied the publisher (pending=%d)", e.js.PublishAsyncPending())
+	}
+	select {
+	case <-r.paf.Ok():
+	case err := <-r.paf.Err():
+		t.Fatalf("publish woken by CleanupPublisher failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("PUB-6: publish woken by CleanupPublisher was registered under the removed reply subscription and never resolved (pending=%d)", e.js.PublishAsyncPending())
+	}
+	if n := e.js.PublishAsyncPending(); n != 0 {
+		t.Fatalf("pending = %d", n)
 	}
 }
 

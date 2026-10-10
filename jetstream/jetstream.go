@@ -1307,6 +1307,8 @@ func (js *jetStream) CleanupPublisher() {
 		}
 		delete(js.publisher.acks, id)
 	}
+	// wake callers stalled on max pending: there is room now
+	js.maybeUnstall()
 	if js.publisher.doneCh != nil {
 		close(js.publisher.doneCh)
 		js.publisher.doneCh = nil
@@ -1322,6 +1324,9 @@ func (js *jetStream) cleanupReplySub() {
 	if js.publisher.replySub != nil {
 		js.publisher.replySub.Unsubscribe()
 		js.publisher.replySub = nil
+		// registerPAF re-creates the subscription (under a new prefix)
+		// when it sees the prefix cleared.
+		js.publisher.replyPrefix = ""
 	}
 	if js.publisher.connStatusCh != nil {
 		js.conn.RemoveStatusListener(js.publisher.connStatusCh)

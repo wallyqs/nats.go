@@ -19,21 +19,23 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
-	"github.com/nats-io/nats.go/modeltest/harness"
 )
 
 // PUB-6: PublishMsgAsync runs newAsyncReply (publish.go:362, its own lock
 // hold) and registerPAF (publish.go:367, another lock hold) separately. A
 // CleanupPublisher in between unsubscribes the reply subscription and
-// removes the status listener; registerPAF then registers the future under
-// the stale js.publisher.replyPrefix (cleanup keeps it, jetstream.go:1317-1331),
-// the publish goes out with a reply subject nobody listens on, and the
-// future is never resolved (no ack timeout) -- PublishAsyncComplete never
-// closes either. The window is a few instructions wide, so this is a
-// stress test: it races PublishAsync against CleanupPublisher until one
-// future is orphaned. Model: PUB6_cleanup_orphan_bug.cfg (NoOrphanedFuture).
+// removes the status listener; registerPAF then registered the future under
+// the stale js.publisher.replyPrefix (cleanup kept it, jetstream.go:1317-1331),
+// the publish went out with a reply subject nobody listens on, and the
+// future was never resolved (no ack timeout) -- PublishAsyncComplete never
+// closed either. Fixed: cleanup clears the prefix and registerPAF re-creates
+// the subscription when it sees that. The window is a few instructions
+// wide, so this is a stress test: it races PublishAsync against
+// CleanupPublisher and fails if a future is orphaned (before the fix it did
+// within a few hundred rounds); TestPUB2CleanupDoesNotWakeStalledPublisher
+// opens the same window deterministically.
+// Model: PUB6_cleanup_orphan_bug.cfg (NoOrphanedFuture).
 func TestPUB6CleanupRaceOrphansFuture(t *testing.T) {
-	harness.KnownBug(t, "PUB-6")
 	e := newEnv(t, nil)
 	e.warmUp()
 	const rounds = 20000
