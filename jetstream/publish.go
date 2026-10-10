@@ -583,14 +583,20 @@ func (js *jetStream) resetPendingAcksOnReconnect() {
 	js.publisher.Unlock()
 	for {
 		newStatus, ok := <-connStatusCh
-		if !ok || newStatus == nats.CLOSED {
+		if !ok {
 			return
+		}
+		// Fail everything pending: acks for it are lost on a reconnect,
+		// and can never arrive once the connection is closed.
+		failErr := nats.ErrDisconnected
+		if newStatus == nats.CLOSED {
+			failErr = nats.ErrConnectionClosed
 		}
 		js.publisher.Lock()
 		errCb := js.publisher.asyncPublisherOpts.aecb
 		var msgs []*nats.Msg
 		for id, paf := range js.publisher.acks {
-			paf.err = nats.ErrDisconnected
+			paf.err = failErr
 			if paf.errCh != nil {
 				paf.errCh <- paf.err
 			}
@@ -604,10 +610,13 @@ func (js *jetStream) resetPendingAcksOnReconnect() {
 		js.publisher.doneCh = nil
 		js.publisher.Unlock()
 		for _, msg := range msgs {
-			errCb(js, msg, nats.ErrDisconnected)
+			errCb(js, msg, failErr)
 		}
 		if dch != nil {
 			close(dch)
+		}
+		if newStatus == nats.CLOSED {
+			return
 		}
 	}
 }

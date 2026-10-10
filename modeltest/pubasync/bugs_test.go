@@ -288,13 +288,13 @@ func TestPUB4RetryErrorAfterReconnectWedgesPublisher(t *testing.T) {
 	}
 }
 
-// PUB-5: resetPendingAcksOnReconnect returns on CLOSED without failing the
-// pending futures (publish.go:578-581), and nothing else ever will: their
-// Ok()/Err() never fire and PublishAsyncComplete never closes unless an ack
-// timeout was configured. Model: PUB5_closed_never_resolved_bug.cfg
-// (NoStrandedFuture).
+// PUB-5: resetPendingAcksOnReconnect returned on CLOSED without failing the
+// pending futures (publish.go:578-581), and nothing else ever would: their
+// Ok()/Err() never fired and PublishAsyncComplete never closed unless an ack
+// timeout was configured. Fixed: CLOSED fails them with ErrConnectionClosed,
+// like RECONNECTING does with ErrDisconnected.
+// Model: PUB5_closed_never_resolved_bug.cfg (NoStrandedFuture).
 func TestPUB5CloseStrandsPendingFutures(t *testing.T) {
-	harness.KnownBug(t, "PUB-5")
 	e := newEnv(t, nil)
 	paf, err := e.js.PublishAsync("silent.a", []byte("x"))
 	if err != nil {
@@ -304,7 +304,9 @@ func TestPUB5CloseStrandsPendingFutures(t *testing.T) {
 	e.nc.Close()
 	select {
 	case err := <-paf.Err():
-		t.Logf("future failed with %v", err)
+		if !errors.Is(err, nats.ErrConnectionClosed) {
+			t.Fatalf("future failed with %v, want %v", err, nats.ErrConnectionClosed)
+		}
 	case <-paf.Ok():
 		t.Fatal("acked?")
 	case <-time.After(2 * time.Second):
