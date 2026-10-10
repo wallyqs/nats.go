@@ -28,7 +28,7 @@ package reqrep
 //   burst                interleaved requesters + late replies
 //   cut                  Disconnect, Reconnect
 //   close_inflight       Close while requests wait -> NewRecvClosed
-//   request_pub_error    NewPublishErr                  (REQ-1, gated)
+//   request_pub_error    NewPublishErr                  (REQ-1)
 //   unsub_reply_sub      UserUnsubMux                   (REQ-2, gated)
 //
 //   invariant            TLA+ invariant
@@ -523,6 +523,7 @@ func runMachine(t *testing.T, bugRules []zizek.Rule[machineState], cfg zizek.Con
 			{Name: "burst", Apply: (*machineState).burst},
 			{Name: "cut", Apply: (*machineState).cut},
 			{Name: "close_inflight", Apply: (*machineState).closeInflight},
+			{Name: "request_pub_error", Apply: (*machineState).requestPubError},
 		}
 		rules = append(rules, bugRules...)
 		for i := range rules {
@@ -560,19 +561,10 @@ func runMachine(t *testing.T, bugRules []zizek.Rule[machineState], cfg zizek.Con
 	}
 }
 
-// The model's actions without the two known-bug triggers: every invariant
-// must hold.
+// The model's actions without the known-bug trigger: every invariant must
+// hold. request_pub_error (REQ-1, fixed) is part of it.
 func TestStatefulRequestReply(t *testing.T) {
 	runMachine(t, nil, zizek.Config{Examples: 200, Seed: 7, SuppressTooSlow: true})
-}
-
-// Adds the REQ-1 trigger (NewPublishErr). Fails today; zizek shrinks the run
-// to the single step that breaks NoLeak.
-func TestStatefulRequestReplyREQ1(t *testing.T) {
-	harness.KnownBug(t, "REQ-1")
-	runMachine(t, []zizek.Rule[machineState]{
-		{Name: "request_pub_error", Apply: (*machineState).requestPubError},
-	}, zizek.Config{Examples: 200, Seed: 7, SuppressTooSlow: true})
 }
 
 // Adds the REQ-2 trigger (UserUnsubMux). Fails today; zizek shrinks the run

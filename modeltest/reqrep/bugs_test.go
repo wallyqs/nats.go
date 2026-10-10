@@ -52,7 +52,6 @@ func echo(t testing.TB, nc *nats.Conn, subj string) {
 // ---------------------------------------------------------------------------
 
 func TestREQ1RespMapLeaksOnPublishError(t *testing.T) {
-	harness.KnownBug(t, "REQ-1")
 	s := harness.RunServer(t, false)
 	nc := connect(t, s.URL())
 	echo(t, nc, "svc")
@@ -89,7 +88,6 @@ func TestREQ1RespMapLeaksOnPublishError(t *testing.T) {
 // respMap for the lifetime of the connection - reconnecting does not clean
 // them up.
 func TestREQ1RespMapLeaksWhileReconnectBufferFull(t *testing.T) {
-	harness.KnownBug(t, "REQ-1")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	nc := connect(t, p.URL(), nats.ReconnectBufSize(256), nats.ReconnectWait(20*time.Millisecond),

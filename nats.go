@@ -4901,6 +4901,7 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 		// will be on a wildcard.
 		s, err := nc.subscribeLocked(nc.respSub, _EMPTY_, nc.respHandler, nil, nil, false, nil)
 		if err != nil {
+			delete(nc.respMap, token)
 			nc.mu.Unlock()
 			return nil, token, err
 		}
@@ -4909,6 +4910,11 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	nc.mu.Unlock()
 
 	if err := nc.publish(subj, respInbox, false, hdr, data); err != nil {
+		// The caller returns the error without waiting for a response:
+		// remove the entry, nothing else ever would but Close.
+		nc.mu.Lock()
+		delete(nc.respMap, token)
+		nc.mu.Unlock()
 		return nil, token, err
 	}
 
