@@ -136,7 +136,6 @@ func TestREQ1RespMapLeaksWhileReconnectBufferFull(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestREQ2RequestAfterReplySubUnsubscribe(t *testing.T) {
-	harness.KnownBug(t, "REQ-2")
 	for _, how := range []string{"Unsubscribe", "AutoUnsubscribe", "Drain"} {
 		t.Run(how, func(t *testing.T) {
 			s := harness.RunServer(t, false)
@@ -170,7 +169,6 @@ func TestREQ2RequestAfterReplySubUnsubscribe(t *testing.T) {
 // With no deadline the same request never returns: RequestWithContext only
 // comes back when the caller's context ends.
 func TestREQ2RequestWithContextHangs(t *testing.T) {
-	harness.KnownBug(t, "REQ-2")
 	s := harness.RunServer(t, false)
 	nc := connect(t, s.URL())
 	echo(t, nc, "svc")
@@ -192,7 +190,6 @@ func TestREQ2RequestWithContextHangs(t *testing.T) {
 // subscription count to fall to 1 because respMux != nil, which never
 // happens once the mux is gone, so Drain always runs out DrainTimeout.
 func TestREQ2DrainRunsOutTimeout(t *testing.T) {
-	harness.KnownBug(t, "REQ-2")
 	s := harness.RunServer(t, false)
 	nc := connect(t, s.URL(), nats.DrainTimeout(3*time.Second))
 	resp := connect(t, s.URL())

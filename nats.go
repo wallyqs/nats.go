@@ -5295,6 +5295,13 @@ func (nc *Conn) removeSub(s *Subscription) {
 	nc.subsMu.Lock()
 	delete(nc.subs, s.sid)
 	nc.subsMu.Unlock()
+	// The shared response subscription is gone (e.g. a caller unsubscribed
+	// or drained the Sub of a reply, which is nc.respMux): let the next
+	// request create a new one rather than publish requests whose replies
+	// nobody receives.
+	if s == nc.respMux {
+		nc.respMux = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Release callers on NextMsg for SyncSubscription only
