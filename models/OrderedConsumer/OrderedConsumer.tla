@@ -22,6 +22,10 @@
 (* The stream holds messages 1..N, all matching the filter; a server-side  *)
 (* consumer delivers (consumer seq, stream seq) pairs from its start       *)
 (* sequence. Every consumer seq and stream seq is therefore observable.   *)
+(*                                                                         *)
+(* Fixes (fix/ordered) are switched on by overriding the definition of    *)
+(* Fixes in a cfg (CONSTANT Fixes <- AllFixes); left alone, the spec is    *)
+(* the code at 31a3ee4, which the *_bug.cfg reproducers check.            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -42,6 +46,21 @@ CONSTANTS
                      \* ordered ConsumeContext returned by Consume
 
 ASSUME N \in Nat /\ SA \in Nat /\ MaxSubs \in Nat \ {0}
+
+Fixes == {}                    \* the code at 31a3ee4
+AllFixes == {"ORD-3", "ORD-4", "ORD-6", "ORD-7", "ORD-9"}
+\* ORD-3: errHandler calls the user's handler without c.Mutex.
+\* ORD-4: handlerMu is held across the ordered internalHandler, from the
+\*        checks to the end of the user handler.
+\* ORD-6: the reset goroutine checks closed before creating and before
+\*        installing a new inner subscription; the handler drops messages
+\*        once Stop ran (its locked part sets `stopped`, here odone). This
+\*        also covers ORD-11.
+\* ORD-7: a closed connection ends reset() and the inner Consume with
+\*        ErrConnectionClosed, which errHandler turns into Stop().
+\* ORD-9: StopAfter is re-checked under the lock that computes the inner
+\*        StopAfter; the error handler gets the ordered ConsumeContext.
+Fixed(id) == id \in Fixes
 
 \* Error values flowing into orderedConsumer.errHandler (ordered.go:204).
 \*   "hb"         ErrNoHeartbeat                (pull.go:1113)
@@ -69,6 +88,7 @@ VARIABLES
     curS,       \* c.cursor.streamSeq
     delivered,  \* c.deliveredMessages
     rip,        \* c.resetInProgress
+    hmu,        \* holder of c.handlerMu (ORD-4 fix), 0 = free
     doReset,    \* items in c.doReset (buffer 1)
     oclosed,    \* orderedSubscription.closed
     odone,      \* orderedSubscription.done is closed
@@ -94,7 +114,8 @@ VARIABLES
     \* fault budgets
     gaps, hbs, extDels, discs, cfails
 
-cvars == <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, odone, curSub, curCons>>
+cvars0 == <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, odone, curSub, curCons>>
+cvars == <<cvars0, hmu>>
 evars == <<cons, nCons, pendDel, conn>>
 gvars == <<subs, nSubs, rg, usr>>
 ovars == <<obs, active, stopRet, late, lateNew, userErrs>>
@@ -137,7 +158,7 @@ Init ==
     \* Consume() reuses it (ordered.go:85) and starts inner sub 1 with
     \* StopAfter(SA) (ordered.go:107-113,156-160).
     /\ lock = "none" /\ serial = 1 /\ curD = 0 /\ curS = 0 /\ delivered = 0
-    /\ rip = 0 /\ doReset = 0 /\ oclosed = FALSE /\ odone = FALSE
+    /\ rip = 0 /\ hmu = 0 /\ doReset = 0 /\ oclosed = FALSE /\ odone = FALSE
     /\ curSub = 1 /\ curCons = 1
     /\ cons = [k \in 1..MaxCons |-> IF k = 1 THEN [exists |-> TRUE, nD |-> 1, nS |-> 1]
                                     ELSE [exists |-> FALSE, nD |-> 1, nS |-> 1]]
@@ -174,11 +195,14 @@ DPop(i) ==
                          !.derr = "noresp"])
     /\ UNCHANGED <<cvars, evars, nSubs, rg, usr, ovars, bvars>>
 
-\* ordered internalHandler under c.Mutex (ordered.go:121-148)
+\* ordered internalHandler under c.Mutex (ordered.go:121-148). With ORD-4
+\* fixed it first takes handlerMu, released when it returns (DPost).
 DH1(i) ==
     LET s == subs[i]  m == s.dmsg IN
     /\ s.dpc = "h1" /\ Free
-    /\ IF s.ser /= serial THEN                      \* ordered.go:123
+    /\ ~Fixed("ORD-4") \/ hmu = 0
+    /\ hmu' = IF Fixed("ORD-4") THEN i ELSE hmu
+    /\ IF s.ser /= serial \/ (Fixed("ORD-6") /\ odone) THEN   \* ordered.go:123
           /\ SetD(i, [s EXCEPT !.dpc = "hpost"])
           /\ UNCHANGED <<curD, curS, delivered>>
        ELSE IF m.d /= curD + 1 THEN                 \* ordered.go:135-138
@@ -218,7 +242,7 @@ DSt1(i) ==
     /\ s.dpc = "st1"
     /\ IF oclosed THEN SetD(i, [s EXCEPT !.dpc = "hpost"]) /\ UNCHANGED oclosed
        ELSE oclosed' = TRUE /\ SetD(i, [s EXCEPT !.dpc = "st2"])
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 \* orderedSubscription.Stop under c.Mutex (ordered.go:362-367)
@@ -227,7 +251,7 @@ DSt2(i) ==
     /\ s.dpc = "st2" /\ Free
     /\ odone' = TRUE
     /\ subs' = [StopInner(subs, curSub) EXCEPT ![i].dpc = "hpost"]
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 \* pull.go:290-301: delivered++ and StopAfter on the inner subscription;
@@ -235,30 +259,37 @@ DSt2(i) ==
 DPost(i) ==
     LET s == subs[i] IN
     /\ s.dpc = "hpost"
+    /\ hmu' = IF hmu = i THEN 0 ELSE hmu   \* the ordered internalHandler returned
     /\ SetD(i, [s EXCEPT !.dpc = "idle", !.idel = s.idel + 1, !.hb = ~s.unsub,
                          !.closed = s.closed \/ (s.lim > 0 /\ s.idel + 1 = s.lim)])
-    /\ UNCHANGED <<cvars, evars, nSubs, rg, usr, ovars, bvars>>
+    /\ UNCHANGED <<cvars0, evars, nSubs, rg, usr, ovars, bvars>>
 
 DNext(e) == CASE e = "deleted" -> "ehstop"   \* pull.go:282 sub.Stop()
               [] e = "mismatch" -> "hpost"   \* back in pull.go:290
               [] OTHER -> "idle"
 
-\* errHandler called from the dispatcher (ordered.go:137 / pull.go:273,280)
+\* errHandler called from the dispatcher (ordered.go:137 / pull.go:273,280).
+\* "eh2": the rest of errHandler after the user's handler stopped the
+\* consume without c.Mutex (ORD-3 fixed).
 DEh(i) ==
-    LET s == subs[i]  e == s.derr IN
-    /\ s.dpc = "eh" /\ Free
-    /\ userErrs' = AddErr(e)
-    /\ IF SelfStop(e) THEN
+    LET s == subs[i]  e == s.derr  first == s.dpc = "eh" IN
+    /\ s.dpc \in {"eh", "eh2"} /\ Free
+    /\ userErrs' = IF first THEN AddErr(e) ELSE userErrs
+    /\ IF first /\ SelfStop(e) /\ ~Fixed("ORD-3") THEN
           /\ oclosed' = TRUE /\ lock' = <<"d", i>>
           /\ SetD(i, [s EXCEPT !.dpc = "dead"])
           /\ UNCHANGED <<rip, doReset>>
+       ELSE IF first /\ SelfStop(e) THEN
+          \* Stop's CAS; its locked part is DUStop
+          /\ oclosed' = TRUE /\ UNCHANGED <<rip, doReset, lock>>
+          /\ SetD(i, [s EXCEPT !.dpc = "ehus"])
        ELSE IF Trig(e, s.ser) THEN
           /\ rip' = 1 /\ UNCHANGED oclosed
           /\ IF doReset = 0
                 THEN doReset' = 1 /\ UNCHANGED lock /\ SetD(i, [s EXCEPT !.dpc = DNext(e)])
                 ELSE UNCHANGED doReset /\ lock' = <<"d", i>> /\ SetD(i, [s EXCEPT !.dpc = "ehblk"])
        ELSE UNCHANGED <<rip, doReset, lock, oclosed>> /\ SetD(i, [s EXCEPT !.dpc = DNext(e)])
-    /\ UNCHANGED <<serial, curD, curS, delivered, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, odone, curSub, curCons,
                    evars, nSubs, rg, usr, obs, active, stopRet, late, lateNew, bvars>>
 
 \* blocked sending to c.doReset while holding c.Mutex (ordered.go:229)
@@ -267,7 +298,16 @@ DEhBlk(i) ==
     /\ s.dpc = "ehblk" /\ doReset = 0
     /\ doReset' = 1 /\ lock' = "none"
     /\ SetD(i, [s EXCEPT !.dpc = DNext(s.derr)])
-    /\ UNCHANGED <<serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
+                   evars, nSubs, rg, usr, ovars, bvars>>
+
+\* the user's Stop() under c.Mutex, called from the error handler (ORD-3 fixed)
+DUStop(i) ==
+    LET s == subs[i] IN
+    /\ s.dpc = "ehus" /\ Free
+    /\ odone' = TRUE
+    /\ subs' = [StopInner(subs, curSub) EXCEPT ![i].dpc = "eh2"]
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 DEhStop(i) ==
@@ -278,7 +318,7 @@ DEhStop(i) ==
 
 Dispatcher(i) ==
     DPop(i) \/ DH1(i) \/ DRun(i) \/ DEnd(i) \/ DSt1(i) \/ DSt2(i) \/ DPost(i)
-    \/ DEh(i) \/ DEhBlk(i) \/ DEhStop(i)
+    \/ DEh(i) \/ DEhBlk(i) \/ DEhStop(i) \/ DUStop(i)
 
 \* ===========================================================================
 \* Status goroutine of inner subscription i (pull.go:348-428)
@@ -312,13 +352,16 @@ SErr(i) ==
     /\ UNCHANGED <<cvars, evars, nSubs, rg, usr, ovars, bvars>>
 
 SEh(i) ==
-    LET s == subs[i]  e == s.serr IN
-    /\ s.spc = "eh" /\ Free
-    /\ userErrs' = AddErr(e)
-    /\ IF SelfStop(e) THEN
+    LET s == subs[i]  e == s.serr  first == s.spc = "eh" IN
+    /\ s.spc \in {"eh", "eh2"} /\ Free
+    /\ userErrs' = IF first THEN AddErr(e) ELSE userErrs
+    /\ IF first /\ SelfStop(e) /\ ~Fixed("ORD-3") THEN
           /\ oclosed' = TRUE /\ lock' = <<"s", i>>
           /\ SetD(i, [s EXCEPT !.spc = "dead"])
           /\ UNCHANGED <<rip, doReset>>
+       ELSE IF first /\ SelfStop(e) THEN   \* as in DEh
+          /\ oclosed' = TRUE /\ UNCHANGED <<rip, doReset, lock>>
+          /\ SetD(i, [s EXCEPT !.spc = "ehus"])
        ELSE IF e = "closed" THEN
           \* ordered.go:211-216: unlock, then orderedSubscription.Stop()
           /\ SetD(i, [s EXCEPT !.spc = "cst1"])
@@ -329,7 +372,7 @@ SEh(i) ==
                 THEN doReset' = 1 /\ UNCHANGED lock /\ SetD(i, [s EXCEPT !.spc = "post"])
                 ELSE UNCHANGED doReset /\ lock' = <<"s", i>> /\ SetD(i, [s EXCEPT !.spc = "ehblk"])
        ELSE UNCHANGED <<rip, doReset, lock, oclosed>> /\ SetD(i, [s EXCEPT !.spc = "post"])
-    /\ UNCHANGED <<serial, curD, curS, delivered, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, odone, curSub, curCons,
                    evars, nSubs, rg, usr, obs, active, stopRet, late, lateNew, bvars>>
 
 SEhBlk(i) ==
@@ -337,7 +380,15 @@ SEhBlk(i) ==
     /\ s.spc = "ehblk" /\ doReset = 0
     /\ doReset' = 1 /\ lock' = "none"
     /\ SetD(i, [s EXCEPT !.spc = "post"])
-    /\ UNCHANGED <<serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
+                   evars, nSubs, rg, usr, ovars, bvars>>
+
+SUStop(i) ==   \* as DUStop
+    LET s == subs[i] IN
+    /\ s.spc = "ehus" /\ Free
+    /\ odone' = TRUE
+    /\ subs' = [StopInner(subs, curSub) EXCEPT ![i].spc = "eh2"]
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 SCst1(i) ==   \* orderedSubscription.Stop CAS (ordered.go:359)
@@ -345,7 +396,7 @@ SCst1(i) ==   \* orderedSubscription.Stop CAS (ordered.go:359)
     /\ s.spc = "cst1"
     /\ IF oclosed THEN SetD(i, [s EXCEPT !.spc = "post"]) /\ UNCHANGED oclosed
        ELSE oclosed' = TRUE /\ SetD(i, [s EXCEPT !.spc = "cst2"])
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 SCst2(i) ==
@@ -353,7 +404,7 @@ SCst2(i) ==
     /\ s.spc = "cst2" /\ Free
     /\ odone' = TRUE
     /\ subs' = [StopInner(subs, curSub) EXCEPT ![i].spc = "post"]
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, rg, usr, ovars, bvars>>
 
 SPost(i) ==   \* pull.go:421-423
@@ -363,7 +414,8 @@ SPost(i) ==   \* pull.go:421-423
     /\ UNCHANGED <<cvars, evars, nSubs, rg, usr, ovars, bvars>>
 
 Status(i) ==
-    SExit(i) \/ SEv(i) \/ SErr(i) \/ SEh(i) \/ SEhBlk(i) \/ SCst1(i) \/ SCst2(i) \/ SPost(i)
+    SExit(i) \/ SEv(i) \/ SErr(i) \/ SEh(i) \/ SEhBlk(i) \/ SUStop(i) \/ SCst1(i) \/ SCst2(i)
+    \/ SPost(i)
 
 \* pullMessages sees done and runs cleanup: status listener removed, heartbeat
 \* monitor closed, subscription unsubscribed (pull.go:1093-1094, 1120-1150).
@@ -381,7 +433,7 @@ RGSel ==
     /\ rg.pc = "sel"
     /\ \/ doReset = 1 /\ doReset' = 0 /\ SetRG([rg EXCEPT !.pc = "chk"]) /\ UNCHANGED odone
        \/ odone /\ SetRG([rg EXCEPT !.pc = "dn"]) /\ UNCHANGED doReset
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, oclosed, odone, curSub, curCons,
                    evars, subs, nSubs, usr, ovars, bvars>>
 
 RGChk ==   \* ordered.go:166-172
@@ -396,15 +448,17 @@ RGR1 ==    \* reset(): lock, stop current sub, async delete, serial++ (552-571, 
     /\ pendDel' = pendDel \cup {curCons}
     /\ curD' = 0 /\ serial' = serial + 1
     /\ SetRG([rg EXCEPT !.pc = "r2", !.att = 0])
-    /\ UNCHANGED <<curS, delivered, rip, doReset, oclosed, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, curS, delivered, rip, doReset, oclosed, odone, curSub, curCons,
                    cons, nCons, conn, nSubs, usr, ovars, bvars>>
 
 RGR2 ==    \* closed check of every attempt (ordered.go:584-587)
     /\ rg.pc = "r2"
     /\ IF oclosed
           THEN lock' = "none" /\ rip' = 0 /\ SetRG([rg EXCEPT !.pc = "sel"])   \* 174-176
+       ELSE IF Fixed("ORD-7") /\ conn = "closed"     \* ErrConnectionClosed
+          THEN lock' = "none" /\ rip' = 0 /\ SetRG([rg EXCEPT !.pc = "rgcl"])
           ELSE UNCHANGED <<lock, rip>> /\ SetRG([rg EXCEPT !.pc = "r3"])
-    /\ UNCHANGED <<serial, curD, curS, delivered, doReset, oclosed, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, doReset, oclosed, odone, curSub, curCons,
                    evars, subs, nSubs, usr, ovars, bvars>>
 
 \* CreateOrUpdateConsumer (ordered.go:588-594), still holding c.Mutex;
@@ -421,28 +475,34 @@ RGR3 ==
        \/ /\ \/ conn /= "up"
              \/ conn = "up" /\ cfails < MaxCreateFail
           /\ cfails' = IF conn = "up" THEN cfails + 1 ELSE cfails
-          /\ IF MaxReset > 0 /\ rg.att + 1 >= MaxReset
+          /\ IF Fixed("ORD-7") /\ conn = "closed"
+                THEN lock' = "none" /\ rip' = 0 /\ SetRG([rg EXCEPT !.pc = "rgcl"])
+             ELSE IF MaxReset > 0 /\ rg.att + 1 >= MaxReset
                 THEN lock' = "none" /\ rip' = 0 /\ SetRG([rg EXCEPT !.pc = "err", !.att = rg.att + 1])
                 ELSE UNCHANGED <<lock, rip>>
                      /\ SetRG([rg EXCEPT !.pc = "r2", !.att = IF MaxReset > 0 THEN rg.att + 1 ELSE 0])
           /\ UNCHANGED <<cons, nCons, curCons>>
-    /\ UNCHANGED <<serial, curD, curS, delivered, doReset, oclosed, odone, curSub,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, doReset, oclosed, odone, curSub,
                    pendDel, conn, subs, nSubs, usr, ovars, gaps, hbs, extDels, discs>>
 
 \* errHandler(c.serial)(c.currentSub, err) after a failed reset (ordered.go:177)
 RGErr ==
     /\ rg.pc = "err" /\ Free
     /\ userErrs' = AddErr("createfail")
-    /\ IF SelfStop("createfail")
+    /\ IF SelfStop("createfail") /\ ~Fixed("ORD-3")
           THEN oclosed' = TRUE /\ lock' = "rg" /\ SetRG([rg EXCEPT !.pc = "dead"])
+       ELSE IF SelfStop("createfail")
+          THEN oclosed' = TRUE /\ UNCHANGED lock /\ SetRG([rg EXCEPT !.pc = "errus"])
           ELSE UNCHANGED <<oclosed, lock>> /\ SetRG([rg EXCEPT !.pc = "opts"])
-    /\ UNCHANGED <<serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, subs, nSubs, usr, obs, active, stopRet, late, lateNew, bvars>>
 
 RGOpts ==  \* ordered.go:179-182, innerOpts (107-113)
     /\ rg.pc = "opts" /\ Free
-    /\ SetRG([rg EXCEPT !.pc = "cons", !.snap = serial,
-                        !.isa = IF SA > 0 THEN SA - delivered ELSE 0])
+    /\ IF Fixed("ORD-6") /\ oclosed THEN SetRG([rg EXCEPT !.pc = "sel"])
+       ELSE IF Fixed("ORD-9") /\ SA > 0 /\ delivered >= SA THEN SetRG([rg EXCEPT !.pc = "sa1"])
+       ELSE SetRG([rg EXCEPT !.pc = "cons", !.snap = serial,
+                             !.isa = IF SA > 0 THEN SA - delivered ELSE 0])
     /\ UNCHANGED <<cvars, evars, subs, nSubs, usr, ovars, bvars>>
 
 \* currentConsumer.Consume(...) (ordered.go:183). No c.Mutex, no closed check.
@@ -452,6 +512,8 @@ RGCons ==
     /\ rg.pc = "cons"
     /\ IF SA > 0 /\ rg.isa <= 0
           THEN SetRG([rg EXCEPT !.pc = "cerr"]) /\ UNCHANGED <<subs, nSubs>>
+       ELSE IF Fixed("ORD-7") /\ conn = "closed"   \* Subscribe fails: ErrConnectionClosed
+          THEN SetRG([rg EXCEPT !.pc = "rgcl"]) /\ UNCHANGED <<subs, nSubs>>
           ELSE /\ nSubs < MaxSubs
                /\ nSubs' = nSubs + 1
                /\ subs' = [subs EXCEPT ![nSubs + 1] =
@@ -466,18 +528,46 @@ RGCons ==
 RGCErr ==
     /\ rg.pc = "cerr" /\ Free
     /\ userErrs' = AddErr("invalid")
-    /\ IF SelfStop("invalid")
+    /\ IF SelfStop("invalid") /\ ~Fixed("ORD-3")
           THEN oclosed' = TRUE /\ lock' = "rg" /\ SetRG([rg EXCEPT !.pc = "dead"])
+       ELSE IF SelfStop("invalid")
+          THEN oclosed' = TRUE /\ UNCHANGED lock /\ SetRG([rg EXCEPT !.pc = "cerrus"])
           ELSE UNCHANGED <<oclosed, lock>> /\ SetRG([rg EXCEPT !.pc = "sel"])
-    /\ UNCHANGED <<serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, subs, nSubs, usr, obs, active, stopRet, late, lateNew, bvars>>
 
 RGAsg ==   \* ordered.go:186-188
     /\ rg.pc = "asg" /\ Free
-    /\ curSub' = rg.nw
+    /\ IF Fixed("ORD-6") /\ oclosed
+          THEN subs' = StopInner(subs, rg.nw) /\ UNCHANGED curSub   \* cc.Stop(); continue
+          ELSE curSub' = rg.nw /\ UNCHANGED subs
     /\ SetRG([rg EXCEPT !.pc = "sel"])
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, odone, curCons,
-                   evars, subs, nSubs, usr, ovars, bvars>>
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, odone, curCons,
+                   evars, nSubs, usr, ovars, bvars>>
+
+\* ORD-7 fixed: errHandler(c.serial)(sub, ErrConnectionClosed) after reset()
+\* or the inner Consume failed on the closed connection: the user's handler,
+\* then orderedSubscription.Stop(); the goroutine then `continue`s.
+RGCl ==
+    /\ rg.pc = "rgcl" /\ Free
+    /\ userErrs' = AddErr("closed")
+    /\ IF SelfStop("closed") /\ ~Fixed("ORD-3")
+          THEN oclosed' = TRUE /\ lock' = "rg" /\ SetRG([rg EXCEPT !.pc = "dead"])
+       ELSE IF oclosed
+          THEN UNCHANGED <<oclosed, lock>> /\ SetRG([rg EXCEPT !.pc = "sel"])
+          ELSE oclosed' = TRUE /\ UNCHANGED lock /\ SetRG([rg EXCEPT !.pc = "clus"])
+    /\ UNCHANGED <<hmu, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+                   evars, subs, nSubs, usr, obs, active, stopRet, late, lateNew, bvars>>
+
+\* Stop() under c.Mutex from the reset goroutine's error handling (ORD-3,
+\* ORD-7 fixed); afterwards errHandler returns.
+RGUStop ==
+    /\ rg.pc \in {"errus", "cerrus", "clus"} /\ Free
+    /\ odone' = TRUE
+    /\ subs' = StopInner(subs, curSub)
+    /\ SetRG([rg EXCEPT !.pc = IF rg.pc = "errus" THEN "opts" ELSE "sel"])
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
+                   evars, nSubs, usr, ovars, bvars>>
 
 RGDn ==    \* case <-sub.done (ordered.go:190-197)
     /\ rg.pc = "dn" /\ Free
@@ -489,7 +579,7 @@ RGSa1 ==   \* sub.Stop() when StopAfter is reached (ordered.go:169-171)
     /\ rg.pc = "sa1"
     /\ IF oclosed THEN SetRG([rg EXCEPT !.pc = "end"]) /\ UNCHANGED oclosed
        ELSE oclosed' = TRUE /\ SetRG([rg EXCEPT !.pc = "sa2"])
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, subs, nSubs, usr, ovars, bvars>>
 
 RGSa2 ==
@@ -497,11 +587,11 @@ RGSa2 ==
     /\ odone' = TRUE
     /\ subs' = StopInner(subs, curSub)
     /\ SetRG([rg EXCEPT !.pc = "end"])
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, usr, ovars, bvars>>
 
 ResetG == RGSel \/ RGChk \/ RGR1 \/ RGR2 \/ RGR3 \/ RGErr \/ RGOpts \/ RGCons
-          \/ RGCErr \/ RGAsg \/ RGDn \/ RGSa1 \/ RGSa2
+          \/ RGCErr \/ RGAsg \/ RGDn \/ RGSa1 \/ RGSa2 \/ RGCl \/ RGUStop
 
 \* ===========================================================================
 \* User calling Stop() on the ordered ConsumeContext (ordered.go:358-368)
@@ -516,7 +606,7 @@ USt1 ==
     /\ IF oclosed
           THEN usr' = "ret" /\ stopRet' = TRUE /\ UNCHANGED oclosed
           ELSE usr' = "st2" /\ oclosed' = TRUE /\ UNCHANGED stopRet
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, odone, curSub, curCons,
                    evars, subs, nSubs, rg, obs, active, late, lateNew, userErrs, bvars>>
 
 USt2 ==
@@ -524,7 +614,7 @@ USt2 ==
     /\ subs' = StopInner(subs, curSub)
     /\ odone' = TRUE
     /\ usr' = "ret" /\ stopRet' = TRUE
-    /\ UNCHANGED <<lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
+    /\ UNCHANGED <<hmu, lock, serial, curD, curS, delivered, rip, doReset, oclosed, curSub, curCons,
                    evars, nSubs, rg, obs, active, late, lateNew, userErrs, bvars>>
 
 User == UStart \/ USt1 \/ USt2
@@ -699,7 +789,7 @@ NoLeakedSub == odone ~> (\A i \in 1..nSubs : subs[i].unsub)
 SubView(i) == [d |-> subs[i].dpc, s |-> subs[i].spc, ser |-> subs[i].ser,
                cons |-> subs[i].cons, closed |-> subs[i].closed, unsub |-> subs[i].unsub,
                q |-> subs[i].q, errs |-> subs[i].errs, ev |-> subs[i].ev, hb |-> subs[i].hb]
-Alias == [lock |-> lock, serial |-> serial, cur |-> <<curD, curS>>, delivered |-> delivered,
+Alias == [lock |-> lock, hmu |-> hmu, serial |-> serial, cur |-> <<curD, curS>>, delivered |-> delivered,
           rip |-> rip, doReset |-> doReset, oclosed |-> oclosed, odone |-> odone,
           curSub |-> curSub, curCons |-> curCons, conn |-> conn,
           cons |-> [k \in 1..nCons |-> cons[k]], pendDel |-> pendDel,

@@ -3,7 +3,9 @@
 Models of `jetstream/ordered.go` (the `jetstream` package's ordered consumer)
 and the parts of `jetstream/pull.go` it is built on, with tests derived from
 them in `modeltest/ordered/`. Line numbers refer to upstream main at
-`31a3ee4` (the base of this branch).
+`31a3ee4` (the base of this branch), which is the code the findings and the
+`*_bug.cfg` reproducers describe. The fixes are on `fix/ordered`; the
+models can check either version (see "Fixes in the models").
 
 | Spec | Covers |
 |------|--------|
@@ -12,26 +14,26 @@ them in `modeltest/ordered/`. Line numbers refer to upstream main at
 | `OrderedFetch.tla` | `Fetch` / `FetchBytes` / `Next` / `FetchNoWait`: cursor hand-over between successive fetches, `runningFetch`, the mutex |
 
 Run: `TLA2TOOLS=/path/to/tla2tools.jar models/tlc.sh OrderedConsumer`.
-Tests: `cd modeltest && go test -race ./ordered/...` (known-bug reproducers
-run with `MODELTEST_KNOWN_BUGS=1`).
+Tests: `cd modeltest && ./run.sh ./ordered/...` (the reproducer of the
+finding that is still open, ORD-12, runs with `MODELTEST_KNOWN_BUGS=1`).
 
 ## Findings
 
 | Id | Severity | What | Status |
 |----|----------|------|--------|
-| ORD-1 | high | `Fetch`/`FetchBytes` return `ErrOrderedConsumerConcurrentRequests` with the consumer mutex still held; every later call on the consumer blocks forever | confirmed (deterministic) |
-| ORD-2 | high | `FetchNoWait` neither applies nor records the cursor; the next fetch re-delivers the same messages | confirmed (deterministic), also found by zizek |
-| ORD-3 | high | `ConsumeErrHandler` runs with the consumer mutex held; calling `Stop()` on the ordered `ConsumeContext`, or `CachedInfo()`/`Info()`, from it deadlocks | confirmed (deterministic) |
-| ORD-4 | high | Across a reset, the `Consume` handler runs concurrently for two messages and messages can be handled out of order | confirmed (deterministic), also found by zizek |
-| ORD-5 | medium | `Messages`: `Stop()` during a reset leaves a live inner iterator; `Next` after `Stop` keeps returning messages, and the inner subscription leaks | confirmed (scheduler-dependent, ~1 in 20–100 attempts; test repeats up to 600) |
-| ORD-6 | medium | `Consume`: `Stop()` during a reset; the reset goroutine still starts a new inner subscription (and pull) after `Stop` returned, whose messages can reach the handler | confirmed (new pull after Stop: deterministic; late handler call: scheduler-dependent) |
-| ORD-7 | high | Connection closed while `reset()` retries: the consume never ends / `Next` never returns; `ErrConnectionClosed` is never reported | confirmed (deterministic) |
-| ORD-8 | medium | `Next(NextMaxWait/NextContext)` ignores its deadline while resetting | confirmed (deterministic) |
-| ORD-9 | low | StopAfter reached in a narrow window around a reset: the next inner `Consume` gets `StopAfter(0)`, and the user's error handler gets `ErrInvalidOption` with a **nil** `ConsumeContext` | model only (window of a few instructions) |
-| ORD-10 | low (limitation) | A lost message is only detected when a later message arrives; if the lost message was the last one, the consumer stalls until the next publish | model only |
-| ORD-11 | low (inherited) | A message dequeued after `Stop()` returned still reaches the handler (`Stop` returns before the inner subscription is unsubscribed; no layer checks closed) | model only; pull.go behavior |
-| ORD-12 | high | `Messages` never recovers if its server-side consumer disappears while no pull waits (deleted, or removed after `InactiveThreshold` while the app paused) and `Next` is polled with a deadline below two heartbeats | confirmed (deterministic, both triggers) |
-| ORD-13 | low | The ordered default heartbeat (5s) never reaches the inner pull; a stalled pull is detected after 30s, not 10s | confirmed (deterministic) |
+| ORD-1 | high | `Fetch`/`FetchBytes` return `ErrOrderedConsumerConcurrentRequests` with the consumer mutex still held; every later call on the consumer blocks forever | confirmed (deterministic); **fixed on fix/ordered** |
+| ORD-2 | high | `FetchNoWait` neither applies nor records the cursor; the next fetch re-delivers the same messages | confirmed (deterministic), also found by zizek; **fixed on fix/ordered** |
+| ORD-3 | high | `ConsumeErrHandler` runs with the consumer mutex held; calling `Stop()` on the ordered `ConsumeContext`, or `CachedInfo()`/`Info()`, from it deadlocks | confirmed (deterministic); **fixed on fix/ordered** |
+| ORD-4 | high | Across a reset, the `Consume` handler runs concurrently for two messages and messages can be handled out of order | confirmed (deterministic), also found by zizek; **fixed on fix/ordered** |
+| ORD-5 | medium | `Messages`: `Stop()` during a reset leaves a live inner iterator; `Next` after `Stop` keeps returning messages, and the inner subscription leaks | confirmed (scheduler-dependent, ~1 in 20–100 attempts; test repeats up to 600); **fixed on fix/ordered** |
+| ORD-6 | medium | `Consume`: `Stop()` during a reset; the reset goroutine still starts a new inner subscription (and pull) after `Stop` returned, whose messages can reach the handler | confirmed (new pull after Stop: deterministic; late handler call: scheduler-dependent); **fixed on fix/ordered** |
+| ORD-7 | high | Connection closed while `reset()` retries: the consume never ends / `Next` never returns; `ErrConnectionClosed` is never reported | confirmed (deterministic); **fixed on fix/ordered** |
+| ORD-8 | medium | `Next(NextMaxWait/NextContext)` ignores its deadline while resetting | confirmed (deterministic); **fixed on fix/ordered** |
+| ORD-9 | low | StopAfter reached in a narrow window around a reset: the next inner `Consume` gets `StopAfter(0)`, and the user's error handler gets `ErrInvalidOption` with a **nil** `ConsumeContext` | model only (window of a few instructions); **fixed on fix/ordered** (checked by the model) |
+| ORD-10 | low (limitation) | A lost message is only detected when a later message arrives; if the lost message was the last one, the consumer stalls until the next publish | model only; open (limitation) |
+| ORD-11 | low (inherited) | A message dequeued after `Stop()` returned still reaches the handler (`Stop` returns before the inner subscription is unsubscribed; no layer checks closed) | model only; pull.go behavior. **Closed for the ordered consumer on fix/ordered** by the ORD-6 handler check (checked by the model); the pull.go part is left to the pull.go fixes |
+| ORD-12 | high | `Messages` never recovers if its server-side consumer disappears while no pull waits (deleted, or removed after `InactiveThreshold` while the app paused) and `Next` is polled with a deadline below two heartbeats | confirmed (deterministic, both triggers); **open**: the fix is in pull.go (see ORD-12) |
+| ORD-13 | low | The ordered default heartbeat (5s) never reaches the inner pull; a stalled pull is detected after 30s, not 10s | confirmed (deterministic); **fixed on fix/ordered** |
 
 Details, traces and proposed fixes are below. Cross-reference: PUB-7
 (`models/PublishAsync/README.md`), status-listener event loss, discussed at the
@@ -154,77 +156,124 @@ end.
 | `DeadlineHonored` | Messages | (liveness) a `Next` whose deadline passed returns |
 | `StopReturns`, `NoLeakedSub` | Consume | (liveness) Stop returns; every inner subscription is eventually unsubscribed |
 
+## Fixes in the models
+
+Each spec defines `Fixes == {}`, the code at `31a3ee4`, and `AllFixes`, the
+fixes on `fix/ordered` that the spec models. A cfg switches them on by
+overriding the definition: `CONSTANT Fixes <- AllFixes`. The `*_bug.cfg`
+reproducers leave it alone and keep checking the old code.
+
+| Spec | `AllFixes` | Modeled as |
+|------|------------|------------|
+| `OrderedFetch` | ORD-1, ORD-2 | the rejected call leaves `lock = "none"`; `FetchNoWait` takes the `Fetch` path (`F1`) and its result is recorded as `runningFetch` |
+| `OrderedConsumer` | ORD-3, ORD-4, ORD-6, ORD-7, ORD-9 | ORD-3: the user's `Stop()` from the error handler is its CAS plus a locked step (`DUStop`/`SUStop`/`RGUStop`), after which the handler continues (`eh2`). ORD-4: a new variable `hmu` (holder of `handlerMu`) taken in `DH1`, released in `DPost`. ORD-6: `RGOpts` and `RGAsg` check `oclosed`; `DH1` drops messages once `odone` (the `stopped` flag; Drain is not modeled). ORD-7: `RGR2`/`RGR3`/`RGCons` on a closed connection go to `RGCl` (report, then `Stop`). ORD-9: `RGOpts` re-checks StopAfter |
+| `OrderedMessages` | ORD-5, ORD-7, ORD-8 | ORD-5: `NAsg` stops the new iterator when `oclosed`. ORD-7: `NR2`/`NR3`/`NMsgs` on a closed connection go to `NCst1`. ORD-8: `NR2` returns once the deadline passed and sets `nx.pend`, which the next `NCall` turns into a reset; the deadline is not restarted after a reset |
+
+Every passing cfg runs the fixed code, and each `*_bug.cfg` of a fixed
+finding has a `*_fixed.cfg` counterpart: the same scenario with the fixes,
+expected to pass. Two of them use smaller bounds than their `_bug` twin,
+because the full state space with liveness was too large (both still
+violate their property without the override, measured):
+`CloseDuringReset_fixed.cfg` has `N = 0` (with `N = 1` the space is 7.6M
+states before the liveness check), and `OrderedMessages_timeout_fixed.cfg`
+triggers the reset with the forced missed heartbeat instead of a deletion.
+One abstraction was added for ORD-8: a reset retried after the deadline
+interrupted it reuses the serial (`NR1`), which keeps the state space finite
+when every `Next` call times out; the interrupted reset created no consumer
+in the model, so the label is unused.
+
+ORD-12 (pull.go) is not modeled as fixed: `OrderedMessages_noresp_bug.cfg`
+still fails with the ordered fixes, as expected. ORD-10 is open and ORD-13
+is timing, which the models do not represent.
+
 ## TLC results (measured)
 
-TLC 2026.10.06, `-workers auto` on 4 cores (shared with other runs).
+TLC 2026.10.06, `-workers auto` on 4 cores shared with other runs (load
+average 8–10 during the measurement), one `models/tlc.sh` call per cfg on
+fix/ordered. `*_bug.cfg` check the code at `31a3ee4`; every other cfg checks
+the fixed code (`Fixes <- AllFixes`).
 
 | Config | Spec | Checks | Result | Distinct states | Time |
 |--------|------|--------|--------|-----------------|------|
-| `OrderedConsumer.cfg` | Consume | safety; Lose + HbFault | pass | 595,102 | 18s |
-| `ExtDelete.cfg` | Consume | safety; ExtDelete + Lose | pass | 2,198,761 | 60s |
-| `Reconnect.cfg` | Consume | safety; reconnect | pass | 210,328 | 7s |
-| `Live.cfg` | Consume | AllDelivered; HbFault | pass | 14,367 | 4s |
-| `Live_del.cfg` | Consume | AllDelivered; ExtDelete | pass | 50,652 | 8s |
-| `Live_disc.cfg` | Consume | AllDelivered; reconnect | pass | 210,328 | 27s |
-| `Live_stop.cfg` | Consume | StopReturns, NoLeakedSub; Stop + HbFault | pass | 377,559 | 2m00s |
-| `StopAfter.cfg` | Consume | StopAfter = 1; HbFault | pass | 34,057 | 6s |
-| `ConcurrentHandler_bug.cfg` | Consume | ORD-4 `SerialHandler` | violated | 35,872 | 2s |
-| `OutOfOrder_bug.cfg` | Consume | ORD-4 `InOrder` | violated | 25,697 | 2s |
-| `ErrHandlerStop_bug.cfg` | Consume | ORD-3 `NoSelfDeadlock` | violated | 54 | 1s |
-| `StopResurrect_bug.cfg` | Consume | ORD-6 `NoResurrectedDelivery` | violated | 12,591 | 2s |
-| `CloseDuringReset_bug.cfg` | Consume | ORD-7 `CloseEndsConsume` | violated | 16,490 | 4s |
-| `StopAfterInvalid_bug.cfg` | Consume | ORD-9 `NoSpuriousInvalid` | violated | 12,248 | 2s |
-| `TailLoss_bug.cfg` | Consume | ORD-10 `AllDelivered` | violated | 994 | 1s |
-| `DeliveryAfterStop_bug.cfg` | Consume | ORD-11 `NoDeliveryAfterStop` | violated | 151 | 1s |
-| `OrderedMessages.cfg` | Messages | safety; Lose + HbFault | pass | 11,753 | 1s |
+| `CloseDuringReset_bug.cfg` | Consume | ORD-7 `CloseEndsConsume` | violated | — | 4s |
+| `CloseDuringReset_fixed.cfg` | Consume | ORD-7 fixed: `CloseEndsConsume` (N = 0) | pass | 372,676 | 2m02s |
+| `ConcurrentHandler_bug.cfg` | Consume | ORD-4 `SerialHandler` | violated | — | 2s |
+| `ConcurrentHandler_fixed.cfg` | Consume | ORD-4 fixed: `SerialHandler` | pass | 168,418 | 6s |
+| `DeliveryAfterStop_bug.cfg` | Consume | ORD-11 `NoDeliveryAfterStop` | violated | — | 1s |
+| `DeliveryAfterStop_fixed.cfg` | Consume | ORD-11 (ORD-6 fix): `NoDeliveryAfterStop` | pass | 486 | 1s |
+| `ErrHandlerStop_bug.cfg` | Consume | ORD-3 `NoSelfDeadlock` | violated | — | 1s |
+| `ErrHandlerStop_fixed.cfg` | Consume | ORD-3 fixed: `NoSelfDeadlock` | pass | 180,444 | 6s |
+| `ExtDelete.cfg` | Consume | safety incl. `InOrder`, `SerialHandler`; ExtDelete + Lose | pass | 1,366,669 | 39s |
+| `Live.cfg` | Consume | AllDelivered; HbFault | pass | 11,181 | 4s |
+| `Live_del.cfg` | Consume | AllDelivered; ExtDelete | pass | 44,028 | 7s |
+| `Live_disc.cfg` | Consume | AllDelivered; reconnect | pass | 168,418 | 23s |
+| `Live_stop.cfg` | Consume | StopReturns, NoLeakedSub, no delivery after Stop; Stop + HbFault | pass | 462,837 | 2m16s |
+| `OrderedConsumer.cfg` | Consume | safety incl. `InOrder`, `SerialHandler`; Lose + HbFault | pass | 332,352 | 12s |
+| `OutOfOrder_bug.cfg` | Consume | ORD-4 `InOrder` | violated | — | 3s |
+| `OutOfOrder_fixed.cfg` | Consume | ORD-4 fixed: `InOrder` | pass | 168,418 | 5s |
+| `Reconnect.cfg` | Consume | safety incl. `InOrder`, `SerialHandler`; reconnect | pass | 168,418 | 6s |
+| `StopAfter.cfg` | Consume | StopAfter = 1 incl. `InOrder`; HbFault | pass | 47,779 | 9s |
+| `StopAfterInvalid_bug.cfg` | Consume | ORD-9 `NoSpuriousInvalid` | violated | — | 2s |
+| `StopAfterInvalid_fixed.cfg` | Consume | ORD-9 fixed: `NoSpuriousInvalid` | pass | 641,520 | 15s |
+| `StopResurrect_bug.cfg` | Consume | ORD-6 `NoResurrectedDelivery` | violated | — | 2s |
+| `StopResurrect_fixed.cfg` | Consume | ORD-6 fixed: `NoResurrectedDelivery` | pass | 462,837 | 12s |
+| `TailLoss_bug.cfg` | Consume | ORD-10 `AllDelivered` (open) | violated | — | 2s |
+| `OrderedMessages.cfg` | Messages | safety; Lose + HbFault | pass | 11,753 | 2s |
+| `OrderedMessages_close_bug.cfg` | Messages | ORD-7 `CloseEndsNext` | violated | — | 2s |
+| `OrderedMessages_close_fixed.cfg` | Messages | ORD-7 fixed: `CloseEndsNext` | pass | 5,127 | 2s |
 | `OrderedMessages_live.cfg` | Messages | AllDelivered + safety; HbFault + ExtDelete | pass | 142,999 | 14s |
 | `OrderedMessages_live_del.cfg` | Messages | AllDelivered + safety; ExtDelete | pass | 2,521 | 2s |
 | `OrderedMessages_live_disc.cfg` | Messages | AllDelivered + safety; reconnect | pass | 8,756 | 2s |
-| `OrderedMessages_stopafter.cfg` | Messages | StopAfter = 1; HbFault + ExtDelete | pass | 251,917 | 26s |
-| `OrderedMessages_resurrect_bug.cfg` | Messages | ORD-5 `NoMsgAfterStop` | violated | 19,038 | 2s |
-| `OrderedMessages_close_bug.cfg` | Messages | ORD-7 `CloseEndsNext` | violated | 3,787 | 2s |
-| `OrderedMessages_timeout_bug.cfg` | Messages | ORD-8 `DeadlineHonored` | violated | 28,909 | 4s |
-| `OrderedMessages_noresp_bug.cfg` | Messages | ORD-12 `AllDelivered` | violated | 426 | 1s |
-| `OrderedFetch.cfg` | Fetch | `InOrder`, Fetch only, calls may overlap | pass | 1,035 | 1s |
-| `OrderedFetch_locked_bug.cfg` | Fetch | ORD-1 `LockFree` | violated | 31 | 1s |
-| `OrderedFetch_nowait_bug.cfg` | Fetch | ORD-2 `InOrder` | violated | 92 | 1s |
+| `OrderedMessages_noresp_bug.cfg` | Messages | ORD-12 `AllDelivered` | violated | — | 1s |
+| `OrderedMessages_resurrect_bug.cfg` | Messages | ORD-5 `NoMsgAfterStop` | violated | — | 2s |
+| `OrderedMessages_resurrect_fixed.cfg` | Messages | ORD-5 fixed: `NoMsgAfterStop` | pass | 48,847 | 2s |
+| `OrderedMessages_stopafter.cfg` | Messages | StopAfter = 1; HbFault + ExtDelete | pass | 251,917 | 24s |
+| `OrderedMessages_timeout_bug.cfg` | Messages | ORD-8 `DeadlineHonored` | violated | — | 4s |
+| `OrderedMessages_timeout_fixed.cfg` | Messages | ORD-8 fixed: `DeadlineHonored` (reset by missed heartbeat) | pass | 182,226 | 17s |
+| `OrderedFetch.cfg` | Fetch | `InOrder`, `LockFree`, `CallsReturn`; Fetch + FetchNoWait, calls may overlap | pass | 2,544 | 1s |
+| `OrderedFetch_locked_bug.cfg` | Fetch | ORD-1 `LockFree` | violated | — | 1s |
+| `OrderedFetch_locked_fixed.cfg` | Fetch | ORD-1 fixed: `LockFree`, `CallsReturn` | pass | 92 | 1s |
+| `OrderedFetch_nowait_bug.cfg` | Fetch | ORD-2 `InOrder` | violated | — | 1s |
+| `OrderedFetch_nowait_fixed.cfg` | Fetch | ORD-2 fixed: `InOrder` | pass | 77 | 1s |
 
-For violated configs the state count is the number explored when TLC
-stopped. Total wall time for all 28 configs is about 6 minutes. Bigger fault
-combinations with liveness ran out of the 15-minute budget: Messages with
-HbFault + ExtDelete + reconnect, and Consume with every fault at once.
-Those combinations are split across the configs above.
+`tlc.sh` does not print the state count of a violation, hence "—"; TLC stops
+at the first one. Total wall time for all 40 configs: 9m17s (a second run
+of `models/tlc.sh OrderedConsumer` passed in 15m29s under heavier load).
+Times vary with the load: `CloseDuringReset_bug.cfg` took 1m05s in the timed
+loop and 4s when re-run at load average 3 (the 4s is in the table). Bigger fault combinations with liveness ran out of the
+15-minute budget when the models were written: Messages with HbFault +
+ExtDelete + reconnect, and Consume with every fault at once. Those
+combinations are split across the configs above.
 
-**Note on `models/tlc.sh`:** it detects a reproduced violation by grepping
-"is violated". TLC reports a violated *temporal* property as "Temporal
-property X **was** violated", so the runner prints "EXPECTED A VIOLATION, got
-none" for the liveness reproducers. Those are `CloseDuringReset_bug`,
-`TailLoss_bug`, `OrderedMessages_close_bug`, `OrderedMessages_timeout_bug`
-and `OrderedMessages_noresp_bug`. Run directly, TLC does report their
-violations as listed above. I did not edit the shared script. Matching
-`"is violated|was violated"` there would fix it.
+`models/tlc.sh` matches both "is violated" and "was violated", so the
+liveness reproducers (`CloseDuringReset_bug`, `TailLoss_bug`,
+`OrderedMessages_close_bug`, `OrderedMessages_timeout_bug`,
+`OrderedMessages_noresp_bug`) are reported as reproduced.
 
-The baseline ("pass") results do not include the bugs above, because each
-bug lives in its own config. For example, `InOrder` is violated in any Consume
-config with a reconnect (ORD-4), so the Consume safety baselines check
-`NoDupNoGap`. Liveness configs leave out `Lose`, because of ORD-10.
+Each bug still lives in its own config, but the baselines now run the fixed
+code, so the Consume safety baselines check `InOrder` and `SerialHandler`
+(ORD-4) in addition to `NoDupNoGap`. Liveness configs still leave out
+`Lose`, because of ORD-10.
 
 ## Tests (`modeltest/ordered`)
 
-* `bugs_test.go`: one reproducer per confirmed finding, gated by
-  `harness.KnownBug`. Each asserts the correct behavior, so it fails today.
+* `bugs_test.go`: one reproducer per confirmed finding. Each asserts the
+  correct behavior. On fix/ordered they are regression tests that run by
+  default, except ORD-12 (open), which stays behind `harness.KnownBug`.
+  The ORD-7 and ORD-8 tests also check the error `Next` returns, and ORD-8
+  checks that the next call completes the interrupted reset.
 * `stateful_test.go`: zizek state machines whose rules are the model's actions.
   Rules: publish, cut connection (Disconnect + Reconnect), restart server,
   delete server-side consumer (ExtDelete), steal a message with a separate pull
-  (Lose), `next`, `fetch`, `fetchBytes`, and `settle`
-  (AllDelivered, with a timeout above 2 × 15s because of ORD-13). The
-  invariants are the model's: `InOrder`, and for Consume also `SerialHandler`.
-  * `TestStatefulConsume`, `TestStatefulMessages` and `TestStatefulFetch` pass
-    (15 examples each, fixed seeds, ≤ 10–15 steps; about 40s, 10s and 20s).
-  * `TestStatefulConsumeKnownBugs` adds a "slow handler + cut" rule and
-    shrinks to that single step: `user got stream sequences [2 1]` (ORD-4).
-  * `TestStatefulFetchKnownBugs` adds `fetchNoWait` and shrinks to publish →
-    fetch → fetchNoWait: `[1 1]` (ORD-2).
+  (Lose), "slow handler + cut" (Consume, ORD-4), `next`, `fetch`,
+  `fetchBytes`, `fetchNoWait` (ORD-2), and `settle` (AllDelivered, 45s
+  timeout). The invariants are the model's: `InOrder`, and for Consume also
+  `SerialHandler`. The rules that hit ORD-4 and ORD-2 used to live in
+  `*KnownBugs` variants, where zizek shrank them to a single "slow handler +
+  cut" step (`user got stream sequences [2 1]`) and to publish → fetch →
+  fetchNoWait (`[1 1]`); they are part of the default machines now. The
+  Messages machine still issues the first pull before any rule runs
+  (ORD-12).
 * `helpers_test.go`: two environment tools.
   * **JetStream API relay.** The client uses API prefix `RLY.`, and a second
     connection forwards each request to `$JS.API.` with the client's reply
@@ -237,8 +286,14 @@ config with a reconnect (ORD-4), so the Consume safety baselines check
     a pull on a missing consumer gets no 503. The tests that depend on 503
     (ORD-12, the stateful tests) do not use the relay.
 
-`go test -race ./ordered/...` passes. With `MODELTEST_KNOWN_BUGS=1` every
-reproducer fails as described below.
+Measured on fix/ordered (`ZIZEK_DIR=… modeltest/run.sh ./ordered/...`, `-race`,
+4 shared cores): the default run passes in 88s (`TestStatefulConsume` 13s,
+`TestStatefulMessages` 9s, `TestStatefulFetch` 22s, ORD-5 17s for its 600
+attempts, ORD-13 10s). With `MODELTEST_KNOWN_BUGS=1` only
+`TestORD12MessagesStuckAfterSilentConsumerLoss` fails ("no message within 15s
+of polling", both variants). ORD-5 passed all 600 attempts in each of 11
+runs (8 with `-race`, 3 without). On the base commit (re-run with
+`MODELTEST_KNOWN_BUGS=1`) every reproducer fails as described below.
 
 ---
 
@@ -278,6 +333,10 @@ again.
  		}
 ```
 (in both `Fetch` and `FetchBytes`).
+
+*Fixed on fix/ordered* as proposed. `Fetch`, `FetchBytes` and `FetchNoWait`
+also assign `runningFetch` under the mutex. `OrderedFetch_locked_fixed.cfg`
+passes.
 
 ## ORD-2 — FetchNoWait re-delivers messages (high)
 
@@ -341,6 +400,10 @@ starts the consumer at `curS + 1 = 1`; `obs = <<1, 2, 1, …>>`.
 (`Fetch`/`FetchBytes` should also assign `runningFetch` under the lock; today
 line 443 and line 483 race with a concurrent caller's read at 420.)
 
+*Fixed on fix/ordered* as proposed. `fetchNoWait` is now a rule of the
+default `TestStatefulFetch` machine; `OrderedFetch_nowait_fixed.cfg` and
+`OrderedFetch.cfg` (Fetch and FetchNoWait, fixed code) pass.
+
 ## ORD-3 — ConsumeErrHandler runs under the consumer mutex (high)
 
 `errHandler` locks `c` and calls `c.userErrHandler(cc, err)` while holding it
@@ -385,6 +448,12 @@ Separately, the `cc` passed to the user is usually the *inner*
 subscription and not the ordered consume, whose `Closed()` then never fires.
 At ordered.go:184 it is even a nil `ConsumeContext` (see ORD-9). Passing the
 ordered subscription would be less surprising.
+
+*Fixed on fix/ordered* as proposed: the handler is read under the lock and
+called without it. The `cc` the inner subscriptions pass is unchanged; the
+errors the reset goroutine reports (a failed reset, a failed inner
+`Consume`) now carry the ordered `ConsumeContext` instead of the stopped
+inner subscription or nil (see ORD-9). `ErrHandlerStop_fixed.cfg` passes.
 
 ## ORD-4 — Consume handler runs concurrently / out of order across a reset (high)
 
@@ -432,6 +501,13 @@ A stale dispatcher then waits for the running handler, re-checks the serial
 and drops its message. `Stop()` from inside the handler takes only `c`, so it
 is unaffected.
 
+*Fixed on fix/ordered* as proposed (`handlerMu`, taken before `c.Mutex`;
+nothing takes it while holding `c.Mutex`). The "slow handler + cut" rule is
+part of the default `TestStatefulConsume` machine. `ConcurrentHandler_fixed.cfg`
+and `OutOfOrder_fixed.cfg` pass, and the Consume safety baselines
+(`OrderedConsumer.cfg`, `ExtDelete.cfg`, `Reconnect.cfg`) now also check
+`InOrder` and `SerialHandler`.
+
 ## ORD-5 — Messages: Next returns messages after Stop (medium)
 
 Sequence of events:
@@ -477,6 +553,10 @@ returned stream seq N".
 ```
 `Stop` CASes before locking. If the CAS comes after this check, `Stop` waits
 for the mutex and then stops the new iterator.
+
+*Fixed on fix/ordered* as proposed. `OrderedMessages_resurrect_fixed.cfg`
+passes; the test passed all 600 attempts in each of 11 runs (8 with
+`-race`, 3 without).
 
 ## ORD-6 — Consume: new inner subscription after Stop (medium)
 
@@ -533,6 +613,15 @@ is closed. The handler check also covers ORD-11 for the ordered consumer.
  			}
 ```
 
+*Fixed on fix/ordered*, with one change to the proposal: the handler check
+uses a new `stopped` flag, set by `Stop` under `c.Mutex`, instead of
+`closed`. `Drain` sets `closed` too, and a drained consume must keep handing
+buffered messages to the handler (`jetstream/test` "wait for closed after
+drain"). The reset goroutine also reads `currentSub` under the mutex in its
+`done` case. `StopResurrect_fixed.cfg` and `DeliveryAfterStop_fixed.cfg`
+(ORD-11) pass, and `Live_stop.cfg` now also checks `NoResurrectedDelivery`,
+`NoDeliveryAfterStop` and `AtMostOneLive`.
+
 ## ORD-7 — Connection closed during a reset: never ends (high)
 
 `reset()` first stops the current inner subscription, whose status goroutine
@@ -572,6 +661,17 @@ In the Consume reset goroutine, add `if errors.Is(err, ErrConnectionClosed) {
 continue }` after reporting, so it does not try `Consume` on the closed
 connection.
 
+*Fixed on fix/ordered.* `reset()` returns `jetstream.ErrConnectionClosed`
+(the error `errHandler` and the inner status goroutine use) when the
+connection is closed before an attempt or the attempt fails with
+`nats.ErrConnectionClosed`. The Consume reset goroutine reports it and
+`continue`s; an inner `Consume` that fails on a connection closed right
+after the reset is reported as `ErrConnectionClosed` too. Messages' `Next`
+stops the iterator and returns `ErrMsgIteratorClosed` wrapping
+`ErrConnectionClosed`, as pull.go does. `Fetch` on a closed connection now
+returns `ErrConnectionClosed` instead of retrying forever.
+`CloseDuringReset_fixed.cfg` and `OrderedMessages_close_fixed.cfg` pass.
+
 ## ORD-8 — Next deadline ignored during a reset (medium)
 
 `Next(NextMaxWait(d))` and `Next(NextContext(ctx))` bound only the inner
@@ -605,6 +705,25 @@ model mirrors this in `NAsg`.
 * On `ctx` expiry, `Next` returns `nats.ErrTimeout`/`ctx.Err()` and remembers
   that a reset is pending, so the next call retries it.
 
+*Fixed on fix/ordered* along the sketch:
+* `reset(ctx)`: each attempt's 10s timeout derives from `ctx`, no attempt
+  starts once `ctx` is done, and `ctx.Done()` is the backoff's `cancel`
+  (replacing `c.subscription.done`, which cannot close while `reset()`
+  holds the mutex). `retryWithBackoff` returns `nil` when canceled, so
+  `reset()` then returns `ctx.Err()`; this removes the latent nil-consumer
+  panic noted under "Other observations".
+* `Next` computes the deadline of `NextMaxWait` once and gives every inner
+  `Next` the time remaining; `NextContext` is passed through. On expiry
+  during a reset it returns `nats.ErrTimeout` (or the context's error) and
+  sets `resetPending`; the next call completes the reset before reading.
+* Consume and Fetch pass `context.Background()`.
+
+The test also checks the error and that the next call delivers. In the
+model, `OrderedMessages_timeout_fixed.cfg` passes. It triggers the reset
+with the forced missed heartbeat rather than a deletion, because with both
+the full state space is too large for the liveness check; without the
+`Fixes` override it still violates `DeadlineHonored`.
+
 ## ORD-9 — StopAfter(0) after a reset; nil ConsumeContext to the error handler (low, model only)
 
 The reset goroutine checks `deliveredMessages >= stopAfter` (ordered.go:166-172)
@@ -634,6 +753,11 @@ open.
 +				}
  				serial := c.serial
 ```
+
+*Fixed on fix/ordered* as proposed. The errors the reset goroutine reports
+also carry the ordered `ConsumeContext` (never nil). `StopAfterInvalid_fixed.cfg`
+passes, and `StopAfter.cfg` now also checks `InOrder` and
+`NoSpuriousInvalid`.
 
 ## ORD-10 — a lost tail message stalls the consumer (low / limitation, model only)
 
@@ -665,6 +789,10 @@ layer checks `closed`. This is pull.go behavior (see the PullConsume model);
 the handler check in the ORD-6 fix closes it for the ordered consumer.
 
 *Trace*: `DeliveryAfterStop_bug.cfg`. Not separately tested.
+
+*Status on fix/ordered*: closed for the ordered consumer by the ORD-6
+handler check (`stopped`); `DeliveryAfterStop_fixed.cfg` passes. The
+pull.go behavior itself is left to the pull.go fixes.
 
 ## ORD-12 — Messages stuck after its consumer is lost silently (high)
 
@@ -712,6 +840,13 @@ ordered `Next`, so it resets.
  				continue
 ```
 
+*Not fixed on fix/ordered.* The fix is in pull.go, which is outside this
+branch's scope; the ordered side needs no change, because `ErrNoResponders`
+is not in the direct-return list of ordered `Next` and therefore resets.
+`TestORD12MessagesStuckAfterSilentConsumerLoss` stays behind
+`harness.KnownBug`, and `OrderedMessages_noresp_bug.cfg` still violates
+`AllDelivered` with the ordered fixes switched on.
+
 ## ORD-13 — ordered default heartbeat not applied (low)
 
 `setDefaults(ordered=true)` picks a 5s heartbeat for ordered consumers
@@ -734,6 +869,12 @@ pull, and no reset occurs within 15s.
 ```
 (likewise in `Messages`).
 
+*Fixed on fix/ordered*, with a private option instead of `PullHeartbeat`
+that sets the heartbeat the ordered parse resolved (and already validated).
+A user's `PullHeartbeat` passes through unchanged. Behavior change: ordered `Consume`/`Messages` pull requests carry a 5s idle
+heartbeat by default (was 15s). Measured: the test's reset happens after
+10.0s. Not modeled (timing).
+
 ## Other observations (not findings)
 
 * **`Stop()` latency.** `reset()` holds `c.Mutex` across
@@ -743,6 +884,9 @@ pull, and no reset occurs within 15s.
   `done` is closed only under the same mutex. If it did fire,
   `retryWithBackoff` would return `nil` and `cons.(*pullConsumer)` would panic
   on a nil interface (ordered.go:599). That is latent, not reachable today.
+  On fix/ordered the latency remains (bounded by `Next`'s deadline for
+  Messages, ORD-8); `cancel` is the reset's context and `reset()` returns its
+  error when canceled, so the nil-interface panic is gone.
 * **Messages vs Consume on 503.** `Messages` resets on no-responders only
   through the heartbeat (ORD-12); `Consume` resets immediately.
 * **`Consume` after `Stop`.** A second `Consume` on the same ordered consumer
