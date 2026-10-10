@@ -986,7 +986,7 @@ func (p *pullConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, error) 
 // FetchBytes is used to retrieve up to a provided bytes from the stream.
 func (p *pullConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBatch, error) {
 	req := &pullRequest{
-		Batch:     defaultBatchMaxBytesOnly,
+		Batch:     p.fetchBytesBatch(maxBytes),
 		MaxBytes:  maxBytes,
 		Expires:   DefaultExpires,
 		Heartbeat: unset,
@@ -1015,6 +1015,23 @@ func (p *pullConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBatch,
 	}
 
 	return p.fetch(req)
+}
+
+// fetchBytesBatch returns the batch size of a FetchBytes request: the most
+// messages that can fit in maxBytes, capped at defaultBatchMaxBytesOnly.
+// The server counts at least a message's subject and its ack reply subject
+// against max_bytes, and the ack subject starts with
+// "$JS.ACK.<stream>.<consumer>.", so no more messages than that can ever
+// arrive. fetch sizes its buffers by the batch: asking for a million
+// messages allocated about 30 MB of channels on every call, whatever
+// maxBytes was. A server that counted less would at worst return fewer
+// messages than fit, which FetchBytes ("up to maxBytes") allows.
+func (p *pullConsumer) fetchBytesBatch(maxBytes int) int {
+	if maxBytes <= 0 {
+		return defaultBatchMaxBytesOnly
+	}
+	minMsgSize := len("$JS.ACK.") + len(p.stream) + 1 + len(p.name) + 1 + 1 // + a 1-byte subject
+	return min(maxBytes/minMsgSize+1, defaultBatchMaxBytesOnly)
 }
 
 // FetchNoWait sends a single request to retrieve given number of messages.

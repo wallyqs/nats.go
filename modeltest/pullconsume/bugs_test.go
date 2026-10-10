@@ -452,7 +452,6 @@ func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
 // with PullMaxBytes likewise allocates an 8 MB channel (pull.go:534,
 // MaxMessages = 1,000,000 at pull.go:1222).
 func TestPULL9FetchBytesAllocatesChannelsForAMillionMessages(t *testing.T) {
-	harness.KnownBug(t, "PULL-9")
 	e := newEnv(t)
 	e.publish(1)
 	var before, after runtime.MemStats
@@ -462,10 +461,27 @@ func TestPULL9FetchBytesAllocatesChannelsForAMillionMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := 0
 	for range batch.Messages() {
+		got++
 	}
 	runtime.ReadMemStats(&after)
 	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 4<<20 {
 		t.Fatalf("FetchBytes(1024) allocated %d MB", alloc>>20)
+	}
+	if got != 1 {
+		t.Fatalf("FetchBytes(1024) returned %d messages, want 1", got)
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	it, err := e.cons.Messages(jetstream.PullMaxBytes(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Stop()
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 4<<20 {
+		t.Fatalf("Messages(PullMaxBytes(1024)) allocated %d MB", alloc>>20)
 	}
 }
