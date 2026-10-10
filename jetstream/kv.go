@@ -1213,6 +1213,10 @@ func purge() KVDeleteOpt {
 	})
 }
 
+// How long a watcher still waiting for its initial values may go without a
+// message before it asks the server whether any are left (see checkInit).
+const kvWatchInitCheck = 2 * time.Second
+
 // Implementation for Watch
 type watcher struct {
 	mu          sync.Mutex
@@ -1222,8 +1226,11 @@ type watcher struct {
 	initDone    bool
 	initPending uint64
 	received    uint64
-	// Consumer of the last message handled.
+	// Consumer and delivery sequence of the last message handled.
 	consumer string
+	dseq     uint64
+	// Ends an initial phase whose last values are gone, see checkInit.
+	initCheck *time.Timer
 	// Closed by Stop, so that an update blocked on a full channel gives up.
 	stopped  chan struct{}
 	stopOnce sync.Once
@@ -1264,6 +1271,16 @@ func (w *watcher) send(e KeyValueEntry) bool {
 	return false
 }
 
+// endInit marks the initial values as delivered and sends the marker.
+// w.mu must be held.
+func (w *watcher) endInit() {
+	w.initDone = true
+	if w.initCheck != nil {
+		w.initCheck.Stop()
+	}
+	w.send(nil)
+}
+
 // close closes w.updates once; no update is sent after that.
 // w.mu must be held.
 func (w *watcher) close() {
@@ -1271,7 +1288,35 @@ func (w *watcher) close() {
 		return
 	}
 	w.closed = true
+	if w.initCheck != nil {
+		w.initCheck.Stop()
+	}
 	close(w.updates)
+}
+
+// checkInit ends an initial phase that cannot end otherwise: when values
+// still owed are removed without a new message (MaxAge, PurgeDeletes, a
+// stream purge), received never reaches initPending and no message carries
+// delta 0. It runs once the watcher has been idle for kvWatchInitCheck and
+// sends the marker if the consumer has nothing pending and every message it
+// delivered was handled here, so nothing was lost on the way either.
+func (w *watcher) checkInit() {
+	if !w.sub.IsValid() {
+		return
+	}
+	ci, err := w.sub.ConsumerInfo()
+	queued, _, qerr := w.sub.Pending()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.initDone || w.closed {
+		return
+	}
+	if err == nil && qerr == nil && queued == 0 && ci.NumPending == 0 &&
+		(ci.Delivered.Consumer == 0 || (ci.Name == w.consumer && ci.Delivered.Consumer == w.dseq)) {
+		w.endInit()
+		return
+	}
+	w.initCheck.Reset(kvWatchInitCheck)
 }
 
 // WatchFiltered will watch for any updates to keys that match the provided
@@ -1378,11 +1423,12 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			}
 			// We're done if we've received all expected messages OR there are no more pending.
 			if w.received >= w.initPending || delta == 0 {
-				w.initDone = true
-				w.send(nil)
+				w.endInit()
+			} else if w.initCheck != nil {
+				w.initCheck.Reset(kvWatchInitCheck)
 			}
 		}
-		w.consumer = consumer
+		w.consumer, w.dseq = consumer, parser.ParseNum(tokens[parser.AckConsumerSeqTokenPos])
 	}
 
 	// Used ordered consumer to deliver results.
@@ -1433,13 +1479,12 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 	// Skip if UpdatesOnly() is set, since there will never be updates initially.
 	if !o.updatesOnly {
 		initialPending, err := sub.InitialConsumerPending()
-		if err == nil {
-			if initialPending == 0 {
-				w.initDone = true
-				w.updates <- nil
-			} else {
-				w.initPending = initialPending
-			}
+		if err == nil && initialPending == 0 {
+			w.initDone = true
+			w.updates <- nil
+		} else {
+			w.initPending = initialPending
+			w.initCheck = time.AfterFunc(kvWatchInitCheck, w.checkInit)
 		}
 	} else {
 		// if UpdatesOnly was used, mark initialization as complete
