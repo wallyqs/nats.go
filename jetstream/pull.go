@@ -1082,6 +1082,11 @@ func (p *pullConsumer) fetch(req *pullRequest) (MessageBatch, error) {
 	go func(res *fetchResult) {
 		defer sub.subscription.Unsubscribe()
 		defer close(res.msgs)
+		if hbTimer != nil {
+			// A timer left armed keeps the subscription (and the
+			// connection) reachable until it fires.
+			defer hbTimer.Stop()
+		}
 		for {
 			select {
 			case msg := <-msgs:
