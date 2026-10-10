@@ -58,6 +58,9 @@ type (
 		opts     []PullMessagesOpt
 		done     chan struct{}
 		closed   atomic.Uint32
+		// stopped is set by Stop (not by Drain) under the consumer's
+		// mutex; no message reaches the Consume handler after it is set.
+		stopped bool
 	}
 
 	cursor struct {
@@ -132,8 +135,10 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 			c.handlerMu.Lock()
 			defer c.handlerMu.Unlock()
 			c.Lock()
-			// handler is a noop if message was delivered for a consumer with different serial
-			if serial != c.serial {
+			// handler is a noop if message was delivered for a consumer with different serial,
+			// or if the consume was stopped (the inner subscription may still
+			// dispatch messages it dequeued before it was unsubscribed)
+			if serial != c.serial || sub.stopped {
 				c.Unlock()
 				return
 			}
@@ -187,26 +192,47 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 					if errors.Is(err, errOrderedConsumerClosed) {
 						continue
 					}
-					c.errHandler(c.serial)(c.currentSub, err)
+					c.errHandler(c.serial)(sub, err)
 				}
 				c.Lock()
+				if sub.closed.Load() == 1 {
+					// Stopped or drained while resetting: done is closed,
+					// or about to be (Stop waits for the mutex), and the
+					// select returns.
+					c.Unlock()
+					continue
+				}
+				if c.stopAfter > 0 && c.deliveredMessages >= c.stopAfter {
+					// The old inner subscription delivered the last
+					// message after the check above and before reset()
+					// changed the serial; there is nothing left to consume.
+					c.Unlock()
+					sub.Stop()
+					return
+				}
 				serial := c.serial
 				consumeOpts := innerOpts()
 				c.Unlock()
 				if cc, err := c.currentConsumer.Consume(internalHandler(serial), consumeOpts...); err != nil {
-					c.errHandler(serial)(cc, err)
+					c.errHandler(serial)(sub, err)
 				} else {
 					c.Lock()
+					if sub.closed.Load() == 1 {
+						// Stop or Drain ran while the inner subscription was
+						// created and stopped the previous one.
+						c.Unlock()
+						cc.Stop()
+						continue
+					}
 					c.currentSub = cc.(*pullSubscription)
 					c.Unlock()
 				}
 			case <-sub.done:
-				s := sub.consumer.currentSub
-				if s != nil {
-					sub.consumer.Lock()
+				sub.consumer.Lock()
+				if s := sub.consumer.currentSub; s != nil {
 					s.Stop()
-					sub.consumer.Unlock()
 				}
+				sub.consumer.Unlock()
 				return
 			}
 		}
@@ -371,6 +397,13 @@ func (s *orderedSubscription) resetMessages() error {
 		return err
 	}
 	c.Lock()
+	if s.closed.Load() == 1 {
+		// Stop or Drain ran during the reset and stopped the previous
+		// iterator; do not install the new one.
+		c.Unlock()
+		cc.Stop()
+		return ErrMsgIteratorClosed
+	}
 	c.currentSub = cc.(*pullSubscription)
 	c.Unlock()
 	return nil
@@ -382,6 +415,7 @@ func (s *orderedSubscription) Stop() {
 	}
 	s.consumer.Lock()
 	defer s.consumer.Unlock()
+	s.stopped = true
 	if s.consumer.currentSub != nil {
 		s.consumer.currentSub.Stop()
 	}

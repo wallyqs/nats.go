@@ -227,7 +227,6 @@ func TestORD4HandlerRunsConcurrentlyAcrossReset(t *testing.T) {
 // attempts here), so the test repeats the forced part of the trace.
 // Trace: OrderedMessages_resurrect_bug.cfg.
 func TestORD5MessagesNextAfterStopDuringReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-5")
 	e := newEnv(t, envOpts{relay: true})
 	for i := 0; i < 600; i++ {
 		if seq, ok := ord5Attempt(t, e); !ok {
@@ -291,7 +290,6 @@ func ord5Attempt(t *testing.T, e *env) (uint64, bool) {
 // logs late handler calls (their number depends on scheduling).
 // Trace: StopResurrect_bug.cfg.
 func TestORD6ConsumeSubscribesAfterStop(t *testing.T) {
-	harness.KnownBug(t, "ORD-6")
 	e := newEnv(t, envOpts{relay: true})
 	e.publish(1)
 	c := e.ordered(jetstream.OrderedConsumerConfig{})
