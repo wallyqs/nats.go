@@ -777,6 +777,13 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 					s.Stop()
 					return nil, termErr
 				}
+				// An ordered consumer (the only user of notifyOnReconnect)
+				// must learn that its consumer is gone: with no pull request
+				// waiting on the server, a 503 is the only sign of it, and
+				// swallowing it leaves the iterator silent for good.
+				if errors.Is(msgErr, nats.ErrNoResponders) && s.consumeOpts.notifyOnReconnect {
+					return nil, msgErr
+				}
 				continue
 			}
 			if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {

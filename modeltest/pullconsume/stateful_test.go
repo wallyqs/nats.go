@@ -50,11 +50,8 @@ import (
 //
 // The findings fixed on fix/pull (PULL-1, 3, 4, 5, 6, 10) are part of the
 // default run: Consume draws StopAfter, and Messages reconnects and misses
-// heartbeats. By default the draws stay clear of the one finding still
-// open, PULL-2 (nats.go's StatusChanged losing events, fixed separately in
-// nats.go): Messages makes at most maxCutsBetweenNext reconnects in a row
-// without Next, so its status goroutine never fills errs and stops
-// reading. With MODELTEST_KNOWN_BUGS=1 that limit is lifted.
+// heartbeats, as many times in a row as it draws: PULL-2 (nats.go's
+// StatusChanged losing events) is fixed in nats.go.
 
 const (
 	stExpiry    = time.Second
@@ -123,12 +120,6 @@ func checkWire(e *env, maxMsgs, stopAfter int) error {
 	}
 	return nil
 }
-
-// maxCutsBetweenNext keeps Messages' status goroutine from blocking on a
-// full errs channel (capacity 10, two notifications per reconnect) while
-// nobody calls Next, which with the unfixed nats.go StatusChanged (PULL-2)
-// loses status events. Only lifted with MODELTEST_KNOWN_BUGS=1.
-const maxCutsBetweenNext = 4
 
 // settleBeforeCut gives messages already on their way to the client time
 // to arrive before the connection is cut: the proxy loses what is in
@@ -398,9 +389,7 @@ func (s *messagesState) next(tc *zizek.TestCase) error {
 func (s *messagesState) cut(tc *zizek.TestCase) error {
 	// Reconnects reset the pending count, which over-pulled into a
 	// fixed-size channel (PULL-5), and two unread reconnects before a
-	// Drain hung Next (PULL-1). PULL-2 is still open, see
-	// maxCutsBetweenNext.
-	tc.Assume(s.known || s.cuts < maxCutsBetweenNext)
+	// Drain hung Next (PULL-1).
 	settleBeforeCut(func() bool { return len(s.e.px.Frames(isStreamMsg)) >= s.published })
 	s.cuts++
 	s.e.cutAndWaitReconnect()

@@ -480,7 +480,6 @@ func TestORD8NextDeadlineIgnoredDuringReset(t *testing.T) {
 // heartbeats. Consume resets on ErrNoResponders (ordered.go:225); Messages
 // does not. Trace: OrderedMessages_noresp_bug.cfg.
 func TestORD12MessagesStuckAfterSilentConsumerLoss(t *testing.T) {
-	harness.KnownBug(t, "ORD-12")
 	poll := func(t *testing.T, it jetstream.MessagesContext, want uint64) {
 		t.Helper()
 		deadline := time.Now().Add(15 * time.Second)

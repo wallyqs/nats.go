@@ -20,7 +20,26 @@ in [`../modeltest`](../modeltest).
 
 Each model's README has the action→code mapping, the invariants, the
 abstractions, measured TLC results, and for every finding its trace, its
-status and a proposed fix as a diff. No fix is applied on this branch.
+status and a proposed fix as a diff.
+
+## Fix status
+
+The fixes live on `claude/magical-lovelace-my0imq-fixes`, which merges one
+branch per area (`fix/conn`, `fix/pull`, `fix/pub`, `fix/ordered`,
+`fix/kv`). On it every confirmed reproducer is a regression test that runs
+by default, and each model has passing configs with its fixes switched on
+next to the `*_bug.cfg` configs that keep reproducing the old code.
+
+| Area | Fixed | Not fixed |
+|------|-------|-----------|
+| PullConsume | PULL-1…10, O-1 | — |
+| OrderedConsumer | ORD-1…9, 11, 12, 13 | ORD-10 (a lost last message is only noticed on the next one; design limitation) |
+| PublishAsync | PUB-1…8, PUB-L1 | legacy `js.go` siblings of PUB-3/4/5/8 |
+| ConnLifecycle | CONN-1…11 | — |
+| KVWatch | KV-1…8 | KV-9 (nats-server); `ListKeys` still ends without an error on context end (needs a `KeyLister` API change) |
+| RequestReply | REQ-1, REQ-2 | REQ-3 (the single-entry reply fallback; a maintainer decision) |
+
+The behavior changes these fixes make are listed in each model's README.
 
 ## Most important findings
 
@@ -41,7 +60,7 @@ Deadlocks and hangs:
   makes the reset retry forever; `Next` never returns.
 - **KV-3** — purging or expiring not-yet-delivered initial values means a
   watcher's "initial values done" marker never arrives, so `Keys()` and
-  `History()` block until their context ends. (Fixed on `fix/kv`.)
+  `History()` block until their context ends.
 
 Lost or wrong data:
 
@@ -51,7 +70,6 @@ Lost or wrong data:
 - **KV-1 / KV-2** — the legacy ordered push consumer's reset drops
   last-per-subject delivery (stale revisions, deleted keys in `Keys()`), or
   restarts from sequence 1 (`UpdatesOnly` watchers replay history).
-  (Fixed on `fix/kv`, with KV-4…8.)
 - **ORD-2** — `FetchNoWait` on an ordered consumer never advances the
   cursor, so the next fetch re-delivers the same messages.
 - **ORD-4** — after a reset, the ordered `Consume` handler can run for two

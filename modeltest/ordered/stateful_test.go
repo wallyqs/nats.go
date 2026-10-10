@@ -39,8 +39,8 @@ import (
 //
 // The rules that reproduced ORD-4 (slow handler + cut) and ORD-2
 // (fetchNoWait) are part of the default machines since those were fixed.
-// The Messages machine still issues the first pull before any rule runs,
-// because a consumer lost while no pull waits is ORD-12 (open).
+// The Messages machine starts without a priming Next: a consumer lost while
+// no pull waits (ORD-12) is fixed too.
 
 // settleTimeout leaves room for two missed heartbeats (2 x 5s, the ordered
 // default since ORD-13 was fixed) plus the reset backoff.
@@ -391,11 +391,6 @@ func TestStatefulMessages(t *testing.T) {
 			return err
 		}
 		defer st.it.Stop()
-		// Issue the first pull now: a consumer lost while no pull waits is
-		// ORD-12.
-		if _, err := st.it.Next(jetstream.NextMaxWait(100 * time.Millisecond)); !errors.Is(err, nats.ErrTimeout) {
-			return fmt.Errorf("priming Next: %v", err)
-		}
 		m := zizek.Machine[messagesState]{
 			Rules: counted(&rc, []zizek.Rule[messagesState]{
 				{Name: "publish", Apply: (*messagesState).publish},

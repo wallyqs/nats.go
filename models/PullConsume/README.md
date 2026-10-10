@@ -11,8 +11,10 @@ H5 section; it has no TLA+ model. The model-derived Go tests live in
 **Status on `fix/pull`:** PULL-1, 3, 4, 5, 6, 7, 8, 9, 10 and O-1 are fixed
 in `jetstream/pull.go` (see "Fixed on fix/pull" below and each finding).
 PULL-2's root cause is in `nats.go` (`sendStatusEvent`) and is fixed by the
-nats.go change on `fix/conn`; its reproducers stay gated by
-`harness.KnownBug` here. The `pull.go:<line>` references in this README
+nats.go change on `fix/conn`; on the merged
+`claude/magical-lovelace-my0imq-fixes` branch its reproducers run as
+regression tests too, and the stateful Messages test no longer limits
+reconnects between `Next` calls. The `pull.go:<line>` references in this README
 and in the specs are to the base commit, before the fixes.
 
 Run:
@@ -20,7 +22,7 @@ Run:
 ```sh
 TLA2TOOLS=/path/to/tla2tools.jar models/tlc.sh PullConsume      # every cfg below
 cd modeltest && ./run.sh ./pullconsume/...                      # default: green
-cd modeltest && MODELTEST_KNOWN_BUGS=1 ./run.sh ./pullconsume/...  # only PULL-2 fails (until fix/conn)
+cd modeltest && MODELTEST_KNOWN_BUGS=1 ./run.sh ./pullconsume/...  # green on the merged fixes branch
 ```
 
 ## What is modeled
@@ -177,8 +179,9 @@ Low = narrow races, performance, cosmetic.
 Every "confirmed" finding has a test in `modeltest/pullconsume/bugs_test.go`
 that asserts the correct behavior. The failure counts below were measured
 on the base commit (`-race -count=3` or `-count=5`). On `fix/pull` every
-one of them is a regression test that passes, except PULL-2's, which stay
-gated by `harness.KnownBug` until the nats.go fix.
+one of them is a regression test that passes, except PULL-2's, which pass
+once the nats.go fix from `fix/conn` is merged (they do on the merged
+fixes branch).
 
 ### PULL-1 — Stop/Drain while a pull is queued deadlocks the consume; Next hangs during Drain (High, confirmed)
 
@@ -713,8 +716,8 @@ reachable. Consume's equivalent was fixed in #2164. Fix:
   break them) and a `len(chan)` peek, so tests can wait for settled states
   instead of sleeping.
 * `bugs_test.go`: one reproducer per confirmed finding (PULL-1, 2, 3, 4, 5,
-  7, 9). On `fix/pull` all are regression tests except PULL-2's two, which
-  stay gated by `harness.KnownBug` until the nats.go fix.
+  7, 9). On `fix/pull` all are regression tests except PULL-2's two; on the
+  merged fixes branch those are regression tests too.
 * `stateful_test.go`: zizek state machines, `TestModelConsume` and
   `TestModelMessages`.
   * Rules are the models' environment actions: publish, cut, late
@@ -732,11 +735,10 @@ reachable. Consume's equivalent was fixed in #2164. Fix:
     in an earlier revision of its default mode, the stale-`errConnected`
     variant of PULL-5).
   * On `fix/pull` the default run explores the fixed findings: Consume
-    draws StopAfter, Messages reconnects and misses heartbeats. Only
-    PULL-2's trigger is still avoided: Messages makes at most four
-    reconnects in a row without Next (`maxCutsBetweenNext`), so its status
-    goroutine never fills `errs` and stops reading `StatusChanged`;
-    `MODELTEST_KNOWN_BUGS=1` lifts that. Both pass, about 23 s and 29 s,
+    draws StopAfter, Messages reconnects and misses heartbeats. On
+    `fix/pull` alone Messages made at most four reconnects in a row without
+    Next, to stay clear of PULL-2; the merged fixes branch drops that
+    limit. Both pass, about 23 s and 29 s,
     6 and 8 examples, fixed seeds (also 25 examples each with other seeds,
     82 s and 101 s, green).
   * Rules that cut the connection first wait (up to 500 ms, without

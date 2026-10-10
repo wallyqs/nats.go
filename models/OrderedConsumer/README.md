@@ -14,8 +14,12 @@ models can check either version (see "Fixes in the models").
 | `OrderedFetch.tla` | `Fetch` / `FetchBytes` / `Next` / `FetchNoWait`: cursor hand-over between successive fetches, `runningFetch`, the mutex |
 
 Run: `TLA2TOOLS=/path/to/tla2tools.jar models/tlc.sh OrderedConsumer`.
-Tests: `cd modeltest && ./run.sh ./ordered/...` (the reproducer of the
-finding that is still open, ORD-12, runs with `MODELTEST_KNOWN_BUGS=1`).
+Tests: `cd modeltest && ./run.sh ./ordered/...`.
+
+**ORD-12** is fixed on the merged `claude/magical-lovelace-my0imq-fixes`
+branch by a pull.go change (the inner `Next` returns `ErrNoResponders` to an
+ordered `Messages`, the only user of `notifyOnReconnect`, which then
+resets); its reproducer runs as a regression test there.
 
 ## Findings
 
@@ -32,7 +36,7 @@ finding that is still open, ORD-12, runs with `MODELTEST_KNOWN_BUGS=1`).
 | ORD-9 | low | StopAfter reached in a narrow window around a reset: the next inner `Consume` gets `StopAfter(0)`, and the user's error handler gets `ErrInvalidOption` with a **nil** `ConsumeContext` | model only (window of a few instructions); **fixed on fix/ordered** (checked by the model) |
 | ORD-10 | low (limitation) | A lost message is only detected when a later message arrives; if the lost message was the last one, the consumer stalls until the next publish | model only; open (limitation) |
 | ORD-11 | low (inherited) | A message dequeued after `Stop()` returned still reaches the handler (`Stop` returns before the inner subscription is unsubscribed; no layer checks closed) | model only; pull.go behavior. **Closed for the ordered consumer on fix/ordered** by the ORD-6 handler check (checked by the model); the pull.go part is left to the pull.go fixes |
-| ORD-12 | high | `Messages` never recovers if its server-side consumer disappears while no pull waits (deleted, or removed after `InactiveThreshold` while the app paused) and `Next` is polled with a deadline below two heartbeats | confirmed (deterministic, both triggers); **open**: the fix is in pull.go (see ORD-12) |
+| ORD-12 | high | `Messages` never recovers if its server-side consumer disappears while no pull waits (deleted, or removed after `InactiveThreshold` while the app paused) and `Next` is polled with a deadline below two heartbeats | confirmed (deterministic, both triggers); fixed by a pull.go change on the merged fixes branch (see ORD-12) |
 | ORD-13 | low | The ordered default heartbeat (5s) never reaches the inner pull; a stalled pull is detected after 30s, not 10s | confirmed (deterministic); **fixed on fix/ordered** |
 
 Details, traces and proposed fixes are below. Cross-reference: PUB-7
@@ -259,7 +263,8 @@ code, so the Consume safety baselines check `InOrder` and `SerialHandler`
 
 * `bugs_test.go`: one reproducer per confirmed finding. Each asserts the
   correct behavior. On fix/ordered they are regression tests that run by
-  default, except ORD-12 (open), which stays behind `harness.KnownBug`.
+  default, except ORD-12, which stayed behind `harness.KnownBug` until its
+  pull.go fix landed on the merged fixes branch.
   The ORD-7 and ORD-8 tests also check the error `Next` returns, and ORD-8
   checks that the next call completes the interrupted reset.
 * `stateful_test.go`: zizek state machines whose rules are the model's actions.
