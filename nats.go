@@ -4291,6 +4291,15 @@ func (nc *Conn) processPong() {
 	var ch chan struct{}
 
 	nc.mu.Lock()
+	// A PONG parsed after the connection was given up (ForceReconnect, stale
+	// connection, -ERR in the middle of a read buffer) answers a PING whose
+	// waiter has already been released by clearPendingFlushCalls; nc.pongs
+	// now holds waiters for PINGs sent on the next connection only. That one
+	// is established only after this readLoop has exited (waitForExits).
+	if !nc.isConnected() {
+		nc.mu.Unlock()
+		return
+	}
 	if len(nc.pongs) > 0 {
 		ch = nc.pongs[0]
 		nc.pongs = append(nc.pongs[:0], nc.pongs[1:]...)

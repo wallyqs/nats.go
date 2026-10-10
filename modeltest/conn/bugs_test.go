@@ -286,7 +286,6 @@ func TestConn5FlushSucceedsForLostMessage(t *testing.T) {
 // matched by processPong (nats.go:4272) against the *new* pongs list, so a
 // Flush issued during the reconnect returns nil without any round trip.
 func TestConn6StalePongCompletesNewFlush(t *testing.T) {
-	harness.KnownBug(t, "CONN-6")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	d := &faultDialer{}
