@@ -672,9 +672,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 
 	s.Lock()
 	defer s.Unlock()
-	drainMode := s.draining.Load() == 1
-	closed := s.closed.Load() == 1
-	if closed && !drainMode {
+	if s.stopped() {
 		// Check if iterator was closed due to connection closure
 		if s.consumer.js.conn.IsClosed() {
 			return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
@@ -855,6 +853,19 @@ func (s *pullSubscription) Drain() {
 	}
 	s.draining.Store(1)
 	close(s.done)
+}
+
+// stopped reports whether Stop was called, as opposed to Drain or
+// neither. Drain sets closed before draining, so a reader that finds
+// closed set waits for done, which Stop and Drain close only after that;
+// reading draining right away could take a Drain for a Stop and discard
+// the buffered messages.
+func (s *pullSubscription) stopped() bool {
+	if s.closed.Load() == 0 {
+		return false
+	}
+	<-s.done
+	return s.draining.Load() == 0
 }
 
 // Closed returns a channel that is closed when consuming is
@@ -1164,6 +1175,11 @@ func (s *pullSubscription) cleanup() {
 	if s.subscription == nil || !s.subscription.IsValid() {
 		s.closed.Store(1)
 		return
+	}
+	if s.closed.Load() == 1 {
+		// Drain sets closed before draining: wait until Stop or Drain
+		// has published which of the two it was (see stopped).
+		<-s.done
 	}
 	drainMode := s.draining.Load() == 1
 	if drainMode {
