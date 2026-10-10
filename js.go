@@ -2575,6 +2575,11 @@ func (nc *Conn) rewireOrderedSub(sub *Subscription, osid, nsid int64, deliver, m
 	// completes, and that removal sends no UNSUB, so subscribing the new sid
 	// here would leave interest on the server for the life of the connection.
 	registered := nc.subs[nsid] == sub && !sub.draining
+	if registered {
+		// The server counts an auto-unsubscribe max from the SUB sent
+		// below, as it does after resendSubscriptions.
+		sub.receivedBase = sub.received
+	}
 	sub.mu.Unlock()
 	nc.subsMu.RUnlock()
 	if registered {
