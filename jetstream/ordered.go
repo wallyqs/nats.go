@@ -204,10 +204,15 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err error) {
 	return func(cc ConsumeContext, err error) {
 		c.Lock()
-
-		if c.userErrHandler != nil && !errors.Is(err, errOrderedSequenceMismatch) && !errors.Is(err, errConnected) {
-			c.userErrHandler(cc, err)
+		userErrHandler := c.userErrHandler
+		c.Unlock()
+		// Call the user's handler without holding the lock: it may call
+		// Stop or Drain on the ConsumeContext, or Info/CachedInfo.
+		if userErrHandler != nil && !errors.Is(err, errOrderedSequenceMismatch) && !errors.Is(err, errConnected) {
+			userErrHandler(cc, err)
 		}
+
+		c.Lock()
 		if errors.Is(err, ErrConnectionClosed) {
 			if c.subscription != nil {
 				c.Unlock()

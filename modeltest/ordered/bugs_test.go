@@ -122,7 +122,6 @@ func TestORD2FetchNoWaitRedelivers(t *testing.T) {
 // handler deadlocks the handler and, with it, the consume.
 // Trace: ErrHandlerStop_bug.cfg.
 func TestORD3ErrHandlerCallingStopDeadlocks(t *testing.T) {
-	harness.KnownBug(t, "ORD-3")
 	for _, call := range []string{"Stop", "CachedInfo"} {
 		t.Run(call, func(t *testing.T) {
 			e := newEnv(t, envOpts{})
