@@ -163,7 +163,6 @@ func TestORD3ErrHandlerCallingStopDeadlocks(t *testing.T) {
 // still running, and can finish first. Trace: ConcurrentHandler_bug.cfg,
 // OutOfOrder_bug.cfg.
 func TestORD4HandlerRunsConcurrentlyAcrossReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-4")
 	e := newEnv(t, envOpts{proxy: true})
 	e.publish(3)
 	c := e.ordered(jetstream.OrderedConsumerConfig{})

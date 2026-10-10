@@ -45,6 +45,11 @@ type (
 		deliveredMessages int // messages handed to the caller, across resets
 		runningFetch      *fetchResult
 		subscription      *orderedSubscription
+		// handlerMu serializes the Consume handler across inner
+		// subscriptions: after a reset, the new inner subscription's
+		// messages are dispatched on another goroutine than the old one's.
+		// It is taken before the consumer's mutex.
+		handlerMu sync.Mutex
 		sync.Mutex
 	}
 
@@ -118,6 +123,11 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.subscription = sub
 	internalHandler := func(serial int) func(msg Msg) {
 		return func(msg Msg) {
+			// Hold handlerMu across the checks and the handler call, so
+			// that a message of the next inner subscription waits for the
+			// running handler and only then sees the new cursor.
+			c.handlerMu.Lock()
+			defer c.handlerMu.Unlock()
 			c.Lock()
 			// handler is a noop if message was delivered for a consumer with different serial
 			if serial != c.serial {

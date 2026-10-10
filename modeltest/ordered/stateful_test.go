@@ -37,8 +37,10 @@ import (
 //   SerialHandler         the Consume handler never runs twice at once
 //   AllDelivered          "settle": everything published is eventually seen
 //
-// The default machines leave out the rules that hit a confirmed bug (so
-// they stay green); the *KnownBugs variants add them back.
+// The rules that reproduced ORD-4 (slow handler + cut) and ORD-2
+// (fetchNoWait) are part of the default machines since those were fixed.
+// The Messages machine still issues the first pull before any rule runs,
+// because a consumer lost while no pull waits is ORD-12 (open).
 
 const settleTimeout = 45 * time.Second // > 2 x 15s default heartbeat (ORD-13)
 
@@ -255,13 +257,9 @@ func runConsumeMachine(t *testing.T, extra []zizek.Rule[consumeState], examples 
 	}
 }
 
+// TestStatefulConsume includes a slow handler rule (ORD-4): message
+// handling overlaps a reconnect.
 func TestStatefulConsume(t *testing.T) {
-	runConsumeMachine(t, nil, 15)
-}
-
-// With a slow handler (ORD-4): message handling overlaps a reconnect.
-func TestStatefulConsumeKnownBugs(t *testing.T) {
-	harness.KnownBug(t, "ORD-4")
 	slowCut := zizek.Rule[consumeState]{Name: "slowHandlerCut", Apply: func(s *consumeState, tc *zizek.TestCase) error {
 		// publish two messages and cut the connection while the handler of
 		// the first one runs
