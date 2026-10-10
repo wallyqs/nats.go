@@ -50,7 +50,6 @@ import (
 //
 // Trace: PullConsume_orphan_bug.cfg.
 func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
-	harness.KnownBug(t, "PULL-1")
 	e := newEnv(t)
 	// Missed heartbeats: drop idle heartbeats; hold the 408 of the first pull.
 	e.px.SetFilter(func(f *Frame) Verdict {
@@ -75,15 +74,15 @@ func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
 	subLock := cc.(sync.Locker)
 	subLock.Lock()
 	// The heartbeat timer fires (2x500ms): the status goroutine takes the
-	// ErrNoHeartbeat and waits for sub.Lock (pull.go:395).
-	waitGoroutineAt(t, 10*time.Second, "jetstream/pull.go:395", "Mutex).Lock")
+	// ErrNoHeartbeat and waits for sub.Lock (pull.go:395 on the base).
+	waitGoroutineAt(t, 10*time.Second, statusGoroutine, "Mutex).Lock")
 	// The first pull expires at the server; let its 408 through. The
-	// handler waits for sub.Lock (pull.go:262).
+	// handler waits for sub.Lock (pull.go:262 on the base).
 	if !harness.Eventually(10*time.Second, func() bool { return e.px.Held() > 0 }) {
 		t.Fatal("no 408")
 	}
 	e.px.Release()
-	waitGoroutineAt(t, 10*time.Second, "jetstream/pull.go:262", "Mutex).Lock")
+	waitGoroutineAt(t, 10*time.Second, consumeHandler, "Mutex).Lock")
 	// Stop: pullMessages returns on done and unsubscribes.
 	subs := e.nc.NumSubscriptions()
 	cc.Stop()
@@ -96,10 +95,8 @@ func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
 	// NoOrphanedFetchSend). Closed() alone is not a reliable witness: it
 	// reports closed as soon as the subscription is invalid (PULL-7).
 	if !harness.Eventually(5*time.Second, func() bool { return consumeGoroutines() == base }) {
-		stuck := goroutinesAt("jetstream/pull.go:401", "[chan send") +
-			goroutinesAt("jetstream/pull.go:488", "[chan send")
 		t.Fatalf("%d consume goroutine(s) still running 5s after Stop; %d blocked forever on fetchNext holding sub.Lock",
-			consumeGoroutines()-base, stuck)
+			consumeGoroutines()-base, goroutinesAt("nats.go/jetstream.", "[chan send"))
 	}
 	if !closedWithin(cc, 5*time.Second) {
 		t.Fatal("Closed() not closed after Stop")
@@ -400,7 +397,6 @@ func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
 //
 // Trace: PullMessages_orphan_bug.cfg (NoOrphanedFetchSend).
 func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
-	harness.KnownBug(t, "PULL-1")
 	e := newEnv(t)
 	var holdPong atomic.Bool
 	e.px.SetFilter(func(f *Frame) Verdict {
@@ -447,7 +443,7 @@ func TestPULL1MessagesNextHangsDuringDrain(t *testing.T) {
 		case <-res:
 		case <-time.After(5 * time.Second):
 			t.Fatalf("Next did not return after Drain: %d goroutine(s) blocked on fetchNext in checkPending holding sub.Lock",
-				goroutinesAt("jetstream/pull.go:488", "[chan send"))
+				goroutinesAt("(*pullSubscription).checkPending", "[chan send"))
 		}
 	}
 }
