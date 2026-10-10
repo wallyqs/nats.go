@@ -49,8 +49,8 @@ for cfg in "${cfgs[@]}"; do
   # about deadlock state it as an explicit invariant/property instead, so the
   # failure carries a name.
   if [[ $expect_fail -eq 1 ]]; then
-    if [[ $rc -ne 0 ]] && grep -q "is violated" "$log"; then
-      echo "violation reproduced: $(grep -m1 'is violated' "$log" || true)"
+    if [[ $rc -ne 0 ]] && grep -qE "(is|was) violated" "$log"; then
+      echo "violation reproduced: $(grep -m1 -E "(is|was) violated" "$log" || true)"
     else
       echo "EXPECTED A VIOLATION, got none"; tail -20 "$log"; status=1
     fi
@@ -59,7 +59,7 @@ for cfg in "${cfgs[@]}"; do
       # The last "distinct states found" line is TLC's final count.
       echo "ok ($(grep 'distinct states found' "$log" | tail -1 | sed 's/.* \([0-9,]*\) distinct states found.*/\1 distinct states/'))"
     else
-      echo "FAILED"; { grep -E "is violated|Error|error" "$log" || tail -20 "$log"; } | head -20; status=1
+      echo "FAILED"; { grep -E "(is|was) violated|Error|error" "$log" || tail -20 "$log"; } | head -20; status=1
       echo "   full log: $log"
       continue
     fi
