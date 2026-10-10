@@ -3501,8 +3501,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 				select {
 				case <-rqch:
 					rt.Stop()
+					// Select on the new channel from now on: the closed
+					// one would bypass every later delay.
 					nc.mu.Lock()
-					nc.rqch = make(chan struct{})
+					rqch = make(chan struct{})
+					nc.rqch = rqch
 					nc.mu.Unlock()
 				case <-rt.C:
 				}
@@ -3535,9 +3538,12 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 				rt.Stop()
 
 				// we need to reset the rqch channel to avoid
-				// closing a closed channel in the next iteration
+				// closing a closed channel in the next iteration,
+				// and select on the new one from now on: the closed
+				// one would bypass every later back-off sleep.
 				nc.mu.Lock()
-				nc.rqch = make(chan struct{})
+				rqch = make(chan struct{})
+				nc.rqch = rqch
 				nc.mu.Unlock()
 			case <-rt.C:
 			}

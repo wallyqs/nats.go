@@ -317,7 +317,6 @@ func TestConn6StalePongCompletesNewFlush(t *testing.T) {
 // every later back-off sleep of that reconnect episode returns immediately and
 // MaxReconnects is exhausted in a tight loop.
 func TestConn7ForceReconnectDisablesBackoff(t *testing.T) {
-	harness.KnownBug(t, "CONN-7")
 	s := harness.RunServer(t, false)
 	var attempts atomic.Int64
 	nc := connect(t, s.URL(),
