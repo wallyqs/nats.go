@@ -2030,6 +2030,18 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 			sub.mu.Lock()
 			sub.jsi.dc = true
 			sub.jsi.pending = info.NumPending + info.Delivered.Consumer
+			if sub.jsi.ordered {
+				// Until the first message is handed over, a reset resumes from
+				// jsi.sseq+1. Start that at the consumer's starting point rather
+				// than at the beginning of the stream (DeliverNew, a start
+				// sequence or time, ...). With nothing delivered yet,
+				// Delivered.Stream is that point minus one. Servers that build
+				// this response after delivery started leave it to the first
+				// message, as before.
+				if info.Delivered.Consumer == 0 && sub.jsi.sseq == 0 {
+					sub.jsi.sseq = info.Delivered.Stream
+				}
+			}
 			// If this is an ephemeral, we did not have a consumer name, we get it from the info
 			// after the AddConsumer returns.
 			if consumer == _EMPTY_ {
