@@ -3581,6 +3581,12 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 
 		// Process connect logic
 		if nc.err = nc.processConnectInit(); nc.err != nil {
+			// Close the socket of the failed handshake, as connect()
+			// does, rather than keep it open through the back-off.
+			if nc.conn != nil {
+				nc.conn.Close()
+				nc.conn = nil
+			}
 			// Check if we should abort reconnect. If so, break out
 			// of the loop and connection will be closed.
 			if nc.ar {

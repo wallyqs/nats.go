@@ -354,7 +354,6 @@ var firstRetryFast = nats.CustomReconnectDelay(func(attempts int) time.Duration 
 // until the next dial overwrites nc.conn and the garbage collector finalizes
 // it.
 func TestConn8FailedReconnectHandshakeLeaksSocket(t *testing.T) {
-	harness.KnownBug(t, "CONN-8")
 	eof := make(chan bool, 1)
 	fs := newFakeServer(t, func(i int, c *fakeConn) {
 		if err := c.handshake(); err != nil {
