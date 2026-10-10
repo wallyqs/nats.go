@@ -122,7 +122,6 @@ func TestConn3DrainDuringReconnectLeaksServerInterest(t *testing.T) {
 // client and not at all by the server: the client removes the subscription
 // after max, the server keeps it for that many more messages.
 func TestConn4AutoUnsubscribeAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "CONN-4")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	pub := connect(t, s.URL())
@@ -174,7 +173,6 @@ func TestConn4AutoUnsubscribeAfterReconnect(t *testing.T) {
 // already received and still pending in the client. The client removes the
 // subscription after max messages; the server keeps it for `pending` more.
 func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
-	harness.KnownBug(t, "CONN-4")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	pub := connect(t, s.URL())
@@ -200,6 +198,11 @@ func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
 		t.Fatal("messages did not arrive")
 	}
 	p.Cut()
+	// Wait for the reconnect itself: right after the cut the client may not
+	// have noticed it yet and still report CONNECTED.
+	if !harness.Eventually(5*time.Second, func() bool { return nc.Stats().Reconnects == 1 }) {
+		t.Fatal("no reconnect")
+	}
 	waitStatus(t, nc, nats.CONNECTED, 5*time.Second)
 	nc.Flush()
 	close(gate)

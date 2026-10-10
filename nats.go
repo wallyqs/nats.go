@@ -774,6 +774,14 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+
+	// Messages that reached processMsg for this subscription, including
+	// slow consumer drops: what the server counts against an auto-unsubscribe
+	// max. The server starts counting again from every (re)SUB, so
+	// receivedBase holds the value of received at the last
+	// resendSubscriptions.
+	received     uint64
+	receivedBase uint64
 }
 
 // Status represents the state of the connection.
@@ -3967,6 +3975,7 @@ func (nc *Conn) processMsg(data []byte) {
 		sub.mu.Unlock()
 		return
 	}
+	sub.received++
 
 	// Skip flow control messages in case of using a JetStream context.
 	jsi := sub.jsi
@@ -5550,11 +5559,20 @@ func (s *Subscription) SetClosedHandler(handler func(subject string)) {
 // Use Subscription.Unsubscribe()
 func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 	var maxStr string
+	// Remove the subscription now unless max messages are still to be
+	// delivered to the user.
+	remove := max <= 0
 	if max > 0 {
 		sub.mu.Lock()
 		sub.max = uint64(max)
-		if sub.delivered < sub.max {
-			maxStr = strconv.Itoa(max)
+		remove = sub.delivered >= sub.max
+		// The max is counted over the life of the subscription, but the
+		// server counts only the messages it sent since the last (re)SUB.
+		// If max messages have already been received (some may still be
+		// pending in the client), stop the server with a plain UNSUB and
+		// let the pending ones be delivered.
+		if sub.received < sub.max {
+			maxStr = strconv.FormatUint(sub.max-sub.receivedBase, 10)
 		}
 		sub.mu.Unlock()
 	}
@@ -5575,7 +5593,7 @@ func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 		return nil
 	}
 
-	if maxStr == _EMPTY_ && !drainMode {
+	if remove && !drainMode {
 		nc.removeSub(s)
 	}
 
@@ -6160,11 +6178,15 @@ func (nc *Conn) resendSubscriptions() {
 		// when resending subscriptions, the permissions error should be cleared
 		// since the user may have fixed the permissions issue
 		s.permissionsErr = nil
+		// The server counts the max from the SUB sent below.
+		s.receivedBase = s.received
 		if s.max > 0 {
-			if s.delivered < s.max {
-				adjustedMax = s.max - s.delivered
+			// Count what was received, not what was delivered: messages
+			// still pending in the client count toward the max too.
+			if s.received < s.max {
+				adjustedMax = s.max - s.received
 			}
-			// adjustedMax could be 0 here if the number of delivered msgs
+			// adjustedMax could be 0 here if the number of received msgs
 			// reached the max, if so unsubscribe.
 			if adjustedMax == 0 {
 				s.mu.Unlock()
