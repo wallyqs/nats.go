@@ -2676,6 +2676,7 @@ func (nc *Conn) ForceReconnect() error {
 	nc.conn.Close()
 
 	nc.changeConnStatus(RECONNECTING)
+	nc.pushDisconnectedCB(nil)
 	go nc.doReconnect(nil, true)
 	return nil
 }
@@ -3377,15 +3378,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 	// Clear any errors.
 	nc.err = nil
 
-	// Perform appropriate callback if needed for a disconnect.
-	// DisconnectedErrCB has priority over deprecated DisconnectedCB
-	if !nc.initc {
-		if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
-			nc.ach.push(func() { disconnectedErrCB(nc, err) })
-		} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {
-			nc.ach.push(func() { disconnectedCB(nc) })
-		}
-	} else if nc.Opts.RetryOnFailedConnect && nc.initc && err != nil {
+	// The disconnect callback was queued by whoever started the reconnect
+	// (processOpErr, ForceReconnect), under the same lock hold as the status
+	// change: queuing it here, after waitForExits, would lose it to a Close
+	// that runs in between (close() queues the dispatcher's close marker).
+	if nc.Opts.RetryOnFailedConnect && nc.initc && err != nil {
 		// For initial connection failure with RetryOnFailedConnect,
 		// report the error via ReconnectErrCB if available
 		if nc.Opts.ReconnectErrCB != nil {
@@ -3689,6 +3686,7 @@ func (nc *Conn) processOpErr(err error, forceReconnect bool) bool {
 		// Clear any queued pongs, e.g. pending flush calls.
 		nc.clearPendingFlushCalls()
 
+		nc.pushDisconnectedCB(err)
 		go nc.doReconnect(err, forceReconnect)
 		return false
 	}
@@ -3696,6 +3694,20 @@ func (nc *Conn) processOpErr(err error, forceReconnect bool) bool {
 	nc.changeConnStatus(DISCONNECTED)
 	nc.err = err
 	return true
+}
+
+// pushDisconnectedCB queues the disconnect callback of a connection that
+// starts reconnecting. DisconnectedErrCB has priority over deprecated
+// DisconnectedCB. Lock is held on entry.
+func (nc *Conn) pushDisconnectedCB(err error) {
+	if nc.initc {
+		return
+	}
+	if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
+		nc.ach.push(func() { disconnectedErrCB(nc, err) })
+	} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {
+		nc.ach.push(func() { disconnectedCB(nc) })
+	}
 }
 
 // dispatch is responsible for calling any async callbacks
@@ -6269,6 +6281,8 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		nc.mu.Unlock()
 		return
 	}
+	// A reconnecting connection has already reported its disconnect.
+	wasReconnecting := nc.isReconnecting()
 	nc.status = CLOSED
 
 	// Kick the Go routines so they fall out.
@@ -6345,7 +6359,7 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 
 	// Perform appropriate callback if needed for a disconnect.
 	if doCBs {
-		if nc.conn != nil {
+		if nc.conn != nil && !wasReconnecting {
 			if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
 				nc.ach.push(func() { disconnectedErrCB(nc, err) })
 			} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {

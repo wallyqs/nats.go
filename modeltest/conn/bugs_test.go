@@ -386,7 +386,6 @@ func TestConn8FailedReconnectHandshakeLeaksSocket(t *testing.T) {
 // deliver a second DisconnectedErrCB (close() keys it on nc.conn != nil,
 // nats.go:6287), after the one doReconnect already delivered.
 func TestConn9DoubleDisconnectCallback(t *testing.T) {
-	harness.KnownBug(t, "CONN-9")
 	attempted := make(chan struct{}, 1)
 	fs := newFakeServer(t, func(i int, c *fakeConn) {
 		if err := c.handshake(); err != nil {
@@ -452,7 +451,6 @@ func TestConn10ClosedHandlerCalledTwice(t *testing.T) {
 // doReconnect queues afterwards is never run. Here the ping timer declares the
 // connection stale while the readLoop is still busy with bytes it has read.
 func TestConn11CloseLosesDisconnectCallback(t *testing.T) {
-	harness.KnownBug(t, "CONN-11")
 	s := harness.RunServer(t, false)
 	d := &faultDialer{}
 	var log cbLog
