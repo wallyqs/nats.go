@@ -29,8 +29,9 @@ import (
 
 // Reproducers for the findings in models/OrderedConsumer/README.md. Each one
 // replays the counterexample of the matching *_bug.cfg against the real
-// library and asserts the correct behavior, so it fails until the bug is
-// fixed; harness.KnownBug skips it by default.
+// library and asserts the correct behavior. Fixed findings run as regression
+// tests; harness.KnownBug skips the ones that are still open (ORD-12) by
+// default.
 //
 // Interleavings are forced, not waited for: the JetStream API relay holds
 // the consumer create of reset() (the model's "create in flight" step), and
@@ -407,9 +408,9 @@ func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
 // ORD-8: Next(NextMaxWait / NextContext) does not bound the time spent in
 // resetMessages: reset() holds the ordered consumer's mutex across
 // CreateOrUpdateConsumer and its backoff (ordered.go:583-595), ignoring the
-// caller's deadline. Trace: OrderedMessages_timeout_bug.cfg.
+// caller's deadline. Trace: OrderedMessages_timeout_bug.cfg. With the fix,
+// the interrupted reset is left pending and the next Next completes it.
 func TestORD8NextDeadlineIgnoredDuringReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-8")
 	for _, kind := range []string{"NextMaxWait", "NextContext"} {
 		t.Run(kind, func(t *testing.T) {
 			e := newEnv(t, envOpts{relay: true})
@@ -447,6 +448,23 @@ func TestORD8NextDeadlineIgnoredDuringReset(t *testing.T) {
 			if !ok {
 				err = <-done
 				t.Fatalf("Next with a 1s deadline returned after %v (%v)", time.Since(start).Round(time.Millisecond), err)
+			}
+			want := nats.ErrTimeout
+			if kind == "NextContext" {
+				want = context.DeadlineExceeded
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("Next: %v, want %v", err, want)
+			}
+			// The reset the deadline interrupted is retried by the next
+			// call, which then delivers from where the iterator was.
+			e.publish(1)
+			m, err := it.Next(jetstream.NextMaxWait(10 * time.Second))
+			if err != nil {
+				t.Fatalf("Next after the interrupted reset: %v", err)
+			}
+			if s := streamSeq(t, m); s != 1 {
+				t.Fatalf("Next after the interrupted reset: stream seq %d, want 1", s)
 			}
 		})
 	}

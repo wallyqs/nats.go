@@ -61,6 +61,10 @@ type (
 		// stopped is set by Stop (not by Drain) under the consumer's
 		// mutex; no message reaches the Consume handler after it is set.
 		stopped bool
+		// resetPending is set when Next's deadline expired during a
+		// reset; the next call to Next retries the reset. It is only
+		// accessed by Next.
+		resetPending bool
 	}
 
 	cursor struct {
@@ -91,7 +95,7 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.Lock()
 	defer c.Unlock()
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
+		err := c.reset(context.Background())
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +192,7 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 					sub.Stop()
 					return
 				}
-				if err := c.reset(); err != nil {
+				if err := c.reset(context.Background()); err != nil {
 					if errors.Is(err, errOrderedConsumerClosed) {
 						continue
 					}
@@ -292,7 +296,7 @@ func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err err
 // See [Consumer.Messages] for more details.
 func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error) {
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
+		err := c.reset(context.Background())
 		if err != nil {
 			return nil, err
 		}
@@ -333,8 +337,48 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 }
 
 func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
+	var nextOpts nextOpts
+	for _, opt := range opts {
+		opt.configureNext(&nextOpts)
+	}
+	if nextOpts.timeout > 0 && nextOpts.ctx != nil {
+		return nil, fmt.Errorf("%w: cannot specify both NextMaxWait and NextContext", ErrInvalidOption)
+	}
+	// The deadline of the call bounds the inner Next calls and the resets
+	// in between: a reset is not tied to the inner iterator, and each inner
+	// Next would otherwise start the full NextMaxWait again.
+	ctx := context.Background()
+	var deadline time.Time
+	if nextOpts.timeout > 0 {
+		deadline = time.Now().Add(nextOpts.timeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	} else if nextOpts.ctx != nil {
+		ctx = nextOpts.ctx
+	}
+	resetErr := func(err error) error {
+		if !deadline.IsZero() && errors.Is(err, context.DeadlineExceeded) {
+			return nats.ErrTimeout
+		}
+		return err
+	}
 	for {
-		msg, err := s.consumer.currentSub.Next(opts...)
+		if s.resetPending {
+			// The previous call's deadline expired during a reset.
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
+			}
+		}
+		innerOpts := opts
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, nats.ErrTimeout
+			}
+			innerOpts = []NextOpt{NextMaxWait(remaining)}
+		}
+		msg, err := s.consumer.currentSub.Next(innerOpts...)
 		if err != nil {
 			// Check for errors which should be returned directly
 			// without resetting the consumer
@@ -351,8 +395,8 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 				s.Stop()
 				return nil, err
 			}
-			if err := s.resetMessages(); err != nil {
-				return nil, err
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
 			}
 			continue
 		}
@@ -367,8 +411,8 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 		}
 		dseq := meta.Sequence.Consumer
 		if dseq != s.consumer.cursor.deliverSeq+1 {
-			if err := s.resetMessages(); err != nil {
-				return nil, err
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
 			}
 			continue
 		}
@@ -382,8 +426,9 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 // resetMessages replaces the inner iterator with a new one, created on a
 // new consumer which resumes after the last message returned by Next.
 // With StopAfter set, the new iterator is limited to the messages that
-// are left to deliver.
-func (s *orderedSubscription) resetMessages() error {
+// are left to deliver. If ctx expires before the new consumer is created,
+// the reset is left pending for the next call to Next.
+func (s *orderedSubscription) resetMessages(ctx context.Context) error {
 	c := s.consumer
 	opts := s.opts
 	if c.stopAfter > 0 {
@@ -394,7 +439,7 @@ func (s *orderedSubscription) resetMessages() error {
 		}
 		opts = append(slices.Clip(opts), StopAfter(remaining))
 	}
-	if err := c.reset(); err != nil {
+	if err := c.reset(ctx); err != nil {
 		if errors.Is(err, errOrderedConsumerClosed) {
 			return ErrMsgIteratorClosed
 		}
@@ -402,8 +447,13 @@ func (s *orderedSubscription) resetMessages() error {
 			s.Stop()
 			return fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
 		}
+		if ctx.Err() != nil {
+			// reset() stopped the inner iterator; retry on the next call
+			s.resetPending = true
+		}
 		return err
 	}
+	s.resetPending = false
 	cc, err := c.currentConsumer.Messages(opts...)
 	if err != nil {
 		if c.js.conn.IsClosed() {
@@ -504,7 +554,7 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	}
 	c.subscription = &sub
 	c.Unlock()
-	err := c.reset()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -547,7 +597,7 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	}
 	c.subscription = &sub
 	c.Unlock()
-	err := c.reset()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -593,7 +643,7 @@ func (c *orderedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
 	}
 	c.subscription = &sub
 	c.Unlock()
-	err := c.reset()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -644,7 +694,11 @@ func serialNumberFromConsumer(name string) int {
 	return serial
 }
 
-func (c *orderedConsumer) reset() error {
+// reset stops the current inner subscription and replaces the server-side
+// consumer with a new one that resumes after the cursor. It retries the
+// consumer creation (up to MaxResetAttempts) until ctx is done; a closed
+// connection ends it with ErrConnectionClosed.
+func (c *orderedConsumer) reset(ctx context.Context) error {
 	c.Lock()
 	defer c.Unlock()
 	defer c.resetInProgress.Store(0)
@@ -673,7 +727,10 @@ func (c *orderedConsumer) reset() error {
 		initialInterval: time.Second,
 		factor:          2,
 		maxInterval:     10 * time.Second,
-		cancel:          c.subscription.done,
+		// Stop and Drain cannot close the subscription's done channel
+		// while the lock is held; closed is checked before each attempt
+		// instead.
+		cancel: ctx.Done(),
 	}
 	err = retryWithBackoff(func(attempt int) (bool, error) {
 		isClosed := c.subscription.closed.Load() == 1
@@ -686,17 +743,27 @@ func (c *orderedConsumer) reset() error {
 		if c.js.conn.IsClosed() {
 			return false, ErrConnectionClosed
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		cons, err = c.js.CreateOrUpdateConsumer(ctx, c.stream, *consumerConfig)
+		cons, err = c.js.CreateOrUpdateConsumer(reqCtx, c.stream, *consumerConfig)
 		if err != nil {
 			if errors.Is(err, nats.ErrConnectionClosed) || c.js.conn.IsClosed() {
 				return false, ErrConnectionClosed
+			}
+			if ctx.Err() != nil {
+				return false, ctx.Err()
 			}
 			return true, err
 		}
 		return false, nil
 	}, backoffOpts)
+	if err == nil && cons == nil {
+		// retryWithBackoff returns no error when canceled during a backoff
+		err = ctx.Err()
+	}
 	if err != nil {
 		return err
 	}
