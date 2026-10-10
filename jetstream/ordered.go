@@ -419,6 +419,7 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	}
 	if c.runningFetch != nil {
 		if !c.runningFetch.closed() {
+			c.Unlock()
 			return nil, ErrOrderedConsumerConcurrentRequests
 		}
 		if c.runningFetch.sseq != 0 {
@@ -440,7 +441,9 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	if err != nil {
 		return nil, err
 	}
+	c.Lock()
 	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
 	return msgs, nil
 }
 
@@ -459,6 +462,7 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	}
 	if c.runningFetch != nil {
 		if !c.runningFetch.closed() {
+			c.Unlock()
 			return nil, ErrOrderedConsumerConcurrentRequests
 		}
 		if c.runningFetch.sseq != 0 {
@@ -480,7 +484,9 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	if err != nil {
 		return nil, err
 	}
+	c.Lock()
 	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
 	return msgs, nil
 }
 
@@ -493,11 +499,21 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 // reset the consumer for each subsequent Fetch call.
 // Consider using [Consumer.Consume] or [Consumer.Messages] instead.
 func (c *orderedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
+	c.Lock()
 	if c.consumerType == consumerTypeConsume {
+		c.Unlock()
 		return nil, ErrOrderConsumerUsedAsConsume
 	}
-	if c.runningFetch != nil && !c.runningFetch.done {
-		return nil, ErrOrderedConsumerConcurrentRequests
+	// Same cursor hand-over as Fetch: resume after the last message
+	// delivered by the previous fetch, and record this one.
+	if c.runningFetch != nil {
+		if !c.runningFetch.closed() {
+			c.Unlock()
+			return nil, ErrOrderedConsumerConcurrentRequests
+		}
+		if c.runningFetch.sseq != 0 {
+			c.cursor.streamSeq = c.runningFetch.sseq
+		}
 	}
 	c.consumerType = consumerTypeFetch
 	sub := orderedSubscription{
@@ -505,11 +521,19 @@ func (c *orderedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
 		done:     make(chan struct{}),
 	}
 	c.subscription = &sub
+	c.Unlock()
 	err := c.reset()
 	if err != nil {
 		return nil, err
 	}
-	return c.currentConsumer.FetchNoWait(batch)
+	msgs, err := c.currentConsumer.FetchNoWait(batch)
+	if err != nil {
+		return nil, err
+	}
+	c.Lock()
+	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
+	return msgs, nil
 }
 
 // Next is used to retrieve the next message from the stream. This

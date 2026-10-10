@@ -42,7 +42,6 @@ import (
 // FetchBytes at 460-463). Every later call that takes the mutex blocks
 // forever. Trace: OrderedFetch_locked_bug.cfg.
 func TestORD1FetchConcurrentRequestsLeaksLock(t *testing.T) {
-	harness.KnownBug(t, "ORD-1")
 	for _, name := range []string{"Fetch", "FetchBytes"} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, envOpts{})
@@ -79,7 +78,6 @@ func TestORD1FetchConcurrentRequestsLeaksLock(t *testing.T) {
 // new consumer at the old cursor and hands out the same messages again.
 // Trace: OrderedFetch_nowait_bug.cfg.
 func TestORD2FetchNoWaitRedelivers(t *testing.T) {
-	harness.KnownBug(t, "ORD-2")
 	cases := []struct {
 		name  string
 		first func(jetstream.Consumer) (jetstream.MessageBatch, error)

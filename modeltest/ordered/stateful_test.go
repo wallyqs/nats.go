@@ -494,7 +494,7 @@ func (s *fetchState) fetchNoWait(tc *zizek.TestCase) error {
 
 func (s *fetchState) invInOrder(_ *zizek.TestCase) error { return inOrder(s.got) }
 
-func runFetchMachine(t *testing.T, withNoWait bool) {
+func TestStatefulFetch(t *testing.T) {
 	var rc ruleCounts
 	defer func() { t.Logf("rules applied: %v", rc.n) }()
 	prop := func(tc *zizek.TestCase) error {
@@ -506,9 +506,7 @@ func runFetchMachine(t *testing.T, withNoWait bool) {
 			{Name: "fetch", Apply: (*fetchState).fetch},
 			{Name: "fetchBytes", Apply: (*fetchState).fetchBytes},
 			{Name: "next", Apply: (*fetchState).next},
-		}
-		if withNoWait {
-			rules = append(rules, zizek.Rule[fetchState]{Name: "fetchNoWait", Apply: (*fetchState).fetchNoWait})
+			{Name: "fetchNoWait", Apply: (*fetchState).fetchNoWait}, // ORD-2
 		}
 		m := zizek.Machine[fetchState]{
 			Rules:      counted(&rc, rules),
@@ -519,11 +517,4 @@ func runFetchMachine(t *testing.T, withNoWait bool) {
 	if err := zizek.Check(prop, zizek.Config{Examples: 15, Seed: 3, SuppressTooSlow: true}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestStatefulFetch(t *testing.T) { runFetchMachine(t, false) }
-
-func TestStatefulFetchKnownBugs(t *testing.T) {
-	harness.KnownBug(t, "ORD-2")
-	runFetchMachine(t, true)
 }
