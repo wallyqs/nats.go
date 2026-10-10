@@ -53,8 +53,12 @@ and the delete on timeout, and the lookup (under the lock) and the send
 | `Close` — one `nc.mu` section: `clearPendingRequestCalls`, close sync subs, `subs = nil` | `nats.go:6202-6297` |
 | `UserUnsubMux` — the caller unsubscribes `reply.Sub`, which is `nc.respMux` | `nats.go:3951`, `5441` → `5551` → `5237` |
 
-The constants `FixLeak` and `FixMuxReset` switch on the proposed fixes for
-REQ-1 and REQ-2 so the same model checks them.
+The constants `FixLeak` and `FixMuxReset` switch on the fixes for REQ-1 and
+REQ-2 (applied on branch `fix/conn`) so the same model checks them. They only
+make a difference when publish errors (`WithPubFail`) or the mux unsubscribe
+(`WithUserUnsubMux`) are enabled: `leak_fixed.cfg`, `muxunsub_fixed.cfg` and
+`muxunsub_fixed_live.cfg` run with the fix on and pass; the baseline configs
+do not enable those actions.
 
 ### Invariants and properties
 
@@ -105,7 +109,8 @@ cuts, duplicates, 503s, foreign subjects and unsubscribes are never forced.
 ## TLC results
 
 `models/tlc.sh RequestReply`; TLC 2026.10.06, 4 workers, measured on this
-machine (12 configs, about 6.5 minutes in total). Passing configs use
+machine (12 configs, about 6.5 minutes in total). Re-run on `fix/conn`: the
+same results and state counts, 2m21s in total. Passing configs use
 `SYMMETRY` over the requesters where only safety is checked.
 
 | Config | What | Result |
@@ -135,7 +140,8 @@ unless the subject-rewrite fallback is involved.
 
 Severity: low–medium (unbounded memory growth on a long-lived connection;
 also disables the single-entry fallback of REQ-3 while any leaked entry
-exists). Status: **confirmed by test**.
+exists). Status: **confirmed by test; fixed on `fix/conn` in 2582083** (the
+proposed diff below, as is).
 
 `createNewRequestAndSend` registers `respMap[token]` (`nats.go:4846`)
 before it subscribes the mux and publishes. When `subscribeLocked`
@@ -191,7 +197,8 @@ applied to a scratch copy):
 Severity: medium (an innocent-looking call on a value the API hands out
 silently blackholes all later new-style requests on the connection until
 it is closed; `Conn.Drain` then always runs to `DrainTimeout`). Status:
-**confirmed by test**.
+**confirmed by test; fixed on `fix/conn` in 4aa8101** (the proposed diff
+below, as is).
 
 `processMsg` sets `m.Sub = sub` (`nats.go:3951`), so the reply a request
 returns carries the connection-wide mux subscription. Calling
@@ -260,8 +267,11 @@ tree (4095 of 4096 messages) and is unrelated.
 
 Severity: low (needs a message on the mux whose subject does not start
 with the mux prefix). Status: **design hazard, confirmed with a scripted
-server**; we did not find a nats-server configuration that produces such a
-subject.
+server; not fixed**. We did not find a nats-server configuration that
+produces such a subject. The fallback exists for subjects rewritten by the
+server (the code comment names JetStream), so removing it is a behavior
+decision for the maintainers; `TestREQ3FallbackHandsStaleReplyToOtherRequest`
+stays gated by `harness.KnownBug` and `foreign_bug.cfg` still reproduces.
 
 When the subject of a message delivered to the mux does not start with
 `respSubPrefix`, `respHandler` gives it to the only entry of `respMap` if
@@ -328,14 +338,18 @@ builds with `-tags=internal_testing`):
   `one_mux` (`MuxCreatedOnce`: the new-style connection holds exactly the
   mux, the old-style one none); `NoMisdelivery` and `CloseReleasesWaiters`
   are checked inside the rules. `TestStatefulRequestReply`: 200 examples,
-  seed 7, about 40 s, passes. `TestStatefulRequestReplyREQ1` / `REQ2` add
-  the bug-triggering rule (`request_pub_error`, `unsub_reply_sub`) and
-  fail today with one-step shrunk counterexamples. `REQREP_COUNT=1` logs
-  how often each rule ran.
-- `bugs_test.go` — the reproducers above, gated by `harness.KnownBug`.
+  seed 7, about 35 s, passes. Since the fixes it includes the rules that
+  triggered REQ-1 and REQ-2 (`request_pub_error`, `unsub_reply_sub`, each
+  run about 370 times per 200 examples); before them, the separate
+  `TestStatefulRequestReplyREQ1` / `REQ2` added one of those rules each and
+  failed with one-step shrunk counterexamples. `REQREP_COUNT=1` logs how
+  often each rule ran.
+- `bugs_test.go` — the reproducers above. Those of REQ-1 and REQ-2 run as
+  regression tests; REQ-3's is still gated by `harness.KnownBug`.
 
-`MODELTEST_KNOWN_BUGS=1 go test -race ./reqrep/...` runs the reproducers;
-all of REQ-1, REQ-2 and REQ-3 fail as described.
+`MODELTEST_KNOWN_BUGS=1 go test -race ./reqrep/...` also runs the REQ-3
+reproducer, which fails as described. On the unfixed code the REQ-1 and
+REQ-2 tests and `TestStatefulRequestReply` fail.
 
 ### Notes on zizek
 
