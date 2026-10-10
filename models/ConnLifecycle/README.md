@@ -12,12 +12,15 @@ Line numbers refer to `nats.go` at the base of this branch (upstream main
 including #2169, `b84f342`).
 
 **Result:** 11 findings (CONN-1 … CONN-11). Each one has a TLC
-counterexample (`*_bug.cfg`) and a Go reproducer that fails against the real
-library on every run (13 tests, 5/5 runs each). The proposed fixes were applied
-to a scratch copy of the library, not to this repository. With them all 13
-reproducers pass, both zizek state machines pass with every known-bug
-invariant switched on, and nats.go's own tests pass apart from one test that is flaky without the patch too (details under
-[Validation of the proposed fixes](#validation-of-the-proposed-fixes)).
+counterexample (`*_bug.cfg`) and a Go reproducer that failed against the
+library the model was written against on every run (13 tests, 5/5 runs each).
+
+**Status: all 11 are fixed on branch `fix/conn`** (one commit per finding or
+tight group, listed under each finding). The 13 reproducers now run as
+regression tests, both zizek state machines check every invariant by default,
+and nats.go's own suites show no new failure (details under
+[Validation of the fixes](#validation-of-the-fixes)). The `*_bug.cfg` configs
+keep encoding the old code and still reproduce their violations.
 
 ## Files
 
@@ -28,13 +31,14 @@ invariant switched on, and nats.go's own tests pass apart from one test that is 
 | `StatusListener.tla` | A `StatusChanged` channel: `sendStatusEvent`, a slow reader, `RemoveStatusListener`, a user closing the channel |
 | `ConnLifecycle.cfg`, `PingTimer.cfg`, `Lifecycle.cfg`, `Liveness.cfg` | ConnLifecycle with every proposed fix on: must pass |
 | `SubResendAsync.cfg`, `SubResendSync.cfg`, `StatusListener.cfg` | Same for the other two specs |
-| `*_bug.cfg` | The code as it is: TLC must report the named violation |
+| `*_bug.cfg` | The code before the fixes: TLC must report the named violation |
 | `PendingFlushStallLive_bug.cfg` | CONN-5 as a temporal property (`tlc.sh` accepts TLC's `Temporal property ... was violated` as a reproduced violation). |
 
 Each fix is a `Fix*` constant (`FixStalePong`, `FixPendingFail`, `FixRqch`,
 `FixHsClose`, `FixCloseDisc`, `FixDiscPush`, `FixDrainResend`, `FixAutoBase`,
 `FixRemoveOnce`, `FixProbe`, `FixRemove`). A passing config turns all of them
-on. A bug config leaves them off: the code as it is. Exception:
+on: the code as fixed on `fix/conn`. A bug config leaves them off: the code
+before the fixes. Exception:
 `PendingFlushLost_bug.cfg` and `StalePong_bug.cfg` keep the *other* finding's
 fix on so that TLC reports the intended trace and not the other path to the
 same `FlushIntegrity` violation. I also ran each passing config with only one
@@ -181,6 +185,8 @@ Severity is my estimate of the impact on applications.
 
 ### CONN-1 — `sendStatusEvent`'s "is it closed?" probe steals events and unregisters live listeners (Medium) — confirmed
 
+**Fixed** on `fix/conn` in d7c509c (together with CONN-2, PUB-7 and PULL-2).
+
 Same root cause as **PUB-7** in [`../PublishAsync/README.md`](../PublishAsync/README.md),
 found independently. It is modeled here because it breaks the status-transition
 invariants of this area.
@@ -245,6 +251,8 @@ channel.
 
 ### CONN-2 — `RemoveStatusListener` does not close a channel that holds an event (Low/Medium) — confirmed
 
+**Fixed** on `fix/conn` in d7c509c. `RemoveStatusListener` now always closes the channel (a reader still receives a buffered event first).
+
 Also part of **PUB-7**. `RemoveStatusListener` (nats.go:6799-6806) does
 `select { case <-ch: default: close(ch) }`. When an event is buffered it
 consumes the event and leaves the channel open, despite its doc comment ("If
@@ -276,6 +284,8 @@ the channel is not closed, it will be closed"). A goroutine doing
 ```
 
 ### CONN-3 — A subscription drained across a reconnect keeps its interest on the server (Medium) — confirmed
+
+**Fixed** on `fix/conn` in 187d13b.
 
 `Subscription.Drain` leaves the subscription in `nc.subs` (with
 `draining = true`) until `checkDrained` removes it.
@@ -313,6 +323,8 @@ for the life of the connection:
 ```
 
 ### CONN-4 — `AutoUnsubscribe` max is counted differently by client and server after a reconnect (Medium) — confirmed
+
+**Fixed** on `fix/conn` in 467e6ae.
 
 The client counts `max` over the whole life of the subscription (`delivered`).
 After a reconnect, the server counts only from the SUB that
@@ -374,9 +386,13 @@ pending message and removes the sub → the server still has max 1, nm 0.
 +				adjustedMax = s.max - s.received
 ```
 `FixAutoBase` in the model. `SubResendAsync.cfg` and `SubResendSync.cfg`
-pass with it.
+pass with it. As applied, `unsubscribe` computes "remove now" as
+`max <= 0 || delivered >= max`, so `AutoUnsubscribe(n)` with `n <= 0` still
+behaves like `Unsubscribe`, as before.
 
 ### CONN-5 — A failed write of the reconnect pending buffer stalls the reconnect and lets a Flush succeed for lost messages (High) — confirmed
+
+**Fixed** on `fix/conn` in a280cc5.
 
 A sibling of #2169 that #2169 did not cover. `doReconnect` writes the pending
 buffer with `flushReconnectPendingItems` (nats.go:3591). On failure:
@@ -431,6 +447,8 @@ cleared.
 
 ### CONN-6 — A PONG parsed by an abandoned readLoop completes a Flush issued during the reconnect (Medium) — confirmed
 
+**Fixed** on `fix/conn` in ea8415e.
+
 Several paths clear `nc.pongs` and give up the connection while its readLoop
 may still be parsing bytes it Read before the socket was closed:
 * `ForceReconnect`;
@@ -479,6 +497,8 @@ exited (`waitForExits`).
 
 ### CONN-7 — `ForceReconnect` while RECONNECTING disables the back-off for the rest of the episode and exhausts MaxReconnects (High) — confirmed
 
+**Fixed** on `fix/conn` in dad4d6c.
+
 `doReconnect` takes a local copy `rqch := nc.rqch` (nats.go:3393).
 `ForceReconnect` while RECONNECTING closes `nc.rqch` and sets it to nil. The
 sleep that is cut short sets `nc.rqch = make(...)` (nats.go:3497, 3532), but
@@ -508,6 +528,8 @@ Result: 7 attempts in 600ms and the connection is CLOSED.
 
 ### CONN-8 — The socket of a failed reconnect handshake is left open (Low) — confirmed
 
+**Fixed** on `fix/conn` in 835f8e4.
+
 When `processConnectInit` fails on a freshly dialed socket during a reconnect
 (-ERR, timeout, bad INFO), `doReconnect` sets RECONNECTING and continues
 (nats.go:3569-3576) without closing `nc.conn`. Compare `connect()`, which
@@ -528,6 +550,8 @@ answers the reconnect's CONNECT with `-ERR` and sees no EOF within 1s.
 ```
 
 ### CONN-9 — Close during a reconnect runs DisconnectedErrCB a second time (Low) — confirmed
+
+**Fixed** on `fix/conn` in 7585d35 (with CONN-11; the handshake path also by CONN-8's 835f8e4).
 
 `close()` queues DisconnectedErrCB whenever `nc.conn != nil`
 (nats.go:6287). During a reconnect `nc.conn` is non-nil in two cases:
@@ -559,6 +583,8 @@ application gets `disconnected, disconnected, closed` for one disconnect.
 
 ### CONN-10 — The closed handler of a sync subscription runs twice when Unsubscribe races with Drain (Low) — confirmed
 
+**Fixed** on `fix/conn` in 961414c.
+
 `checkDrained` calls `removeSub` when `closed` is already true
 (nats.go:5503-5506). For non-async subscriptions `removeSub` calls the closed
 handler on every call (nats.go:5262-5266). So
@@ -580,6 +606,8 @@ combined with reaching an AutoUnsubscribe max in `NextMsg`.
 ```
 
 ### CONN-11 — Close right after a disconnect can drop DisconnectedErrCB (Low) — confirmed
+
+**Fixed** on `fix/conn` in 7585d35 (with CONN-9).
 
 `doReconnect` queues DisconnectedErrCB only after `waitForExits`
 (nats.go:3359-3382). If `Close()` runs in between, the following happens:
@@ -651,10 +679,11 @@ Callbacks: `[closed]`.
 
 ## Tests derived from the models (`modeltest/conn`)
 
-* **`bugs_test.go`:** 13 reproducers, one or two per finding, each gated by
-  `harness.KnownBug`. All 13 fail 5 out of 5 runs
-  (`MODELTEST_KNOWN_BUGS=1 go test -race -count=5 -run TestConn ./conn/`). Each
-  takes 0.1–3s.
+* **`bugs_test.go`:** 13 reproducers, one or two per finding. All 13 failed 5
+  out of 5 runs on the unfixed code
+  (`MODELTEST_KNOWN_BUGS=1 go test -race -count=5 -run TestConn ./conn/`); with
+  the fixes on `fix/conn` they are regression tests, no longer gated by
+  `harness.KnownBug`. Each takes 0.1–3s.
 * **`helpers_test.go`:**
   * `faultDialer`: a `nats.CustomDialer` whose sockets can
     * fail one write half way, keeping or closing the socket (the model's
@@ -675,13 +704,25 @@ Callbacks: `[closed]`.
     `unsubscribe`, `drain`, `cut`, `outageStart`/`outageEnd`. Invariants:
     `maxRespected`, `noLeakedInterest`, `closedHandlerOnce`. Each example
     draws whether the subscription is a queue subscription.
-  * `TestLifecycleMachine` and `TestSubscriptionMachine` use only the rules
-    and invariants that hold on today's code. They pass: 12 examples, about
-    1s each.
-  * `Test*MachineKnownBugs/<invariant>` adds the bug-reaching rules and
-    enforces one known-bug invariant, with the subset of rules relevant to it.
+  * `TestLifecycleMachine` and `TestSubscriptionMachine` (12 examples) use
+    every rule and check every invariant except `flushIntegrity`, which
+    needs extra settling. Before the fixes they used only the rules and
+    invariants that held then.
+  * `Test*MachineFocused/<invariant>` (60 examples) enforces one invariant
+    with the rules that reach its bug (`Test*MachineKnownBugs`, gated, before
+    the fixes). Both machines run by default; the whole package takes about
+    two minutes.
+  * After the fixes, `flushIntegrity` turned out to be flaky (5 of 10 runs)
+    for a harness reason: a Flush goroutine scheduled after later steps
+    queued its PING behind a reconnect the "split" check had not seen, so
+    the Flush was answered on the next connection while its message died
+    with the old one (at-most-once, see "Go invariant too strong" above).
+    `publishFlush` now returns only once the Flush has queued its PING, and
+    the invariant skips a message after a status change when no PING followed
+    it on its socket. 10 of 10 runs pass; against the unfixed library the
+    focused subtest still fails (CONN-5b).
 
-Measured on the current code (60 examples, seed 7, ≤ 10 shrinks):
+Measured on the unfixed code (60 examples, seed 7, ≤ 10 shrinks):
 
 | Subtest | Finds | Time |
 |---------|-------|------|
@@ -692,13 +733,36 @@ Measured on the current code (60 examples, seed 7, ≤ 10 shrinks):
 | subscription `noLeakedInterest` | CONN-3: `publish, outageStart, next, drain, outageEnd` | 8–130s |
 | subscription `closedHandlerOnce` | CONN-10: `publish, drain, unsubscribe` | 9–90s |
 
-Against the patched copy (below), every one of these subtests passes.
+With the fixes, every one of these subtests passes. Re-run of the new tests
+against the unfixed library (a worktree of the base commit with these test
+files copied in): all 13 reproducers, both default machines and all six
+focused subtests fail.
 
-## Validation of the proposed fixes
+## Validation of the fixes
 
-All the diffs above were applied together to a scratch copy of the repository
-outside this tree. The library files here are untouched. The combined patch is
-about 260 lines and consists exactly of the hunks shown per finding. Results:
+The fixes on `fix/conn` follow the diffs above, with small deviations noted
+per finding (CONN-4: `max <= 0`; CONN-8: a nil check before closing
+`nc.conn`; CONN-10: the handler guard only, as described below). Measured on
+`fix/conn`:
+
+* `cd modeltest && ./run.sh ./conn/... ./reqrep/...`: pass; `./conn/...` 3 of
+  3 runs pass (about 114s per run).
+* `models/tlc.sh ConnLifecycle`: all 19 configs as expected (passing configs
+  pass, every `*_bug.cfg` reproduces its violation), 2m29s.
+* `go test -modfile=go_test.mod -race -tags=internal_testing .`: pass.
+* `go test ... -p=1 ./test/...` (full suite, about 230s): two runs; each had
+  one failure, both flaky on the base commit too:
+  `TestKeyValueDuplicatesWindow` ("error creating store for stream" from the
+  server; 1 of 60 runs failed on the base commit, 0 of 65 isolated runs on
+  `fix/conn`) and
+  `TestJetStreamOrderedConsumerSlowConsumer/HeartbeatRecovery` (6 of 12
+  isolated runs failed on the base commit, 4 of 12 on `fix/conn`).
+* `./jetstream/test/... -run 'Status|Reconnect|Consume|Messages|Publish'`:
+  only `TestConsumerPrioritized` fails, 5 of 5 runs on the base commit and on
+  `fix/conn` alike.
+
+Earlier validation of the proposed diffs on a scratch copy (kept for
+reference):
 
 * all 13 reproducers pass;
 * both zizek machines pass with every known-bug invariant on (77s);

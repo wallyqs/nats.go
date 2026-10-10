@@ -14,8 +14,9 @@
 package conn
 
 // Reproducers for the findings of models/ConnLifecycle (see its README for
-// the TLC traces). Each test asserts the correct behavior, so it fails on the
-// current code; harness.KnownBug skips it unless MODELTEST_KNOWN_BUGS=1.
+// the TLC traces). Each test asserts the correct behavior. They failed on the
+// code the model was written against; all the findings are fixed now, and
+// the reproducers run as regression tests.
 
 import (
 	"sync/atomic"
@@ -30,7 +31,6 @@ import (
 // on the listener channel. When the channel holds an undelivered event, the
 // probe consumes it and unregisters the listener (nats.go:6833-6851).
 func TestConn1StatusListenerLosesEvents(t *testing.T) {
-	harness.KnownBug(t, "CONN-1")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	reconnected := make(chan struct{}, 4)
@@ -63,7 +63,6 @@ func TestConn1StatusListenerLosesEvents(t *testing.T) {
 // otherwise it receives one event and leaves the channel open
 // (nats.go:6799-6806), contradicting its doc comment.
 func TestConn2RemoveStatusListenerDoesNotClose(t *testing.T) {
-	harness.KnownBug(t, "CONN-2")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	nc := connect(t, p.URL(), nats.ReconnectWait(20*time.Millisecond))
@@ -90,7 +89,6 @@ func TestConn2RemoveStatusListenerDoesNotClose(t *testing.T) {
 // checkDrained (nats.go:5503) without an UNSUB: the server keeps the interest
 // for the life of the connection.
 func TestConn3DrainDuringReconnectLeaksServerInterest(t *testing.T) {
-	harness.KnownBug(t, "CONN-3")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	nc := connect(t, p.URL(), nats.ReconnectWait(20*time.Millisecond))
@@ -125,7 +123,6 @@ func TestConn3DrainDuringReconnectLeaksServerInterest(t *testing.T) {
 // client and not at all by the server: the client removes the subscription
 // after max, the server keeps it for that many more messages.
 func TestConn4AutoUnsubscribeAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "CONN-4")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	pub := connect(t, s.URL())
@@ -177,7 +174,6 @@ func TestConn4AutoUnsubscribeAfterReconnect(t *testing.T) {
 // already received and still pending in the client. The client removes the
 // subscription after max messages; the server keeps it for `pending` more.
 func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
-	harness.KnownBug(t, "CONN-4")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	pub := connect(t, s.URL())
@@ -203,6 +199,11 @@ func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
 		t.Fatal("messages did not arrive")
 	}
 	p.Cut()
+	// Wait for the reconnect itself: right after the cut the client may not
+	// have noticed it yet and still report CONNECTED.
+	if !harness.Eventually(5*time.Second, func() bool { return nc.Stats().Reconnects == 1 }) {
+		t.Fatal("no reconnect")
+	}
 	waitStatus(t, nc, nats.CONNECTED, 5*time.Second)
 	nc.Flush()
 	close(gate)
@@ -228,7 +229,6 @@ func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
 // the connection. Here the write fails part way like a FlusherTimeout expiry
 // on a slow server, and the client never retries.
 func TestConn5PendingFlushFailureStallsReconnect(t *testing.T) {
-	harness.KnownBug(t, "CONN-5")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	d := &faultDialer{}
@@ -256,7 +256,6 @@ func TestConn5PendingFlushFailureStallsReconnect(t *testing.T) {
 // connection completes the oldest of them: Flush returns nil although the
 // message published before it never reached the server.
 func TestConn5FlushSucceedsForLostMessage(t *testing.T) {
-	harness.KnownBug(t, "CONN-5")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	sc := connect(t, s.URL())
@@ -288,7 +287,6 @@ func TestConn5FlushSucceedsForLostMessage(t *testing.T) {
 // matched by processPong (nats.go:4272) against the *new* pongs list, so a
 // Flush issued during the reconnect returns nil without any round trip.
 func TestConn6StalePongCompletesNewFlush(t *testing.T) {
-	harness.KnownBug(t, "CONN-6")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	d := &faultDialer{}
@@ -320,7 +318,6 @@ func TestConn6StalePongCompletesNewFlush(t *testing.T) {
 // every later back-off sleep of that reconnect episode returns immediately and
 // MaxReconnects is exhausted in a tight loop.
 func TestConn7ForceReconnectDisablesBackoff(t *testing.T) {
-	harness.KnownBug(t, "CONN-7")
 	s := harness.RunServer(t, false)
 	var attempts atomic.Int64
 	nc := connect(t, s.URL(),
@@ -358,7 +355,6 @@ var firstRetryFast = nats.CustomReconnectDelay(func(attempts int) time.Duration 
 // until the next dial overwrites nc.conn and the garbage collector finalizes
 // it.
 func TestConn8FailedReconnectHandshakeLeaksSocket(t *testing.T) {
-	harness.KnownBug(t, "CONN-8")
 	eof := make(chan bool, 1)
 	fs := newFakeServer(t, func(i int, c *fakeConn) {
 		if err := c.handshake(); err != nil {
@@ -391,7 +387,6 @@ func TestConn8FailedReconnectHandshakeLeaksSocket(t *testing.T) {
 // deliver a second DisconnectedErrCB (close() keys it on nc.conn != nil,
 // nats.go:6287), after the one doReconnect already delivered.
 func TestConn9DoubleDisconnectCallback(t *testing.T) {
-	harness.KnownBug(t, "CONN-9")
 	attempted := make(chan struct{}, 1)
 	fs := newFakeServer(t, func(i int, c *fakeConn) {
 		if err := c.handshake(); err != nil {
@@ -429,7 +424,6 @@ func TestConn9DoubleDisconnectCallback(t *testing.T) {
 // checkDrained, which calls removeSub even when the subscription is already
 // closed (nats.go:5503-5506).
 func TestConn10ClosedHandlerCalledTwice(t *testing.T) {
-	harness.KnownBug(t, "CONN-10")
 	s := harness.RunServer(t, false)
 	nc := connect(t, s.URL())
 	sub, err := nc.SubscribeSync("conn10")
@@ -457,7 +451,6 @@ func TestConn10ClosedHandlerCalledTwice(t *testing.T) {
 // doReconnect queues afterwards is never run. Here the ping timer declares the
 // connection stale while the readLoop is still busy with bytes it has read.
 func TestConn11CloseLosesDisconnectCallback(t *testing.T) {
-	harness.KnownBug(t, "CONN-11")
 	s := harness.RunServer(t, false)
 	d := &faultDialer{}
 	var log cbLog

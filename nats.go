@@ -774,6 +774,14 @@ type Subscription struct {
 	pMsgsLimit  int
 	pBytesLimit int
 	dropped     int
+
+	// Messages that reached processMsg for this subscription, including
+	// slow consumer drops: what the server counts against an auto-unsubscribe
+	// max. The server starts counting again from every (re)SUB, so
+	// receivedBase holds the value of received at the last
+	// resendSubscriptions.
+	received     uint64
+	receivedBase uint64
 }
 
 // Status represents the state of the connection.
@@ -2668,6 +2676,7 @@ func (nc *Conn) ForceReconnect() error {
 	nc.conn.Close()
 
 	nc.changeConnStatus(RECONNECTING)
+	nc.pushDisconnectedCB(nil)
 	go nc.doReconnect(nil, true)
 	return nil
 }
@@ -3369,15 +3378,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 	// Clear any errors.
 	nc.err = nil
 
-	// Perform appropriate callback if needed for a disconnect.
-	// DisconnectedErrCB has priority over deprecated DisconnectedCB
-	if !nc.initc {
-		if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
-			nc.ach.push(func() { disconnectedErrCB(nc, err) })
-		} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {
-			nc.ach.push(func() { disconnectedCB(nc) })
-		}
-	} else if nc.Opts.RetryOnFailedConnect && nc.initc && err != nil {
+	// The disconnect callback was queued by whoever started the reconnect
+	// (processOpErr, ForceReconnect), under the same lock hold as the status
+	// change: queuing it here, after waitForExits, would lose it to a Close
+	// that runs in between (close() queues the dispatcher's close marker).
+	if nc.Opts.RetryOnFailedConnect && nc.initc && err != nil {
 		// For initial connection failure with RetryOnFailedConnect,
 		// report the error via ReconnectErrCB if available
 		if nc.Opts.ReconnectErrCB != nil {
@@ -3493,8 +3498,11 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 				select {
 				case <-rqch:
 					rt.Stop()
+					// Select on the new channel from now on: the closed
+					// one would bypass every later delay.
 					nc.mu.Lock()
-					nc.rqch = make(chan struct{})
+					rqch = make(chan struct{})
+					nc.rqch = rqch
 					nc.mu.Unlock()
 				case <-rt.C:
 				}
@@ -3527,9 +3535,12 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 				rt.Stop()
 
 				// we need to reset the rqch channel to avoid
-				// closing a closed channel in the next iteration
+				// closing a closed channel in the next iteration,
+				// and select on the new one from now on: the closed
+				// one would bypass every later back-off sleep.
 				nc.mu.Lock()
-				nc.rqch = make(chan struct{})
+				rqch = make(chan struct{})
+				nc.rqch = rqch
 				nc.mu.Unlock()
 			case <-rt.C:
 			}
@@ -3567,6 +3578,12 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 
 		// Process connect logic
 		if nc.err = nc.processConnectInit(); nc.err != nil {
+			// Close the socket of the failed handshake, as connect()
+			// does, rather than keep it open through the back-off.
+			if nc.conn != nil {
+				nc.conn.Close()
+				nc.conn = nil
+			}
 			// Check if we should abort reconnect. If so, break out
 			// of the loop and connection will be closed.
 			if nc.ar {
@@ -3593,6 +3610,15 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 			nc.changeConnStatus(RECONNECTING)
 			// Stop the ping timer (if set)
 			nc.stopPingTimer()
+			// The PINGs of pending flush calls were in the discarded
+			// buffer, so release their waiters: otherwise a PONG on the
+			// next connection would complete a Flush whose messages never
+			// reached the server. The socket may hold a truncated op, and
+			// leaving it open would keep its readLoop (and so the
+			// waitForExits below) blocked until the server drops it.
+			nc.clearPendingFlushCalls()
+			nc.conn.Close()
+			nc.conn = nil
 			// Since processConnectInit() returned without error, the
 			// go routines were started, so wait for them to return
 			// on the next iteration (after releasing the lock).
@@ -3660,6 +3686,7 @@ func (nc *Conn) processOpErr(err error, forceReconnect bool) bool {
 		// Clear any queued pongs, e.g. pending flush calls.
 		nc.clearPendingFlushCalls()
 
+		nc.pushDisconnectedCB(err)
 		go nc.doReconnect(err, forceReconnect)
 		return false
 	}
@@ -3667,6 +3694,20 @@ func (nc *Conn) processOpErr(err error, forceReconnect bool) bool {
 	nc.changeConnStatus(DISCONNECTED)
 	nc.err = err
 	return true
+}
+
+// pushDisconnectedCB queues the disconnect callback of a connection that
+// starts reconnecting. DisconnectedErrCB has priority over deprecated
+// DisconnectedCB. Lock is held on entry.
+func (nc *Conn) pushDisconnectedCB(err error) {
+	if nc.initc {
+		return
+	}
+	if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
+		nc.ach.push(func() { disconnectedErrCB(nc, err) })
+	} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {
+		nc.ach.push(func() { disconnectedCB(nc) })
+	}
 }
 
 // dispatch is responsible for calling any async callbacks
@@ -3967,6 +4008,7 @@ func (nc *Conn) processMsg(data []byte) {
 		sub.mu.Unlock()
 		return
 	}
+	sub.received++
 
 	// Skip flow control messages in case of using a JetStream context.
 	jsi := sub.jsi
@@ -4273,6 +4315,15 @@ func (nc *Conn) processPong() {
 	var ch chan struct{}
 
 	nc.mu.Lock()
+	// A PONG parsed after the connection was given up (ForceReconnect, stale
+	// connection, -ERR in the middle of a read buffer) answers a PING whose
+	// waiter has already been released by clearPendingFlushCalls; nc.pongs
+	// now holds waiters for PINGs sent on the next connection only. That one
+	// is established only after this readLoop has exited (waitForExits).
+	if !nc.isConnected() {
+		nc.mu.Unlock()
+		return
+	}
 	if len(nc.pongs) > 0 {
 		ch = nc.pongs[0]
 		nc.pongs = append(nc.pongs[:0], nc.pongs[1:]...)
@@ -4850,6 +4901,7 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 		// will be on a wildcard.
 		s, err := nc.subscribeLocked(nc.respSub, _EMPTY_, nc.respHandler, nil, nil, false, nil)
 		if err != nil {
+			delete(nc.respMap, token)
 			nc.mu.Unlock()
 			return nil, token, err
 		}
@@ -4858,6 +4910,11 @@ func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Ms
 	nc.mu.Unlock()
 
 	if err := nc.publish(subj, respInbox, false, hdr, data); err != nil {
+		// The caller returns the error without waiting for a response:
+		// remove the entry, nothing else ever would but Close.
+		nc.mu.Lock()
+		delete(nc.respMap, token)
+		nc.mu.Unlock()
 		return nil, token, err
 	}
 
@@ -5238,6 +5295,13 @@ func (nc *Conn) removeSub(s *Subscription) {
 	nc.subsMu.Lock()
 	delete(nc.subs, s.sid)
 	nc.subsMu.Unlock()
+	// The shared response subscription is gone (e.g. a caller unsubscribed
+	// or drained the Sub of a reply, which is nc.respMux): let the next
+	// request create a new one rather than publish requests whose replies
+	// nobody receives.
+	if s == nc.respMux {
+		nc.respMux = nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Release callers on NextMsg for SyncSubscription only
@@ -5258,7 +5322,11 @@ func (nc *Conn) removeSub(s *Subscription) {
 		}
 	}
 
-	if s.typ != AsyncSubscription {
+	// Call the closed handler only the first time: checkDrained calls
+	// removeSub again on a subscription already removed while it was
+	// draining (Unsubscribe, or an AutoUnsubscribe max reached in NextMsg).
+	// Async subscriptions call it once, from waitForMsgs.
+	if s.typ != AsyncSubscription && !s.closed {
 		done := s.pDone
 		if done != nil {
 			done(s.Subject)
@@ -5550,11 +5618,20 @@ func (s *Subscription) SetClosedHandler(handler func(subject string)) {
 // Use Subscription.Unsubscribe()
 func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 	var maxStr string
+	// Remove the subscription now unless max messages are still to be
+	// delivered to the user.
+	remove := max <= 0
 	if max > 0 {
 		sub.mu.Lock()
 		sub.max = uint64(max)
-		if sub.delivered < sub.max {
-			maxStr = strconv.Itoa(max)
+		remove = sub.delivered >= sub.max
+		// The max is counted over the life of the subscription, but the
+		// server counts only the messages it sent since the last (re)SUB.
+		// If max messages have already been received (some may still be
+		// pending in the client), stop the server with a plain UNSUB and
+		// let the pending ones be delivered.
+		if sub.received < sub.max {
+			maxStr = strconv.FormatUint(sub.max-sub.receivedBase, 10)
 		}
 		sub.mu.Unlock()
 	}
@@ -5575,7 +5652,7 @@ func (nc *Conn) unsubscribe(sub *Subscription, max int, drainMode bool) error {
 		return nil
 	}
 
-	if maxStr == _EMPTY_ && !drainMode {
+	if remove && !drainMode {
 		nc.removeSub(s)
 	}
 
@@ -6148,14 +6225,27 @@ func (nc *Conn) resendSubscriptions() {
 	for sid, s := range subs {
 		adjustedMax := uint64(0)
 		s.mu.Lock()
+		// A draining subscription has already removed its interest (or had
+		// its UNSUB suppressed or lost with the old connection): it stays in
+		// nc.subs only until checkDrained removes it client side, which sends
+		// no UNSUB, so re-subscribing it here would leave the interest on the
+		// server for the life of the connection.
+		if s.draining {
+			s.mu.Unlock()
+			continue
+		}
 		// when resending subscriptions, the permissions error should be cleared
 		// since the user may have fixed the permissions issue
 		s.permissionsErr = nil
+		// The server counts the max from the SUB sent below.
+		s.receivedBase = s.received
 		if s.max > 0 {
-			if s.delivered < s.max {
-				adjustedMax = s.max - s.delivered
+			// Count what was received, not what was delivered: messages
+			// still pending in the client count toward the max too.
+			if s.received < s.max {
+				adjustedMax = s.max - s.received
 			}
-			// adjustedMax could be 0 here if the number of delivered msgs
+			// adjustedMax could be 0 here if the number of received msgs
 			// reached the max, if so unsubscribe.
 			if adjustedMax == 0 {
 				s.mu.Unlock()
@@ -6208,6 +6298,8 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		nc.mu.Unlock()
 		return
 	}
+	// A reconnecting connection has already reported its disconnect.
+	wasReconnecting := nc.isReconnecting()
 	nc.status = CLOSED
 
 	// Kick the Go routines so they fall out.
@@ -6284,7 +6376,7 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 
 	// Perform appropriate callback if needed for a disconnect.
 	if doCBs {
-		if nc.conn != nil {
+		if nc.conn != nil && !wasReconnecting {
 			if disconnectedErrCB := nc.Opts.DisconnectedErrCB; disconnectedErrCB != nil {
 				nc.ach.push(func() { disconnectedErrCB(nc, err) })
 			} else if disconnectedCB := nc.Opts.DisconnectedCB; disconnectedCB != nil {
@@ -6800,17 +6892,17 @@ func (nc *Conn) RemoveStatusListener(ch chan (Status)) {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 
-	select {
-	case <-ch:
-	default:
-		close(ch)
+	for _, listeners := range nc.statListeners {
+		delete(listeners, ch)
 	}
 
-	for _, listeners := range nc.statListeners {
-		for range listeners {
-			delete(listeners, ch)
-		}
-	}
+	// Close the channel even if it holds an event the listener has not read
+	// yet: the listener still receives that event, then sees the close.
+	// Receiving from the channel to find out whether it is closed would
+	// consume that event and leave the channel open. Tolerate a channel the
+	// caller has already closed.
+	defer func() { _ = recover() }()
+	close(ch)
 }
 
 // registerStatusChangeListener registers a channel waiting for a specific status change event.
@@ -6831,22 +6923,30 @@ func (nc *Conn) registerStatusChangeListener(status Status, ch chan Status) {
 // If channel is closed, or there is no listener, sendStatusEvent
 // will not block. Lock should be held entering.
 func (nc *Conn) sendStatusEvent(s Status) {
-Loop:
 	for ch := range nc.statListeners[s] {
-		// make sure channel is not closed
-		select {
-		case <-ch:
-			// if chan is closed, remove it
+		// Never receive from ch to find out whether it is closed: on an open
+		// channel that would consume an event the listener has not read yet
+		// (and unregister a live listener). Channels closed by their owner
+		// without RemoveStatusListener are detected by the send instead.
+		if !trySendStatus(ch, s) {
 			delete(nc.statListeners[s], ch)
-			continue Loop
-		default:
-		}
-		// only send event if someone's listening
-		select {
-		case ch <- s:
-		default:
 		}
 	}
+}
+
+// trySendStatus sends s on ch if there is room for it, without blocking.
+// It reports false if ch has been closed.
+func trySendStatus(ch chan Status, s Status) (open bool) {
+	defer func() {
+		if recover() != nil {
+			open = false
+		}
+	}()
+	select {
+	case ch <- s:
+	default:
+	}
+	return true
 }
 
 // changeConnStatus changes connections status and sends events
