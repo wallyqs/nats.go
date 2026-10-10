@@ -228,7 +228,6 @@ func TestConn4AutoUnsubscribeResendIgnoresPending(t *testing.T) {
 // the connection. Here the write fails part way like a FlusherTimeout expiry
 // on a slow server, and the client never retries.
 func TestConn5PendingFlushFailureStallsReconnect(t *testing.T) {
-	harness.KnownBug(t, "CONN-5")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	d := &faultDialer{}
@@ -256,7 +255,6 @@ func TestConn5PendingFlushFailureStallsReconnect(t *testing.T) {
 // connection completes the oldest of them: Flush returns nil although the
 // message published before it never reached the server.
 func TestConn5FlushSucceedsForLostMessage(t *testing.T) {
-	harness.KnownBug(t, "CONN-5")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	sc := connect(t, s.URL())

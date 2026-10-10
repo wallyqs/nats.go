@@ -3601,6 +3601,15 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 			nc.changeConnStatus(RECONNECTING)
 			// Stop the ping timer (if set)
 			nc.stopPingTimer()
+			// The PINGs of pending flush calls were in the discarded
+			// buffer, so release their waiters: otherwise a PONG on the
+			// next connection would complete a Flush whose messages never
+			// reached the server. The socket may hold a truncated op, and
+			// leaving it open would keep its readLoop (and so the
+			// waitForExits below) blocked until the server drops it.
+			nc.clearPendingFlushCalls()
+			nc.conn.Close()
+			nc.conn = nil
 			// Since processConnectInit() returned without error, the
 			// go routines were started, so wait for them to return
 			// on the next iteration (after releasing the lock).
