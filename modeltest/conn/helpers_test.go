@@ -109,11 +109,37 @@ func (d *faultDialer) armRead(marker string) *readHold {
 
 type faultConn struct {
 	net.Conn
-	d *faultDialer
+	d       *faultDialer
+	written []byte // every write attempted on this socket, failed ones included (d.mu)
+}
+
+// pingFollows reports whether b was written (or attempted) on some socket
+// and a PING was written on that same socket after it.
+func (d *faultDialer) pingFollows(b []byte) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.conns {
+		if i := bytes.Index(c.written, b); i >= 0 && bytes.Contains(c.written[i+len(b):], []byte("PING")) {
+			return true
+		}
+	}
+	return false
+}
+
+// pings counts the PINGs written (or attempted) on all sockets.
+func (d *faultDialer) pings() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, c := range d.conns {
+		n += bytes.Count(c.written, []byte("PING\r\n"))
+	}
+	return n
 }
 
 func (c *faultConn) Write(p []byte) (int, error) {
 	c.d.mu.Lock()
+	c.written = append(c.written, p...)
 	f := c.d.wfault
 	if f != nil && bytes.Contains(p, []byte(f.marker)) {
 		c.d.wfault = nil

@@ -14,8 +14,9 @@
 package conn
 
 // Reproducers for the findings of models/ConnLifecycle (see its README for
-// the TLC traces). Each test asserts the correct behavior, so it fails on the
-// current code; harness.KnownBug skips it unless MODELTEST_KNOWN_BUGS=1.
+// the TLC traces). Each test asserts the correct behavior. They failed on the
+// code the model was written against; all the findings are fixed now, and
+// the reproducers run as regression tests.
 
 import (
 	"sync/atomic"

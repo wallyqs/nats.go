@@ -19,12 +19,14 @@ package conn
 // invariants are the model's invariants, checked on settled state after every
 // step.
 //
-// Every machine runs twice:
-//   - TestXxxMachine checks the invariants that hold on the code as it is,
-//     with the rules that only lead to known bugs left out. It must pass.
-//   - TestXxxMachineKnownBugs adds those rules and the invariants the
-//     model's *_bug.cfg configs violate. It is gated by harness.KnownBug and
-//     is expected to fail today with a shrunk counterexample.
+// Every machine runs twice, and both must pass:
+//   - TestXxxMachine runs every rule and checks the cheap invariants after
+//     every step.
+//   - TestXxxMachineFocused has one subtest per invariant that a *_bug.cfg
+//     config of the model violates (CONN-1, 3, 5, 6, 7, 9, 10 before they
+//     were fixed): more examples, with the rules that lead to that bug and
+//     the settling that invariant needs. Each of them found its bug with a
+//     shrunk counterexample on the unfixed code (see the model README).
 
 import (
 	"bytes"
@@ -63,13 +65,14 @@ type flushRec struct {
 	done    chan struct{}
 	err     error
 	checked bool
-	split   bool // the status changed between Publish and Flush
+	split   bool  // the status changed between Publish and Flush
+	changes int64 // status changes seen before the Publish
 }
 
 type lcMachine struct {
 	t      testing.TB
 	strict bool
-	focus  string // strict: the one known-bug invariant enforced
+	focus  string // strict: the one focused invariant enforced
 
 	srv *harness.Server
 	p   *harness.Proxy
@@ -166,12 +169,20 @@ func (m *lcMachine) teardown() {
 // connection, is lost by design (at-most-once). Such pairs are marked and not
 // checked by flushIntegrity: the status must not change between the Publish
 // and the Flush call.
+//
+// The step returns only once the Flush has queued its PING (it was written,
+// or the pending buffer grew), as it would in a goroutine that calls Publish
+// and then Flush: a Flush goroutine that is scheduled late, after later
+// steps, would otherwise queue its PING behind a reconnect that the split
+// check above did not see.
 func (m *lcMachine) publishFlush(tc *zizek.TestCase) error {
 	id := m.next
 	m.next++
 	st0, ch0 := m.nc.Status(), m.changes.Load()
 	perr := m.nc.Publish(lcSubject, []byte(strconv.Itoa(id)))
-	r := &flushRec{id: id, start: time.Now(), done: make(chan struct{})}
+	r := &flushRec{id: id, start: time.Now(), done: make(chan struct{}), changes: ch0}
+	pings0 := m.d.pings()
+	buffered0, _ := m.nc.Buffered()
 	go func() {
 		if m.nc.Status() != st0 || m.changes.Load() != ch0 {
 			r.split = true
@@ -179,6 +190,18 @@ func (m *lcMachine) publishFlush(tc *zizek.TestCase) error {
 		r.err = m.nc.FlushTimeout(time.Second)
 		close(r.done)
 	}()
+	harness.Eventually(250*time.Millisecond, func() bool {
+		select {
+		case <-r.done:
+			return true
+		default:
+		}
+		if m.d.pings() > pings0 {
+			return true
+		}
+		b, err := m.nc.Buffered()
+		return err != nil || (st0 == nats.RECONNECTING && m.nc.Status() == nats.RECONNECTING && b > buffered0)
+	})
 	m.flushes = append(m.flushes, r)
 	tc.Note(fmt.Sprintf("publish %d (err %v) + flush, status %v", id, perr, st0))
 	return nil
@@ -378,6 +401,10 @@ func (m *lcMachine) flushIntegrity(tc *zizek.TestCase) error {
 				tc.Note(fmt.Sprintf("message %d was lost in a failed write without the Flush's PING: not checked", r.id))
 				continue
 			}
+			if m.pingElsewhere(r) {
+				tc.Note(fmt.Sprintf("message %d was lost with a connection that its Flush's PING did not travel on: not checked", r.id))
+				continue
+			}
 			return fmt.Errorf("Flush after message %d returned nil, but the message never reached the server", r.id)
 		}
 	}
@@ -401,6 +428,19 @@ func (m *lcMachine) lostBeforePing(id int) bool {
 		}
 	}
 	return false
+}
+
+// pingElsewhere reports whether the status changed after the message of r
+// was published and no PING followed the message on the socket it was
+// written to (if it was written at all): the message was lost with that
+// connection, written to a dead socket or still in the write buffer that the
+// reconnect drops, while the Flush's PING went on the next connection. That
+// is core NATS at-most-once delivery, not a broken Flush. The "split" check
+// in publishFlush misses it when the disconnect lands between its status
+// check and FlushTimeout taking the connection lock.
+func (m *lcMachine) pingElsewhere(r *flushRec) bool {
+	pub := []byte(fmt.Sprintf("PUB %s %d\r\n%d\r\n", lcSubject, len(strconv.Itoa(r.id)), r.id))
+	return m.changes.Load() > r.changes && !m.d.pingFollows(pub)
 }
 
 // Liveness, checked on settled state: with the network healthy, an open
@@ -477,9 +517,9 @@ func statusName(s nats.Status) string {
 	return s.String()
 }
 
-// lcProperty runs the lifecycle machine. With focus == "" it uses only the
-// rules and invariants that hold today; otherwise it adds the rules that
-// reach the known bugs and enforces the named known-bug invariant.
+// lcProperty runs the lifecycle machine. With focus == "" it uses every rule
+// and the invariants that need no extra settling; otherwise it uses the
+// rules that reach the bug behind the named invariant and enforces it.
 func lcProperty(t testing.TB, focus string) func(tc *zizek.TestCase) error {
 	return func(tc *zizek.TestCase) error {
 		m, err := newLC(t, focus)
@@ -499,17 +539,11 @@ func lcProperty(t testing.TB, focus string) func(tc *zizek.TestCase) error {
 			"armWriteFault":  (*lcMachine).armWriteFault,
 			"holdPong":       (*lcMachine).holdPong,
 			"releasePong":    (*lcMachine).releasePong,
-			// ForceReconnect only while connected: while RECONNECTING it
-			// reaches CONN-7.
-			"forceWhileConnected": func(m *lcMachine, tc *zizek.TestCase) error {
-				tc.Assume(m.nc.IsConnected())
-				return m.forceReconnect(tc)
-			},
 		}
-		// The rules each run uses: everything that holds today, or, for a
-		// known-bug invariant, the model actions that lead to it.
+		// The rules each run uses: all of them, or, for a focused
+		// invariant, the model actions that lead to its bug.
 		names := map[string][]string{
-			"":                   {"publishFlush", "cut", "block", "unblock", "refuse", "allow", "close", "forceWhileConnected"},
+			"":                   {"publishFlush", "cut", "block", "unblock", "refuse", "allow", "close", "forceReconnect", "armWriteFault", "holdPong", "releasePong"},
 			"lazyListener":       {"publishFlush", "cut", "block", "unblock", "close"},
 			"flushIntegrity":     {"publishFlush", "cut", "refuse", "allow", "forceReconnect", "armWriteFault", "holdPong", "releasePong"},
 			"reconnects":         {"publishFlush", "cut", "block", "unblock", "refuse", "allow", "forceReconnect", "armWriteFault"},
@@ -525,6 +559,10 @@ func lcProperty(t testing.TB, focus string) func(tc *zizek.TestCase) error {
 			{Name: "reconnects", Apply: (*lcMachine).reconnects},
 		}
 		switch focus {
+		case "":
+			inv = append(inv,
+				zizek.Rule[lcMachine]{Name: "noDoubleDisconnect", Apply: (*lcMachine).noDoubleDisconnect},
+				zizek.Rule[lcMachine]{Name: "lazyListener", Apply: (*lcMachine).lazyListener})
 		case "flushIntegrity":
 			inv = append(inv, zizek.Rule[lcMachine]{Name: focus, Apply: (*lcMachine).flushIntegrity})
 		case "noDoubleDisconnect":
@@ -554,16 +592,13 @@ func TestLifecycleMachine(t *testing.T) {
 	}
 }
 
-func TestLifecycleMachineKnownBugs(t *testing.T) {
-	for _, c := range []struct{ focus, ids string }{
-		{"lazyListener", "CONN-1"},
-		{"flushIntegrity", "CONN-5/CONN-6"},
-		{"reconnects", "CONN-5/CONN-7"},
-		{"noDoubleDisconnect", "CONN-9"},
-	} {
-		t.Run(c.focus, func(t *testing.T) {
-			harness.KnownBug(t, c.ids)
-			if err := zizek.Check(lcProperty(t, c.focus), machineConfig(true)); err != nil {
+// One subtest per invariant, with the findings it caught before they were
+// fixed: lazyListener (CONN-1), flushIntegrity (CONN-5, CONN-6), reconnects
+// (CONN-5, CONN-7), noDoubleDisconnect (CONN-9).
+func TestLifecycleMachineFocused(t *testing.T) {
+	for _, focus := range []string{"lazyListener", "flushIntegrity", "reconnects", "noDoubleDisconnect"} {
+		t.Run(focus, func(t *testing.T) {
+			if err := zizek.Check(lcProperty(t, focus), machineConfig(true)); err != nil {
 				t.Fatal(err)
 			}
 		})
@@ -575,9 +610,7 @@ func TestLifecycleMachineKnownBugs(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 type srMachine struct {
-	t      testing.TB
-	strict bool
-	focus  string
+	t testing.TB
 
 	srv *harness.Server
 	p   *harness.Proxy
@@ -594,14 +627,13 @@ type srMachine struct {
 	drained    bool
 	unsubbed   bool
 	outage     bool
-	noOutages  bool // non-strict: no disconnects after Drain
 	handlerRun atomic.Int64
 }
 
 const srSubject = "sr.m"
 
-func newSR(t testing.TB, focus string, queue bool) (*srMachine, error) {
-	m := &srMachine{t: t, strict: focus != "", focus: focus, gotAtAuto: -1, lastSeq: -1}
+func newSR(t testing.TB, queue bool) (*srMachine, error) {
+	m := &srMachine{t: t, gotAtAuto: -1, lastSeq: -1}
 	m.srv = harness.RunServer(t, false)
 	m.p = harness.NewProxy(t, m.srv.Addr())
 	var err error
@@ -688,7 +720,7 @@ func (m *srMachine) drain(tc *zizek.TestCase) error {
 
 // Disconnect + Reconnect in one step.
 func (m *srMachine) cut(tc *zizek.TestCase) error {
-	tc.Assume(!m.outage && !m.noOutages)
+	tc.Assume(!m.outage)
 	m.p.Cut()
 	harness.Eventually(3*time.Second, func() bool { return m.nc.IsConnected() })
 	tc.Note("cut, reconnected")
@@ -697,7 +729,7 @@ func (m *srMachine) cut(tc *zizek.TestCase) error {
 
 // Disconnect; later rules run while RECONNECTING until restore.
 func (m *srMachine) outageStart(tc *zizek.TestCase) error {
-	tc.Assume(!m.outage && !m.noOutages)
+	tc.Assume(!m.outage)
 	m.outage = true
 	m.p.Block()
 	harness.Eventually(3*time.Second, func() bool { return m.nc.IsReconnecting() })
@@ -728,7 +760,7 @@ func (m *srMachine) maxRespected(_ *zizek.TestCase) error {
 
 // ClosedHandlerOnce (CONN-10).
 func (m *srMachine) closedHandlerOnce(_ *zizek.TestCase) error {
-	if m.drained && m.strict && m.sub.IsValid() {
+	if m.drained && m.sub.IsValid() {
 		// Settle: give checkDrained (Flush, then a 100ms poll) time to act.
 		time.Sleep(150 * time.Millisecond)
 	}
@@ -763,13 +795,12 @@ func (m *srMachine) noLeakedInterest(_ *zizek.TestCase) error {
 
 // srProperty runs the subscription machine; focus as for lcProperty.
 func srProperty(t testing.TB, focus string) func(tc *zizek.TestCase) error {
-	strict := focus != ""
 	return func(tc *zizek.TestCase) error {
 		queue, err := tc.Boolean()
 		if err != nil {
 			return err
 		}
-		m, err := newSR(t, focus, queue)
+		m, err := newSR(t, queue)
 		if err != nil {
 			return err
 		}
@@ -784,27 +815,19 @@ func srProperty(t testing.TB, focus string) func(tc *zizek.TestCase) error {
 			{Name: "outageStart", Apply: (*srMachine).outageStart},
 			{Name: "outageEnd", Apply: (*srMachine).outageEnd},
 		}
+		rules = append(rules, zizek.Rule[srMachine]{Name: "drain", Apply: (*srMachine).drain})
 		inv := []zizek.Rule[srMachine]{
 			{Name: "maxRespected", Apply: (*srMachine).maxRespected},
 		}
-		if strict {
-			rules = append(rules, zizek.Rule[srMachine]{Name: "drain", Apply: (*srMachine).drain})
-			switch focus {
-			case "noLeakedInterest":
-				inv = append(inv, zizek.Rule[srMachine]{Name: focus, Apply: (*srMachine).noLeakedInterest})
-			case "closedHandlerOnce":
-				inv = append(inv, zizek.Rule[srMachine]{Name: focus, Apply: (*srMachine).closedHandlerOnce})
-			}
-		} else {
-			// Drain while connected and with no reconnect afterwards does not
-			// reach CONN-3; Unsubscribe after Drain reaches CONN-10.
-			rules = append(rules, zizek.Rule[srMachine]{Name: "drain", Apply: func(m *srMachine, tc *zizek.TestCase) error {
-				tc.Assume(!m.unsubbed && !m.outage)
-				m.unsubbed = true  // no Unsubscribe after Drain
-				m.noOutages = true // and no disconnects
-				return m.drain(tc)
-			}})
-			inv = append(inv, zizek.Rule[srMachine]{Name: "closedHandlerOnce", Apply: (*srMachine).closedHandlerOnce})
+		switch focus {
+		case "":
+			inv = append(inv,
+				zizek.Rule[srMachine]{Name: "noLeakedInterest", Apply: (*srMachine).noLeakedInterest},
+				zizek.Rule[srMachine]{Name: "closedHandlerOnce", Apply: (*srMachine).closedHandlerOnce})
+		case "noLeakedInterest":
+			inv = append(inv, zizek.Rule[srMachine]{Name: focus, Apply: (*srMachine).noLeakedInterest})
+		case "closedHandlerOnce":
+			inv = append(inv, zizek.Rule[srMachine]{Name: focus, Apply: (*srMachine).closedHandlerOnce})
 		}
 		err = zizek.RunSteps(m, zizek.Machine[srMachine]{Rules: rules, Invariants: inv}, tc, 16)
 		if err != nil {
@@ -820,14 +843,12 @@ func TestSubscriptionMachine(t *testing.T) {
 	}
 }
 
-func TestSubscriptionMachineKnownBugs(t *testing.T) {
-	for _, c := range []struct{ focus, ids string }{
-		{"noLeakedInterest", "CONN-3/CONN-4"},
-		{"closedHandlerOnce", "CONN-10"},
-	} {
-		t.Run(c.focus, func(t *testing.T) {
-			harness.KnownBug(t, c.ids)
-			if err := zizek.Check(srProperty(t, c.focus), machineConfig(true)); err != nil {
+// One subtest per invariant, with the findings it caught before they were
+// fixed: noLeakedInterest (CONN-3, CONN-4), closedHandlerOnce (CONN-10).
+func TestSubscriptionMachineFocused(t *testing.T) {
+	for _, focus := range []string{"noLeakedInterest", "closedHandlerOnce"} {
+		t.Run(focus, func(t *testing.T) {
+			if err := zizek.Check(srProperty(t, focus), machineConfig(true)); err != nil {
 				t.Fatal(err)
 			}
 		})
