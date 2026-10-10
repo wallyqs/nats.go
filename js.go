@@ -56,6 +56,10 @@ type JetStream interface {
 	PublishAsyncPending() int
 
 	// PublishAsyncComplete returns a channel that will be closed when all outstanding messages are ack'd.
+	//
+	// Callers blocked in PublishMsgAsync waiting for a free slot under
+	// PublishAsyncMaxPending are not outstanding yet, so the channel may
+	// be closed while such a caller is still about to publish.
 	PublishAsyncComplete() <-chan struct{}
 
 	// CleanupPublisher will cleanup the publishing side of JetStreamContext.
@@ -702,8 +706,17 @@ func (paf *pubAckFuture) Msg() *Msg {
 // For quick token lookup etc.
 const aReplyTokensize = 6
 
-func (js *js) newAsyncReply() string {
+// newAsyncReply ensures the async reply subscription, prefix, RNG, and
+// reconnect listener are set up. Reply tokens are allocated in registerPAF
+// under the same lock that inserts into pafs.
+func (js *js) newAsyncReply() error {
 	js.mu.Lock()
+	defer js.mu.Unlock()
+	return js.ensureAsyncReplyLocked()
+}
+
+// ensureAsyncReplyLocked is newAsyncReply with the lock held.
+func (js *js) ensureAsyncReplyLocked() error {
 	if js.rsub == nil {
 		// Create our wildcard reply subject.
 		sha := sha256.New()
@@ -715,8 +728,7 @@ func (js *js) newAsyncReply() string {
 		js.rpre = fmt.Sprintf("%s%s.", js.replyPrefix, b[:aReplyTokensize])
 		sub, err := js.nc.Subscribe(fmt.Sprintf("%s*", js.rpre), js.handleAsyncReply)
 		if err != nil {
-			js.mu.Unlock()
-			return _EMPTY_
+			return err
 		}
 		js.rsub = sub
 		js.rr = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -725,24 +737,7 @@ func (js *js) newAsyncReply() string {
 		js.connStatusCh = js.nc.StatusChanged(RECONNECTING, CLOSED)
 		go js.resetPendingAcksOnReconnect()
 	}
-	var sb strings.Builder
-	sb.Grow(len(js.rpre) + aReplyTokensize)
-	sb.WriteString(js.rpre)
-	for {
-		rn := js.rr.Int63()
-		var b [aReplyTokensize]byte
-		for i, l := 0, rn; i < len(b); i++ {
-			b[i] = rdigits[l%base]
-			l /= base
-		}
-		if _, ok := js.pafs[string(b[:])]; ok {
-			continue
-		}
-		sb.Write(b[:])
-		break
-	}
-	js.mu.Unlock()
-	return sb.String()
+	return nil
 }
 
 func (js *js) resetPendingAcksOnReconnect() {
@@ -767,6 +762,7 @@ func (js *js) resetPendingAcksOnReconnect() {
 			}
 			delete(js.pafs, id)
 		}
+		js.maybeUnstall()
 		dch := js.dch
 		js.dch = nil
 		js.mu.Unlock()
@@ -804,6 +800,8 @@ func (js *js) CleanupPublisher() {
 		}
 		delete(js.pafs, id)
 	}
+	// wake callers stalled on max pending: there is room now
+	js.maybeUnstall()
 	if js.dch != nil {
 		close(js.dch)
 		js.dch = nil
@@ -816,6 +814,9 @@ func (js *js) cleanupReplySub() {
 	if js.rsub != nil {
 		js.rsub.Unsubscribe()
 		js.rsub = nil
+		// registerPAF re-creates the subscription (under a new prefix)
+		// when it sees the prefix cleared.
+		js.rpre = _EMPTY_
 	}
 	if js.connStatusCh != nil {
 		close(js.connStatusCh)
@@ -824,18 +825,71 @@ func (js *js) cleanupReplySub() {
 	js.mu.Unlock()
 }
 
-// registerPAF will register for a PubAckFuture.
-func (js *js) registerPAF(id string, paf *pubAckFuture) (int, int) {
-	js.mu.Lock()
-	if js.pafs == nil {
-		js.pafs = make(map[string]*pubAckFuture)
+// registerPAF will register for a PubAckFuture. If max pending is set and
+// the publisher is already at the cap, it stalls until a slot frees or
+// stallWait elapses. The reply token is drawn and inserted under the same
+// lock hold so pending cannot exceed maxPending and ids cannot collide
+// across stalled callers.
+func (js *js) registerPAF(paf *pubAckFuture, stallWait time.Duration) (string, error) {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		js.mu.Lock()
+		if js.pafs == nil {
+			js.pafs = make(map[string]*pubAckFuture)
+		}
+		maxpa := js.opts.maxpa
+		if maxpa > 0 && len(js.pafs) >= maxpa {
+			if js.stc == nil {
+				js.stc = make(chan struct{})
+			}
+			stc := js.stc
+			js.mu.Unlock()
+			if timer == nil {
+				timer = time.NewTimer(stallWait)
+			}
+			select {
+			case <-stc:
+				continue
+			case <-timer.C:
+				return _EMPTY_, ErrTooManyStalledMsgs
+			}
+		}
+		// CleanupPublisher ran since newAsyncReply (it clears the prefix
+		// along with the reply subscription): never register under a
+		// prefix nobody listens on, the future would never be resolved.
+		if js.rpre == _EMPTY_ {
+			if err := js.ensureAsyncReplyLocked(); err != nil {
+				js.mu.Unlock()
+				return _EMPTY_, errors.New("nats: error creating async reply handler")
+			}
+		}
+		// Allocate a unique reply token under the insert lock.
+		var id string
+		for {
+			rn := js.rr.Int63()
+			var b [aReplyTokensize]byte
+			for i, l := 0, rn; i < len(b); i++ {
+				b[i] = rdigits[l%base]
+				l /= base
+			}
+			if _, ok := js.pafs[string(b[:])]; ok {
+				continue
+			}
+			id = string(b[:])
+			break
+		}
+		reply := js.rpre + id
+		paf.js = js
+		paf.reply = reply
+		js.pafs[id] = paf
+		js.mu.Unlock()
+		return reply, nil
 	}
-	paf.js = js
-	js.pafs[id] = paf
-	np := len(js.pafs)
-	maxpa := js.opts.maxpa
-	js.mu.Unlock()
-	return np, maxpa
 }
 
 // Lock should be held.
@@ -850,7 +904,17 @@ func (js *js) getPAF(id string) *pubAckFuture {
 func (js *js) clearPAF(id string) {
 	js.mu.Lock()
 	delete(js.pafs, id)
+	js.maybeUnstall()
 	js.mu.Unlock()
+}
+
+// maybeUnstall closes stc when under the max pending cap so a waiter
+// in registerPAF can proceed. Lock should be held.
+func (js *js) maybeUnstall() {
+	if js.stc != nil && len(js.pafs) < js.opts.maxpa {
+		close(js.stc)
+		js.stc = nil
+	}
 }
 
 // PublishAsyncPending returns how many PubAckFutures are pending.
@@ -858,16 +922,6 @@ func (js *js) PublishAsyncPending() int {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
 	return len(js.pafs)
-}
-
-func (js *js) asyncStall() <-chan struct{} {
-	js.mu.Lock()
-	if js.stc == nil {
-		js.stc = make(chan struct{})
-	}
-	stc := js.stc
-	js.mu.Unlock()
-	return stc
 }
 
 // Handle an async reply from PublishAsync.
@@ -882,14 +936,6 @@ func (js *js) handleAsyncReply(m *Msg) {
 	if paf == nil {
 		js.mu.Unlock()
 		return
-	}
-
-	closeStc := func() {
-		// Check on anyone stalled and waiting.
-		if js.stc != nil && len(js.pafs) < js.opts.maxpa {
-			close(js.stc)
-			js.stc = nil
-		}
 	}
 
 	closeDchFn := func() func() {
@@ -949,7 +995,7 @@ func (js *js) handleAsyncReply(m *Msg) {
 			return
 		}
 		delete(js.pafs, id)
-		closeStc()
+		js.maybeUnstall()
 		defer closeDchFn()()
 		doErr(ErrNoResponders)
 		return
@@ -957,7 +1003,7 @@ func (js *js) handleAsyncReply(m *Msg) {
 
 	//remove
 	delete(js.pafs, id)
-	closeStc()
+	js.maybeUnstall()
 	defer closeDchFn()()
 
 	var pa pubAckResponse
@@ -1078,32 +1124,24 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 
 	// register new paf if not retrying
 	if paf == nil {
-		reply = js.newAsyncReply()
-
-		if reply == _EMPTY_ {
+		if err := js.newAsyncReply(); err != nil {
 			return nil, errors.New("nats: error creating async reply handler")
 		}
-
-		id = reply[js.replyPrefixLen:]
-		paf = &pubAckFuture{msg: m, st: time.Now(), maxRetries: o.rnum, retryWait: o.rwait, reply: reply}
-		numPending, maxPending := js.registerPAF(id, paf)
-
-		if maxPending > 0 && numPending > maxPending {
-			select {
-			case <-js.asyncStall():
-			case <-time.After(stallWait):
-				js.clearPAF(id)
-				return nil, ErrTooManyStalledMsgs
-			}
+		paf = &pubAckFuture{msg: m, st: time.Now(), maxRetries: o.rnum, retryWait: o.rwait}
+		var err error
+		reply, err = js.registerPAF(paf, stallWait)
+		if err != nil {
+			return nil, err
 		}
+		id = reply[js.replyPrefixLen:]
 		if js.opts.ackTimeout > 0 {
 			paf.timeout = time.AfterFunc(js.opts.ackTimeout, func() {
 				js.mu.Lock()
-				defer js.mu.Unlock()
 
 				if _, ok := js.pafs[id]; !ok {
 					// paf has already been resolved
 					// while waiting for the lock
+					js.mu.Unlock()
 					return
 				}
 
@@ -1111,10 +1149,7 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 				delete(js.pafs, id)
 
 				// check on anyone stalled and waiting.
-				if js.stc != nil && len(js.pafs) < js.opts.maxpa {
-					close(js.stc)
-					js.stc = nil
-				}
+				js.maybeUnstall()
 
 				// send error to user
 				paf.err = ErrAsyncPublishTimeout
@@ -1122,15 +1157,23 @@ func (js *js) PublishMsgAsync(m *Msg, opts ...PubOpt) (PubAckFuture, error) {
 					paf.errCh <- paf.err
 				}
 
-				// call error callback if set
-				if js.opts.aecb != nil {
-					js.opts.aecb(js, paf.msg, ErrAsyncPublishTimeout)
-				}
-
-				// check on anyone one waiting on done status.
+				// check on anyone one waiting on done status; the channel is
+				// closed after the error callback has run.
+				var dch chan struct{}
 				if js.dch != nil && len(js.pafs) == 0 {
-					close(js.dch)
+					dch = js.dch
 					js.dch = nil
+				}
+				cb := js.opts.aecb
+				js.mu.Unlock()
+
+				// call error callback if set, outside the lock: it may call
+				// back into the publisher (e.g. to retransmit the message).
+				if cb != nil {
+					cb(js, paf.msg, ErrAsyncPublishTimeout)
+				}
+				if dch != nil {
+					close(dch)
 				}
 			})
 		}

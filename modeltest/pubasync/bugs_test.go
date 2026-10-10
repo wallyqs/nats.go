@@ -24,18 +24,19 @@ import (
 )
 
 // Each test below reproduces one counterexample of models/PublishAsync
-// (models/PublishAsync/PUB*_bug.cfg) against the real library. They assert
-// the correct behavior, so they fail today and are skipped unless
+// (models/PublishAsync/PUB*_bug.cfg) against the real library and asserts
+// the correct behavior. Tests for fixed findings are regression tests; those
+// still gated by harness.KnownBug fail on this code and are skipped unless
 // MODELTEST_KNOWN_BUGS=1.
 
-// PUB-1: the ack-timeout callback (publish.go:373-405) runs the
+// PUB-1: the ack-timeout callback (publish.go:373-405) ran the
 // MsgErrHandler while holding js.publisher's mutex. A handler that calls back
 // into the publisher -- PublishAsyncPending, or re-publishing the message as
-// MsgErrHandler's doc suggests ("for possible retransmitting") -- deadlocks
-// the timer goroutine, and with it every later publisher call.
+// MsgErrHandler's doc suggests ("for possible retransmitting") -- deadlocked
+// the timer goroutine, and with it every later publisher call. Fixed: the
+// handler now runs after Unlock, like on every other resolution path.
 // Model: PUB1_timeout_reentrant_bug.cfg (NoSelfDeadlock).
 func TestPUB1TimeoutErrHandlerReentry(t *testing.T) {
-	harness.KnownBug(t, "PUB-1")
 	entered := make(chan struct{}, 1)
 	returned := make(chan struct{}, 1)
 	e := newEnv(t, []jetstream.JetStreamOpt{
@@ -63,60 +64,97 @@ func TestPUB1TimeoutErrHandlerReentry(t *testing.T) {
 	}
 }
 
-// PUB-2: CleanupPublisher (jetstream.go:1295-1315) deletes every pending
-// future but never calls maybeUnstall, so a PublishMsgAsync parked in
-// registerPAF's stall (publish.go:626-640) is not woken although the
-// publisher is now empty; it sleeps out its whole stall wait and fails with
+// PUB-2: CleanupPublisher (jetstream.go:1295-1315) deleted every pending
+// future but never called maybeUnstall, so a PublishMsgAsync parked in
+// registerPAF's stall (publish.go:626-640) was not woken although the
+// publisher was now empty; it slept out its whole stall wait and failed with
 // ErrTooManyStalledMsgs. Model: PUB2_cleanup_stall_bug.cfg (NoLostStallWakeup).
+//
+// Once woken, the caller registers right after CleanupPublisher removed the
+// reply subscription: exactly the PUB-6 window, so the test also checks
+// that its future is acked (PUB6_cleanup_orphan_bug.cfg, NoOrphanedFuture).
 func TestPUB2CleanupDoesNotWakeStalledPublisher(t *testing.T) {
-	harness.KnownBug(t, "PUB-2")
 	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncMaxPending(1)})
 	if _, err := e.js.PublishAsync("silent.a", nil); err != nil { // holds the only slot
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
+	type result struct {
+		paf jetstream.PubAckFuture
+		err error
+	}
+	done := make(chan result, 1)
 	go func() {
-		_, err := e.js.PublishAsync("s.b", nil, jetstream.WithStallWait(3*time.Second))
-		done <- err
+		paf, err := e.js.PublishAsync("s.b", nil, jetstream.WithStallWait(3*time.Second))
+		done <- result{paf, err}
 	}()
 	waitGoroutine(t, "the max-pending stall", "[select", "registerPAF")
 	e.js.CleanupPublisher()
-	if n := e.js.PublishAsyncPending(); n != 0 {
-		t.Fatalf("pending after cleanup = %d", n)
-	}
 	start := time.Now()
+	var r result
 	select {
-	case err := <-done:
-		if errors.Is(err, jetstream.ErrTooManyStalledMsgs) {
-			t.Fatalf("PUB-2: stalled publish failed with %v after %v although CleanupPublisher emptied the publisher", err, time.Since(start))
+	case r = <-done:
+		if r.err != nil {
+			t.Fatalf("PUB-2: stalled publish failed with %v after %v although CleanupPublisher emptied the publisher", r.err, time.Since(start))
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("PUB-2: stalled publish still parked 1s after CleanupPublisher emptied the publisher (pending=%d)", e.js.PublishAsyncPending())
 	}
+	select {
+	case <-r.paf.Ok():
+	case err := <-r.paf.Err():
+		t.Fatalf("publish woken by CleanupPublisher failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("PUB-6: publish woken by CleanupPublisher was registered under the removed reply subscription and never resolved (pending=%d)", e.js.PublishAsyncPending())
+	}
+	if n := e.js.PublishAsyncPending(); n != 0 {
+		t.Fatalf("pending = %d", n)
+	}
 }
 
-// PUB-3 (retry path): a 503 retry whose PublishMsg fails synchronously goes
+// PUB-3 (retry path): a 503 retry whose PublishMsg fails synchronously went
 // through clearPAF + handleAsyncErrAndUnlock (publish.go:511-518, 683-688);
-// neither closes js.publisher.doneCh, so a PublishAsyncComplete channel taken
-// while that future was the last one pending is never closed.
+// neither closed js.publisher.doneCh, so a PublishAsyncComplete channel taken
+// while that future was the last one pending was never closed.
 // Model: PUB3_retry_complete_bug.cfg (NoLostCompletion).
+//
+// The model's trace fails the retry with nc.Close(); since PUB-5 the reconnect
+// worker fails the future on CLOSED first, so here the retry's PublishMsg is
+// made to fail while reconnecting without a reconnect buffer instead: the
+// reconnect dial is parked holding nc.mu (the retry blocks on it), and the
+// reconnect worker is kept busy in a blocked MsgErrHandler from an earlier
+// disconnect so that it does not fail the future before the retry does.
 func TestPUB3RetryFailureLeavesCompleteOpen(t *testing.T) {
-	harness.KnownBug(t, "PUB-3")
-	e := newEnv(t, nil)
+	h := newHandlerLog()
+	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncErrHandler(h.handler)},
+		nats.ReconnectBufSize(-1), nats.ReconnectWait(50*time.Millisecond))
+	e.warmUp()
+	busy, releaseHandler := h.blockOn("silent.block")
+	defer releaseHandler()
+	if _, err := e.js.PublishAsync("silent.block", nil); err != nil {
+		t.Fatal(err)
+	}
+	e.cutAndAwaitReconnect()
+	<-busy
+
 	paf, err := e.js.PublishAsync("nostream.a", []byte("x"),
-		jetstream.WithRetryAttempts(1), jetstream.WithRetryWait(500*time.Millisecond))
+		jetstream.WithRetryAttempts(1), jetstream.WithRetryWait(300*time.Millisecond))
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond) // the 503 arrives; the retry is scheduled 500ms out
+	time.Sleep(100 * time.Millisecond) // the 503 arrives; the retry is scheduled 300ms out
 	complete := e.js.PublishAsyncComplete()
 	if closedWithin(complete, 0) {
 		t.Fatal("complete closed while a future is pending")
 	}
-	e.nc.Close()
+	dialing, releaseDial := e.dial.arm()
+	defer releaseDial()
+	e.proxy.Cut()
+	<-dialing
+	waitGoroutine(t, "the retry's PublishMsg", "PublishMsgAsync", "(*Conn).publish", "sync.(*Mutex).Lock")
+	releaseDial() // the dial fails; the retry's PublishMsg returns ErrReconnectBufExceeded
 	select {
 	case err := <-paf.Err():
-		if !errors.Is(err, nats.ErrConnectionClosed) {
+		if !errors.Is(err, nats.ErrReconnectBufExceeded) {
 			t.Fatalf("unexpected future error: %v", err)
 		}
 	case <-time.After(5 * time.Second):
@@ -131,13 +169,13 @@ func TestPUB3RetryFailureLeavesCompleteOpen(t *testing.T) {
 }
 
 // PUB-3 (first attempt): PublishMsg failing after registerPAF has inserted
-// the future (publish.go:422-425) clears it without closing doneCh. The
+// the future (publish.go:422-425) cleared it without closing doneCh. The
 // dial gate parks the reconnect inside createConn holding nc.mu, so the
 // publish blocks between registerPAF and the failure; PublishAsyncComplete
-// taken in that window never closes.
+// taken in that window never closed. Fixed: clearPAF hands doneCh back to
+// be closed once the outcome is reported.
 // Model: PUB3_first_publish_complete_bug.cfg (NoLostCompletion).
 func TestPUB3FirstPublishFailureLeavesCompleteOpen(t *testing.T) {
-	harness.KnownBug(t, "PUB-3")
 	e := newEnv(t, nil, nats.ReconnectBufSize(-1), nats.ReconnectWait(300*time.Millisecond))
 	e.warmUp()
 	entered, release := e.dial.arm()
@@ -177,11 +215,12 @@ func TestPUB3FirstPublishFailureLeavesCompleteOpen(t *testing.T) {
 // pub4Setup drives the PUB-4 interleaving: the 503-retry goroutine passes
 // getPAF (publish.go:505-510) for future X, the reconnect worker then fails X
 // with ErrDisconnected (publish.go:585-594), and only then does the retry's
-// PublishMsg fail, after which handleAsyncErrAndUnlock resolves X a second
-// time (publish.go:515-518). To pin that order: the reconnect worker is kept
-// busy in a blocked MsgErrHandler from an earlier disconnect (so the second
-// RECONNECTING event waits in its channel), and the reconnect dial is parked
-// holding nc.mu (so the retry's PublishMsg waits).
+// PublishMsg fail, after which handleAsyncErrAndUnlock resolved X a second
+// time (publish.go:515-518). Fixed: the PublishMsg failure branch resolves
+// the future only if it is still pending. To pin that order: the reconnect
+// worker is kept busy in a blocked MsgErrHandler from an earlier disconnect
+// (so the second RECONNECTING event waits in its channel), and the reconnect
+// dial is parked holding nc.mu (so the retry's PublishMsg waits).
 func pub4Setup(t *testing.T, callErr bool) (*env, *handlerLog, jetstream.PubAckFuture, <-chan error, func()) {
 	h := newHandlerLog()
 	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncErrHandler(h.handler)},
@@ -231,11 +270,10 @@ func pub4Setup(t *testing.T, callErr bool) (*env, *handlerLog, jetstream.PubAckF
 	return e, h, x, errCh, releaseDial
 }
 
-// PUB-4a: the same message is reported to MsgErrHandler twice (once with
+// PUB-4a: the same message was reported to MsgErrHandler twice (once with
 // ErrDisconnected, once with ErrReconnectBufExceeded) and the future's error
-// is overwritten. Model: PUB4_retry_double_cb_bug.cfg (ErrCbAtMostOnce).
+// overwritten. Model: PUB4_retry_double_cb_bug.cfg (ErrCbAtMostOnce).
 func TestPUB4RetryErrorAfterReconnectReportsTwice(t *testing.T) {
-	harness.KnownBug(t, "PUB-4")
 	_, h, _, _, _ := pub4Setup(t, false)
 	time.Sleep(500 * time.Millisecond)
 	if got := h.get("nostream.x"); len(got) != 1 {
@@ -244,12 +282,11 @@ func TestPUB4RetryErrorAfterReconnectReportsTwice(t *testing.T) {
 }
 
 // PUB-4b: if the caller already holds paf.Err() (cap 1) and has not read
-// the first error, the retry goroutine's second send blocks forever while
+// the first error, the retry goroutine's second send blocked forever while
 // holding js.publisher's mutex: every later PublishAsync,
-// PublishAsyncPending, Ok()/Err() call and the ack handler hang.
+// PublishAsyncPending, Ok()/Err() call and the ack handler hung.
 // Model: PUB4_retry_double_resolve_bug.cfg (NoBlockedSendUnderLock).
 func TestPUB4RetryErrorAfterReconnectWedgesPublisher(t *testing.T) {
-	harness.KnownBug(t, "PUB-4")
 	e, _, _, errCh, _ := pub4Setup(t, true)
 	var n int
 	if !within(2*time.Second, func() { n = e.js.PublishAsyncPending() }) {
@@ -266,13 +303,13 @@ func TestPUB4RetryErrorAfterReconnectWedgesPublisher(t *testing.T) {
 	}
 }
 
-// PUB-5: resetPendingAcksOnReconnect returns on CLOSED without failing the
-// pending futures (publish.go:578-581), and nothing else ever will: their
-// Ok()/Err() never fire and PublishAsyncComplete never closes unless an ack
-// timeout was configured. Model: PUB5_closed_never_resolved_bug.cfg
-// (NoStrandedFuture).
+// PUB-5: resetPendingAcksOnReconnect returned on CLOSED without failing the
+// pending futures (publish.go:578-581), and nothing else ever would: their
+// Ok()/Err() never fired and PublishAsyncComplete never closed unless an ack
+// timeout was configured. Fixed: CLOSED fails them with ErrConnectionClosed,
+// like RECONNECTING does with ErrDisconnected.
+// Model: PUB5_closed_never_resolved_bug.cfg (NoStrandedFuture).
 func TestPUB5CloseStrandsPendingFutures(t *testing.T) {
-	harness.KnownBug(t, "PUB-5")
 	e := newEnv(t, nil)
 	paf, err := e.js.PublishAsync("silent.a", []byte("x"))
 	if err != nil {
@@ -282,7 +319,9 @@ func TestPUB5CloseStrandsPendingFutures(t *testing.T) {
 	e.nc.Close()
 	select {
 	case err := <-paf.Err():
-		t.Logf("future failed with %v", err)
+		if !errors.Is(err, nats.ErrConnectionClosed) {
+			t.Fatalf("future failed with %v, want %v", err, nats.ErrConnectionClosed)
+		}
 	case <-paf.Ok():
 		t.Fatal("acked?")
 	case <-time.After(2 * time.Second):
@@ -361,12 +400,12 @@ func TestPUB7CleanupLeaksReconnectWorker(t *testing.T) {
 
 // PUB-8: a future registered by PublishMsgAsync is failed (and reported to
 // MsgErrHandler) by the ack timer while the publish itself is still blocked
-// in nc.PublishMsg; when that then fails, PublishMsgAsync also returns the
-// error. The same message is reported twice, through two channels, so a
-// caller that retransmits on both sends it twice.
+// in nc.PublishMsg; when that then failed, PublishMsgAsync also returned the
+// error. The same message was reported twice, through two channels, so a
+// caller that retransmits on both sent it twice. Fixed: PublishMsgAsync then
+// returns the (already failed) future and no error.
 // Model: PUB8_double_report_bug.cfg (SingleReport).
 func TestPUB8SyncErrorAfterHandlerReport(t *testing.T) {
-	harness.KnownBug(t, "PUB-8")
 	h := newHandlerLog()
 	e := newEnv(t, []jetstream.JetStreamOpt{
 		jetstream.WithPublishAsyncErrHandler(h.handler),

@@ -6,8 +6,16 @@ listeners in `nats.go` it depends on), the counterexamples TLC finds in it,
 and Go tests in `modeltest/pubasync/` that reproduce every finding against the
 real library. The legacy `js.go` publisher is compared at the end.
 
-Line numbers are for this branch (based on upstream `main` at `31a3ee4`):
-`publish.go` unless stated otherwise.
+Line numbers are for the code before the fixes (upstream `main` at
+`31a3ee4`): `publish.go` unless stated otherwise.
+
+**Status (branch `fix/pub`).** PUB-1 and PUB-2 (both APIs), PUB-3, PUB-4,
+PUB-5, PUB-6 (both APIs), PUB-8 and PUB-L1 are fixed on `fix/pub`, and their
+reproducers in `modeltest/pubasync` are regression tests. PUB-7 is fixed at
+its root by the `nats.go` change on `fix/conn` (`sendStatusEvent`,
+`RemoveStatusListener`); its two reproducers stay gated with `KnownBug` on
+`fix/pub` alone. In legacy `js.go` only PUB-1, PUB-2, PUB-6 and PUB-L1 were
+fixed (see the comparison at the end).
 
 ## Scope
 
@@ -59,7 +67,9 @@ precise.
 | `SendStatus(s)` (inside the above) | `sendStatusEvent` (`nats.go` 6833): probe `case <-ch` (consumes a buffered event, unregisters), then non-blocking send into the cap-10 channel (6786) |
 | `ClnSub`'s listener removal | `RemoveStatusListener` (`nats.go` 6799): `select { case <-ch: default: close(ch) }` |
 
-`FIX_*` constants switch in the proposed fixes below; all `FALSE` = today's code.
+`FIX_*` constants switch in the fixes below -- `FIX_StatusProbe` is the
+`fix/conn` change to `nats.go`, the others are what landed on `fix/pub`; all
+`FALSE` = the code before the fixes, which the `*_bug.cfg` configs encode.
 
 ### Invariants and properties
 
@@ -105,6 +115,21 @@ stall timeout).
 ## TLC results (measured)
 
 TLC 1.8.0, `-workers 4`, on a shared 4-core box (other models were running).
+The times are from the first run, before the fixes. Re-run on `fix/pub`
+after aligning `PubClear`, `RtyClear`, `ClnSub` and `PubReg` with the landed
+code (`TLA2TOOLS=… models/tlc.sh PublishAsync`): every passing config passes
+with the same distinct-state counts as below, every `*_bug.cfg` still
+reproduces its violation; the whole directory took 6 m 30 s.
+
+The `Fixed*` configs turn on every `FIX_*`, i.e. they check `fix/pub` merged
+with the `fix/conn` change (`FIX_StatusProbe`). On `fix/pub` alone
+(`FIX_StatusProbe = FALSE`), `FixedRetry` still passes (1,272,617 states: it
+has one status event at most), but `FixedCleanup` violates
+`NoStrandedFuture` and `FixedLiveness` violates `EventuallyResolved` and
+`CompleteCloses`: a disconnect buffers RECONNECTING, the close's
+`sendStatusEvent` probe eats it and unregisters the listener for CLOSED
+(PUB-7a), so the PUB-5 fix never runs. `PUB5_needs_PUB7_bug.cfg` keeps that
+6-state trace (185 states).
 
 | Config | Result | Distinct states | Time |
 |---|---|---|---|
@@ -115,7 +140,7 @@ TLC 1.8.0, `-workers 4`, on a shared 4-core box (other models were running).
 | `FixedCleanup.cfg` (all fixes: 2 calls, max-pending stall, cleanup, reconnect, close, Complete; symmetry) | pass, all 12 invariants | 647,871 | 1 m 22 s |
 | `FixedLiveness.cfg` (all fixes, 1 call, `FairSpec`: 503 retry, reconnect without buffer, close, cleanup, Complete) | pass (`EventuallyResolved`, `CompleteCloses`) | 61,613 | 3 m 0 s |
 
-Counterexample reproducers (each also passes with only its `FIX_*` flag
+Counterexample reproducers (in the first run, each also passed with only its `FIX_*` flag
 turned on, checked separately):
 
 | Config | Violates | States | Trace length |
@@ -132,10 +157,11 @@ turned on, checked separately):
 | `PUB7_status_probe_deaf_bug.cfg` | `ListenerSubscribed` | 38 | 5 |
 | `PUB7_remove_listener_leak_bug.cfg` | `NoLeakedResetGoroutine` | 59 | 5 |
 | `PUB8_double_report_bug.cfg` | `SingleReport` | 103 | 10 |
+| `PUB5_needs_PUB7_bug.cfg` (every fix but `FIX_StatusProbe`) | `NoStrandedFuture` | 185 | 6 |
 
 ## Tests (`modeltest/pubasync`)
 
-- `bugs_test.go`, `legacy_test.go`, `pub6_test.go`: one `KnownBug` reproducer per
+- `bugs_test.go`, `legacy_test.go`, `pub6_test.go`: one reproducer per
   finding. Windows the model found inside a single goroutine are opened
   deterministically: a `CustomDialer` that parks the reconnect dial (nats.go
   dials *holding `nc.mu`*, `doReconnect` → `createConn`, `nats.go` 3553), so a
@@ -143,39 +169,59 @@ turned on, checked separately):
   handler that blocks, which keeps the reconnect worker busy so status events
   queue up. Goroutine positions are confirmed from `runtime.Stack`, not sleeps,
   except where a 503 must have arrived (100 ms on loopback).
-  All 13 reproducers failed 5/5 runs with `-race -count=5`.
+  Before the fixes all 13 reproducers failed 5/5 runs with `-race -count=5`.
+  On `fix/pub` they are regression tests, except the two PUB-7 ones
+  (`KnownBug`, fixed on `fix/conn`). Changes made with the fixes:
+  - `TestPUB3RetryFailureLeavesCompleteOpen` used `nc.Close()` to fail the
+    retry's `PublishMsg` (the model's trace); with PUB-5 fixed the reconnect
+    worker fails the future on CLOSED first, so the test now fails the retry
+    while reconnecting without a reconnect buffer (dial gate + busy reconnect
+    worker, as in the PUB-4 tests).
+  - `TestPUB2CleanupDoesNotWakeStalledPublisher` and its legacy twin also
+    check that the woken publish is acked: the caller registers right after
+    `CleanupPublisher` removed the reply subscription, so with only the PUB-2
+    fix they fail deterministically on PUB-6 (checked).
+  - `TestPUB5CloseStrandsPendingFutures` expects `nats.ErrConnectionClosed`.
 - `machine_test.go`: zizek stateful tests. Rules are the model's actions
   (`publish`, `ack`, `error_ack`, `no_responders` → `Respond`; `late_reply`;
-  `observe` → `UserErrCall`; `complete`; `disconnect`; `cleanup`; and for the
-  known-bug machines `stalled_publish`, `close`); invariants are
+  `observe` → `UserErrCall`; `complete`; `disconnect`; `cleanup`;
+  `stalled_publish`; `close`); invariants are
   `pending_agrees` (incl. `MaxPendingRespected`), `futures_agree`
   (`ResolvedAtMostOnce`, `EventuallyResolved` for settled state),
   `callbacks_agree` (`ErrCbAtMostOnce`, ack handler once), `complete_agrees`
-  (`NoLostCompletion`, no early completion), `afterRelease` (`NoLostStallWakeup`).
+  (`NoLostCompletion`, no early completion), `afterRelease` (`NoLostStallWakeup`,
+  and since PUB-6 that a woken caller's publish reaches the server).
   The server side is a scripted responder on `ctl.<run>.>` that answers only
   when a rule says so (503 is a reply with a `Status: 503` header and no body,
   exactly what `handleAsyncReply` checks), so outcomes depend on the drawn
-  sequence, not timing.
+  sequence, not timing. All three machines run by default on `fix/pub`:
   - `TestPublishAsyncMachine` (Seed 7, 80 examples × ≤25 steps): passes, ~8 s;
     a run applies ~1,900 rules (e.g. `ack:23 cleanup:331 complete:396
     disconnect:422 error_ack:43 late_reply:229 no_responders:44 observe:35
     publish:348`).
-  - `TestPublishAsyncMachineStallCleanup` (KnownBug PUB-2): finds the lost
-    stall wakeup, ~55-70 s including shrinking.
-  - `TestPublishAsyncMachineClose` (KnownBug PUB-5): finds and shrinks to
-    `publish, close` (~40 s).
+  - `TestPublishAsyncMachineStallCleanup` (adds `stalled_publish`; PUB-2,
+    PUB-6): before the fixes it found the lost stall wakeup (~55-70 s including
+    shrinking); now passes, ~7 s.
+  - `TestPublishAsyncMachineClose` (adds `close`; PUB-5): before the fix it
+    found and shrank to `publish, close` (~40 s); now passes (~3 s) and
+    expects `ErrConnectionClosed` for futures pending at the close and every
+    `PublishAsyncComplete` channel to close.
 
-Run: `cd modeltest && go test -race ./pubasync/...` (green, known bugs
-skipped); `MODELTEST_KNOWN_BUGS=1 go test -race ./pubasync/...` reproduces.
+Run: `cd modeltest && ./run.sh ./pubasync/...` (green; the PUB-7 reproducers
+are skipped); `MODELTEST_KNOWN_BUGS=1 ./run.sh ./pubasync/...` runs them too
+(they fail on `fix/pub` alone, pass once `fix/conn` is merged).
 No `internal_testing` hooks are needed.
 
-**Fix validation.** The diffs below were applied to a scratch copy of the
-repository (not to this checkout) and the package was run against it with a
-temporary modfile: every `KnownBug` test and the three machines pass, except
-`PUB-L1` (legacy, fix not drafted). Upstream tests also pass on that copy:
-`./jetstream` (white-box, incl. `TestRegisterPAFUnstallOnClear`),
-`./jetstream/test -run 'Publish|Cleanup|Async|Reconnect'`,
-`./test -run 'Status|Listener'` and the root package with `internal_testing`.
+**Fix validation (measured on `fix/pub`).** `./run.sh ./pubasync/...` green
+3/3 runs (~32 s each; `TestPUB6CleanupRaceOrphansFuture` completes its 20,000
+rounds in ~9-11 s); with `MODELTEST_KNOWN_BUGS=1` only the two PUB-7 tests
+fail. Upstream: `go test -race ./jetstream/` (incl.
+`TestRegisterPAFUnstallOnClear`), `./jetstream/test -run
+'Publish|Async|Cleanup|Reconnect'` (83 passing tests) and the root package
+`-run 'Async|Publish|PAF|Stall'` pass; `./test -run 'Publish|Async|JetStream'`
+has only failures that are also seen on the unpatched base or are in code
+these fixes do not touch (cluster placement, ordered-consumer heartbeat
+recovery, a data race inside `TestJetStreamSubscribe`'s own goroutine).
 
 ## Findings
 
@@ -196,64 +242,18 @@ reproduces it against the real library.
   (`handleAsyncErrAndUnlock`, the reconnect worker since #2150, `CleanupPublisher`'s deferred calls).
 - **Status:** confirmed — `TestPUB1TimeoutErrHandlerReentry`; legacy
   `js.go` 1127 has the same code: `TestPUB1LegacyTimeoutErrHandlerReentry`.
-- **Fix:**
-
-```diff
-@@ PublishMsgAsync (publish.go:373)
- 			paf.timeout = time.AfterFunc(js.publisher.ackTimeout, func() {
- 				js.publisher.Lock()
--				defer js.publisher.Unlock()
--
- 				if _, ok := js.publisher.acks[id]; !ok {
- 					// paf has already been resolved
- 					// while waiting for the lock
-+					js.publisher.Unlock()
- 					return
- 				}
--
- 				// ack timed out, remove from pending acks
- 				delete(js.publisher.acks, id)
--
- 				// check on anyone stalled and waiting.
- 				js.maybeUnstall()
--
--				// send error to user
--				paf.err = ErrAsyncPublishTimeout
--				if paf.errCh != nil {
--					paf.errCh <- paf.err
--				}
--
--				// call error callback if set
--				if js.publisher.asyncPublisherOpts.aecb != nil {
--					js.publisher.asyncPublisherOpts.aecb(js, paf.msg, ErrAsyncPublishTimeout)
--				}
--
--				// check on anyone one waiting on done status.
--				if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
--					close(js.publisher.doneCh)
--					js.publisher.doneCh = nil
-+				dch := js.takeDoneChIfEmpty()
-+				// send error to user; the error callback runs after Unlock
-+				js.handleAsyncErrAndUnlock(paf, ErrAsyncPublishTimeout)
-+				if dch != nil {
-+					close(dch)
- 				}
- 			})
-@@ (new helper, next to maybeUnstall)
-+// takeDoneChIfEmpty detaches doneCh when nothing is pending; the caller
-+// closes it after reporting. Lock should be held.
-+func (js *jetStream) takeDoneChIfEmpty() chan struct{} {
-+	if js.publisher.doneCh != nil && len(js.publisher.acks) == 0 {
-+		dch := js.publisher.doneCh
-+		js.publisher.doneCh = nil
-+		return dch
-+	}
-+	return nil
-+}
-```
-
-(The same change in `js.go`'s timer callback: capture `dch` and `aecb`,
-`Unlock`, call, close.)
+  **Fixed on `fix/pub`** (`9e15de1`, both APIs; refactored onto `clearPAF` in
+  `0404777`).
+- **Fix (as landed):** the timer callback removes the future under the lock
+  (`clearPAF`: delete, `maybeUnstall`, detach `doneCh` if now empty),
+  resolves it through `handleAsyncErrAndUnlock` -- `errCh` send under the
+  lock, handler after `Unlock` -- and closes the detached `doneCh` after the
+  handler returns (#2150's order). Since the future leaves `acks` in the
+  critical section that resolves it, calling the handler later cannot let
+  another resolver reach it (`ResolvedAtMostOnce`, `ErrCbAtMostOnce` and
+  `NoBlockedSendUnderLock` hold in `FixedRetry.cfg`, which has the timer, the
+  503 retry and a re-entrant handler). `js.go`: the same shape inline
+  (capture `dch` and `aecb`, `Unlock`, call, close). Model: `FIX_TimeoutCb`.
 
 ### PUB-2 — CleanupPublisher does not wake publishers stalled on max pending (lost wakeup)
 
@@ -272,19 +272,13 @@ reproduces it against the real library.
   by zizek in `TestPublishAsyncMachineStallCleanup` (shrunk to `publish,
   publish, error_ack, publish, stalled_publish, cleanup`; the shrinker did not
   remove the `error_ack, publish` pair, see Notes).
-- **Fix** (`jetstream.go`; mirror in `js.go` by closing `js.stc`). Note it
-  must land together with PUB-6's fix: once woken, the caller registers right
-  after `CleanupPublisher` removed the reply subscription — exactly the PUB-6
-  window, made deterministic.
-
-```diff
-@@ func (js *jetStream) CleanupPublisher() (jetstream.go:1308)
- 		delete(js.publisher.acks, id)
- 	}
-+	// wake callers stalled on max pending: there is room now
-+	js.maybeUnstall()
- 	if js.publisher.doneCh != nil {
-```
+- **Fixed on `fix/pub`:** `2b2a45b` (`jetstream.go`, with PUB-6) and
+  `a39b799` (`js.go`, with PUB-6 and PUB-L1): `CleanupPublisher` calls
+  `maybeUnstall` after deleting the futures. It must land together with
+  PUB-6's fix: once woken, the caller registers right after
+  `CleanupPublisher` removed the reply subscription -- exactly the PUB-6
+  window, made deterministic (the extended PUB-2 tests fail on it with the
+  PUB-2 fix alone). Model: `FIX_CleanupUnstall`.
 
 ### PUB-3 — A publish that fails synchronously never closes PublishAsyncComplete (lost completion)
 
@@ -306,7 +300,7 @@ reproduces it against the real library.
   (deterministic: 503 → Complete → Close), `TestPUB3FirstPublishFailureLeavesCompleteOpen`
   (dial gate holds `nc.mu` so the publish waits between `registerPAF` and its
   failure).
-- **Fix:** see the combined PUB-3/4/8 fix below.
+- **Fixed on `fix/pub`** (`0404777`); see the combined PUB-3/4/8 fix below.
 
 ### PUB-4 — 503-retry error path double-resolves a future (second send can wedge the publisher)
 
@@ -337,7 +331,7 @@ reproduces it against the real library.
   error handler from an earlier disconnect so the next RECONNECTING event
   waits in its channel; the dial gate holds `nc.mu` so the retry's
   `PublishMsg` waits; both are released in the model's order.
-- **Fix:** below.
+- **Fixed on `fix/pub`** (`0404777`); see below.
 
 ### PUB-8 — A message is reported both to the error handler and as PublishMsgAsync's error
 
@@ -350,42 +344,45 @@ reproduces it against the real library.
 - **Status:** confirmed — `TestPUB8SyncErrorAfterHandlerReport` (ack timer
   fires while the dial gate holds the publish; handler gets
   `timeout waiting for ack`, `PublishAsync` returns `outbound buffer limit
-  exceeded`).
+  exceeded`). **Fixed on `fix/pub`** (`0404777`).
 
-**Fix for PUB-3, PUB-4 and PUB-8** (one place: the `PublishMsg` failure branch
-owns the outcome only if the future is still pending; the retry closure's
-`if err != nil` branch at 515-518 becomes unreachable and can be dropped):
+**Fix for PUB-3, PUB-4 and PUB-8, as landed** (`0404777`, `jetstream/` only):
+the `PublishMsg` failure branch of `PublishMsgAsync` owns the outcome only if
+the future is still pending. `clearPAF` now runs with the lock held, deletes
+the future only if it is still in `acks` and reports whether it was, wakes
+stalled callers and hands back `doneCh` if the publisher is now empty:
 
-```diff
-@@ func (js *jetStream) PublishMsgAsync (publish.go:422)
- 	if err := js.conn.PublishMsg(pubMsg); err != nil {
--		js.clearPAF(id)
--		return nil, err
-+		js.publisher.Lock()
-+		if _, ok := js.publisher.acks[id]; !ok {
-+			// Already resolved -- and reported -- by the ack timer, a
-+			// reconnect or CleanupPublisher while we were publishing.
-+			js.publisher.Unlock()
-+			return paf, nil
-+		}
-+		delete(js.publisher.acks, id)
-+		js.maybeUnstall()
-+		dch := js.takeDoneChIfEmpty()
-+		if o.pafRetry == nil {
-+			js.publisher.Unlock()
-+			if dch != nil {
-+				close(dch)
-+			}
-+			return nil, err
-+		}
-+		// A retry owns the future's resolution.
-+		js.handleAsyncErrAndUnlock(paf, err)
-+		if dch != nil {
-+			close(dch)
-+		}
-+		return paf, nil
- 	}
+```go
+	if err := js.conn.PublishMsg(pubMsg); err != nil {
+		js.publisher.Lock()
+		dch, ok := js.clearPAF(id)
+		if !ok {
+			// already resolved -- and reported -- by the ack timer, a
+			// reconnect or CleanupPublisher while we were publishing
+			js.publisher.Unlock()
+			return paf, nil
+		}
+		if o.pafRetry == nil {
+			js.publisher.Unlock()
+			if dch != nil {
+				close(dch)
+			}
+			return nil, err
+		}
+		js.handleAsyncErrAndUnlock(paf, err) // a retry: the future carries it
+		if dch != nil {
+			close(dch)
+		}
+		return paf, nil
+	}
 ```
+
+The retry closure's own `if err != nil { handleAsyncErrAndUnlock }` branch
+became unreachable and was removed; the ack-timeout callback uses the same
+`clearPAF`. Behavior change: `PublishMsgAsync` can return an already failed
+future (and no error) when the future was resolved concurrently. Model:
+`FIX_SyncFailDone` (`PubClear`) and `FIX_RetryOwner` (`RtyClear`), aligned
+with this code (a non-owner neither deletes nor unstalls).
 
 ### PUB-5 — Futures pending when the connection closes are never resolved
 
@@ -403,39 +400,15 @@ owns the outcome only if the future is still pending; the retry closure's
   `TestPublishAsyncMachineClose` (shrunk to `publish, close`). Same in `js.go`
   (762-764). Arguably a design choice, but nothing documents it and the
   reconnect path already does the right thing.
-- **Fix:**
-
-```diff
-@@ func (js *jetStream) resetPendingAcksOnReconnect() (publish.go:577)
- 	for {
- 		newStatus, ok := <-connStatusCh
--		if !ok || newStatus == nats.CLOSED {
-+		if !ok {
- 			return
- 		}
-+		failErr := nats.ErrDisconnected
-+		if newStatus == nats.CLOSED {
-+			failErr = nats.ErrConnectionClosed
-+		}
- 		js.publisher.Lock()
- 		errCb := js.publisher.asyncPublisherOpts.aecb
- 		var msgs []*nats.Msg
- 		for id, paf := range js.publisher.acks {
--			paf.err = nats.ErrDisconnected
-+			paf.err = failErr
-@@
- 		for _, msg := range msgs {
--			errCb(js, msg, nats.ErrDisconnected)
-+			errCb(js, msg, failErr)
- 		}
- 		if dch != nil {
- 			close(dch)
- 		}
-+		if newStatus == nats.CLOSED {
-+			return
-+		}
- 	}
-```
+- **Fixed on `fix/pub`** (`350f180`, `jetstream/` only), as proposed:
+  `resetPendingAcksOnReconnect` handles CLOSED like RECONNECTING -- fails
+  every pending future, calls the error handler after `Unlock`, closes
+  `doneCh` -- with `nats.ErrConnectionClosed`, then returns. Behavior change:
+  futures pending at `nc.Close()` now fail with `ErrConnectionClosed` (and
+  the handler is called for each). This relies on the worker receiving the
+  CLOSED event: with PUB-7a a buffered RECONNECTING could eat it, which the
+  `fix/conn` change removes (see the TLC results for `fix/pub` alone).
+  Model: `FIX_CloseResolves`.
 
 ### PUB-6 — CleanupPublisher racing PublishMsgAsync orphans a future under a dead reply prefix
 
@@ -454,37 +427,17 @@ owns the outcome only if the future is still pending; the retry closure's
   of 20,000 (2.1 s) on the first run. With the PUB-2 fix alone this becomes
   deterministic (a stalled caller woken by cleanup always registers in the
   window), so the two fixes go together.
-- **Fix** (cleanup clears the prefix; `registerPAF` re-creates the subscription
-  under the insert lock when it sees that):
-
-```diff
-@@ func (js *jetStream) cleanupReplySub() (jetstream.go:1322)
- 		js.publisher.replySub.Unsubscribe()
- 		js.publisher.replySub = nil
-+		js.publisher.replyPrefix = ""
- 	}
-@@ func (js *jetStream) newAsyncReply() error (publish.go:438)
- 	js.publisher.Lock()
- 	defer js.publisher.Unlock()
-+	return js.ensureAsyncReplyLocked()
-+}
-+
-+// ensureAsyncReplyLocked is newAsyncReply with the publisher lock held.
-+func (js *jetStream) ensureAsyncReplyLocked() error {
- 	if js.publisher.replySub == nil {
-@@ func (js *jetStream) registerPAF (publish.go:622)
- 			js.publisher.acks = make(map[string]*pubAckFuture)
- 		}
-+		// CleanupPublisher ran since newAsyncReply (it clears the prefix):
-+		// never register under a prefix nobody listens on.
-+		if js.publisher.replyPrefix == "" {
-+			if err := js.ensureAsyncReplyLocked(); err != nil {
-+				js.publisher.Unlock()
-+				return "", err
-+			}
-+		}
- 		maxpa := js.publisher.asyncPublisherOpts.maxpa
-```
+- **Fixed on `fix/pub`** (`2b2a45b`; `js.go` in `a39b799`), as proposed:
+  `cleanupReplySub` clears `replyPrefix` (`js.rpre`) together with the
+  subscription, and `registerPAF`, seeing an empty prefix under the insert
+  lock (after any stall), re-creates the subscription and the status
+  listener (`ensureAsyncReplyLocked`, the body of `newAsyncReply`) before
+  drawing the reply token. The check is on the prefix, not on `replySub`,
+  so the white-box `TestRegisterPAFUnstallOnClear` (prefix set, no
+  subscription) is unaffected. `TestPUB6CleanupRaceOrphansFuture` still runs
+  its 20,000 rounds as a stress regression; the extended PUB-2 tests cover
+  the window deterministically. Model: `FIX_CleanupPrefix` (`ClnSub` now
+  clears `prefixGen`, `PubReg` checks it).
 
 ### PUB-7 — Status listeners eat buffered events: the publisher goes deaf to reconnects, or its worker leaks
 
@@ -517,12 +470,13 @@ Root cause in core `nats.go`, observed through the publisher (sibling of
   (`resetPendingAcksOnReconnect` goroutine still running 2 s after cleanup).
   The same `sendStatusEvent` is used by every `StatusChanged` user (pull
   consumers, ordered consumers, `js.go`) — we only exercised the publisher.
-- **Fix** (`nats.go`). It changes `RemoveStatusListener` to always close (a
-  receiver still drains a buffered event first, then sees the close); the
-  upstream `test/` status-listener tests pass with it. If that semantic change
-  is unwanted, the publisher alone can be fixed by giving
-  `resetPendingAcksOnReconnect` its own stop channel, but 7a would remain for
-  every listener.
+- **Fixed by the `nats.go` change on `fix/conn`**, not on `fix/pub`: the
+  reproducers stay gated with `KnownBug` here. That change is the diff below
+  (`RemoveStatusListener` always closes, `sendStatusEvent` never receives),
+  which is what `FIX_StatusProbe` models. The narrower publisher-only
+  alternative (its own stop channel for `resetPendingAcksOnReconnect`) was
+  deliberately not added as defense in depth: the root-cause fix covers
+  every listener. The original proposal:
 
 ```diff
 @@ func (nc *Conn) RemoveStatusListener(ch chan (Status)) (nats.go:6799)
@@ -595,20 +549,28 @@ Root cause in core `nats.go`, observed through the publisher (sibling of
 - **Status:** confirmed — `TestPUBL1LegacyMaxPendingExceeded` (pending 2 with
   `PublishAsyncMaxPending(1)`). Not modeled separately (the model is of the
   new code, where `MaxPendingRespected` holds in every config).
-- **Fix:** port #2126's `registerPAF` (stall loop before insert, under one
-  lock hold) to `js.go`; not drafted here.
+- **Fixed on `fix/pub`** (`a39b799`): #2126's `registerPAF` ported to
+  `js.go` -- check the cap and, once under it, draw the reply token and
+  insert under one lock hold, stalling (with one `stallWait` timer across
+  wakeups) in between; `newAsyncReply` only sets up the subscription and
+  listener; a `maybeUnstall` helper is called on every removal (reply,
+  timeout, `clearPAF`, reconnect worker, `CleanupPublisher`). Behavior
+  change, as in `jetstream/`: stalled callers no longer count as pending, so
+  `PublishAsyncComplete` may close while a caller is still stalled
+  (documented on the legacy interface too). This port is what makes PUB-6
+  deterministic in `js.go` once PUB-2 is fixed, so the three landed together.
 
 ## Legacy `js.go` vs `jetstream/` (same design, compared by reading + tests)
 
 | Finding | `js.go` |
 |---|---|
-| PUB-1 | same (timer calls `aecb` under `js.mu`, 1127) — confirmed |
-| PUB-2 | same (`CleanupPublisher` never closes `js.stc`) — confirmed |
-| PUB-3, PUB-4, PUB-8 | same code shape (`clearPAF` without `dch`; retry `doErr` unconditional) — by reading, not tested |
-| PUB-5 | same (`resetPendingAcksOnReconnect` returns on CLOSED) — by reading |
-| PUB-6 | different: `newAsyncReply` draws the token and `registerPAF` inserts in separate holds, same window — by reading |
-| PUB-7 | 7a applies; for 7b `cleanupReplySub` still does `close(js.connStatusCh)` directly (the pre-#1993 code), which can race `sendStatusEvent`'s send on the same channel ("send on closed channel" panic) — by reading only |
-| PUB-L1 | legacy only — confirmed |
+| PUB-1 | same (timer calls `aecb` under `js.mu`, 1127) — confirmed; **fixed** on `fix/pub` |
+| PUB-2 | same (`CleanupPublisher` never closes `js.stc`) — confirmed; **fixed** on `fix/pub` |
+| PUB-3, PUB-4, PUB-8 | same code shape (`clearPAF` without `dch`; retry `doErr` unconditional) — by reading, not tested; **not fixed** (out of `fix/pub`'s scope) |
+| PUB-5 | same (`resetPendingAcksOnReconnect` returns on CLOSED) — by reading; **not fixed** |
+| PUB-6 | was different (the token drawn in `newAsyncReply`, inserted in `registerPAF`: same window); after the PUB-L1 port identical to `jetstream/` — **fixed** on `fix/pub`, confirmed by `TestPUB2LegacyCleanupDoesNotWakeStalledPublisher` |
+| PUB-7 | 7a applies; for 7b `cleanupReplySub` still does `close(js.connStatusCh)` directly (the pre-#1993 code), which can race `sendStatusEvent`'s send on the same channel ("send on closed channel" panic) — by reading only; the `fix/conn` `sendStatusEvent` recovers from that send, `js.go` is unchanged |
+| PUB-L1 | legacy only — confirmed; **fixed** on `fix/pub` |
 
 ## Things checked that hold
 

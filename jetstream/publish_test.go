@@ -49,7 +49,9 @@ func TestRegisterPAFUnstallOnClear(t *testing.T) {
 
 	// Let the goroutine reach the stall wait.
 	time.Sleep(20 * time.Millisecond)
+	js.publisher.Lock()
 	js.clearPAF(id0)
+	js.publisher.Unlock()
 
 	select {
 	case err := <-done:

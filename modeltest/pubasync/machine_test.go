@@ -365,18 +365,19 @@ func (m *pubMachine) cleanup(tc *zizek.TestCase) error {
 }
 
 // Close: nothing can be acked any more, so every pending future must fail
-// (any error) rather than hang (EventuallyResolved).
+// with ErrConnectionClosed rather than hang (EventuallyResolved).
 func (m *pubMachine) closeConn(tc *zizek.TestCase) error {
 	tc.Assume(!m.closed && m.stall == nil)
 	tc.Note(fmt.Sprintf("nc.Close with %d pending", len(m.pending())))
 	m.nc.Close()
 	m.closed = true
-	m.failAll(nil)
 	for _, f := range m.all {
 		if f.state == failed && f.wantErr == nil && f.seenErr == nil {
 			f.wantErr = errAny
 		}
 	}
+	m.failAll(nats.ErrConnectionClosed)
+	m.drained()
 	return nil
 }
 
@@ -602,20 +603,20 @@ func TestPublishAsyncMachine(t *testing.T) {
 }
 
 // TestPublishAsyncMachineStallCleanup adds a caller parked in the
-// max-pending stall, so that CleanupPublisher can meet it (PUB-2). zizek shrinks to
-// publish, publish, stalled_publish, cleanup -> lost stall wakeup.
+// max-pending stall, so that CleanupPublisher can meet it (PUB-2, and the
+// PUB-6 window right after the wakeup). Before the fixes zizek shrank to
+// publish, publish, error_ack, publish, stalled_publish, cleanup -> lost
+// stall wakeup.
 func TestPublishAsyncMachineStallCleanup(t *testing.T) {
-	harness.KnownBug(t, "PUB-2")
 	extra := []zizek.Rule[pubMachine]{{Name: "stalled_publish", Apply: (*pubMachine).stallPublish}}
 	if err := runMachine(t, extra, zizek.Config{Seed: 7, Examples: 80, SuppressTooSlow: true}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// TestPublishAsyncMachineClose adds nc.Close (PUB-5). zizek shrinks to
-// publish, close -> a future that never resolves.
+// TestPublishAsyncMachineClose adds nc.Close (PUB-5). Before the fix zizek
+// shrank to publish, close -> a future that never resolves.
 func TestPublishAsyncMachineClose(t *testing.T) {
-	harness.KnownBug(t, "PUB-5")
 	extra := []zizek.Rule[pubMachine]{{Name: "close", Apply: (*pubMachine).closeConn}}
 	if err := runMachine(t, extra, zizek.Config{Seed: 7, Examples: 80, SuppressTooSlow: true}); err != nil {
 		t.Fatal(err)
