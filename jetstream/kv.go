@@ -1516,15 +1516,28 @@ func (kv *kvs) Keys(ctx context.Context, opts ...WatchOpt) ([]string, error) {
 	var keys []string
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(keys) == 0 {
+				return nil, ErrNoKeysFound
+			}
+			slices.Sort(keys)
+			return slices.Compact(keys), nil
 		}
 		keys = append(keys, entry.Key())
 	}
-	if len(keys) == 0 {
-		return nil, ErrNoKeysFound
+	// Updates() was closed before all keys were received.
+	return nil, kv.watchClosedErr(ctx)
+}
+
+// watchClosedErr tells why a watcher's updates were closed before all of
+// its initial values were received.
+func (kv *kvs) watchClosedErr(ctx context.Context) error {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	slices.Sort(keys)
-	return slices.Compact(keys), nil
+	if kv.js.conn.IsClosed() {
+		return ErrConnectionClosed
+	}
+	return ErrConsumerDeleted
 }
 
 type keyLister struct {
@@ -1609,14 +1622,15 @@ func (kv *kvs) History(ctx context.Context, key string, opts ...WatchOpt) ([]Key
 	var entries []KeyValueEntry
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(entries) == 0 {
+				return nil, ErrKeyNotFound
+			}
+			return entries, nil
 		}
 		entries = append(entries, entry)
 	}
-	if len(entries) == 0 {
-		return nil, ErrKeyNotFound
-	}
-	return entries, nil
+	// Updates() was closed before the whole history was received.
+	return nil, kv.watchClosedErr(ctx)
 }
 
 // Bucket returns the current bucket name.

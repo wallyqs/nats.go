@@ -944,15 +944,28 @@ func (kv *kvs) Keys(opts ...WatchOpt) ([]string, error) {
 	var keys []string
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(keys) == 0 {
+				return nil, ErrNoKeysFound
+			}
+			slices.Sort(keys)
+			return slices.Compact(keys), nil
 		}
 		keys = append(keys, entry.Key())
 	}
-	if len(keys) == 0 {
-		return nil, ErrNoKeysFound
+	// Updates() was closed before all keys were received.
+	return nil, kv.watchClosedErr(watcher)
+}
+
+// watchClosedErr tells why a watcher's updates were closed before all of
+// its initial values were received.
+func (kv *kvs) watchClosedErr(w KeyWatcher) error {
+	if ctx := w.Context(); ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
 	}
-	slices.Sort(keys)
-	return slices.Compact(keys), nil
+	if kv.js.nc.IsClosed() {
+		return ErrConnectionClosed
+	}
+	return ErrConsumerDeleted
 }
 
 type keyLister struct {
@@ -1017,14 +1030,15 @@ func (kv *kvs) History(key string, opts ...WatchOpt) ([]KeyValueEntry, error) {
 	var entries []KeyValueEntry
 	for entry := range watcher.Updates() {
 		if entry == nil {
-			break
+			if len(entries) == 0 {
+				return nil, ErrKeyNotFound
+			}
+			return entries, nil
 		}
 		entries = append(entries, entry)
 	}
-	if len(entries) == 0 {
-		return nil, ErrKeyNotFound
-	}
-	return entries, nil
+	// Updates() was closed before the whole history was received.
+	return nil, kv.watchClosedErr(watcher)
 }
 
 // Implementation for Watch
