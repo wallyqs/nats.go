@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
-	"github.com/nats-io/nats.go/modeltest/harness"
 )
 
 // The legacy JetStream API (js.go) shares the async publisher design. These
@@ -65,13 +64,14 @@ func TestPUB1LegacyTimeoutErrHandlerReentry(t *testing.T) {
 	}
 }
 
-// PUB-L1: js.go registers the future before checking the cap (registerPAF,
-// then `numPending > maxPending` stall), so PublishAsyncPending exceeds
-// PublishAsyncMaxPending while a caller is stalled; and it waits on the
+// PUB-L1: js.go registered the future before checking the cap (registerPAF,
+// then `numPending > maxPending` stall), so PublishAsyncPending exceeded
+// PublishAsyncMaxPending while a caller was stalled; and it waited on the
 // stall channel once, without re-checking the cap. #2126 fixed both in
-// jetstream/ only. Model: MaxPendingRespected holds for jetstream/.
+// jetstream/; js.go now has the same registerPAF (stall, then draw the
+// token and insert under one lock hold). Model: MaxPendingRespected holds
+// for jetstream/.
 func TestPUBL1LegacyMaxPendingExceeded(t *testing.T) {
-	harness.KnownBug(t, "PUB-L1")
 	e := newEnv(t, nil)
 	js := legacyJS(t, e, nats.PublishAsyncMaxPending(1))
 	if _, err := js.PublishAsync("silent.a", nil); err != nil {
@@ -98,27 +98,44 @@ func TestPUBL1LegacyMaxPendingExceeded(t *testing.T) {
 	}
 }
 
-// PUB-2 in js.go: CleanupPublisher does not close js.stc either.
+// PUB-2 in js.go: CleanupPublisher did not close js.stc either. With the
+// PUB-L1 fix the stalled caller registers only once woken, right after
+// CleanupPublisher removed the reply subscription -- the PUB-6 window -- so
+// the test also checks that its future is acked.
 func TestPUB2LegacyCleanupDoesNotWakeStalledPublisher(t *testing.T) {
-	harness.KnownBug(t, "PUB-2")
 	e := newEnv(t, nil)
 	js := legacyJS(t, e, nats.PublishAsyncMaxPending(1))
 	if _, err := js.PublishAsync("silent.a", nil); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
+	type result struct {
+		paf nats.PubAckFuture
+		err error
+	}
+	done := make(chan result, 1)
 	go func() {
-		_, err := js.PublishAsync("s.b", nil, nats.StallWait(3*time.Second))
-		done <- err
+		paf, err := js.PublishAsync("s.b", nil, nats.StallWait(3*time.Second))
+		done <- result{paf, err}
 	}()
-	waitGoroutine(t, "the max-pending stall", "[select", "(*js).PublishMsgAsync")
+	waitGoroutine(t, "the max-pending stall", "[select", "(*js).registerPAF")
 	js.CleanupPublisher()
+	var r result
 	select {
-	case err := <-done:
-		if errors.Is(err, nats.ErrTooManyStalledMsgs) {
-			t.Fatalf("PUB-2 (legacy): stalled publish failed with %v although CleanupPublisher emptied the publisher", err)
+	case r = <-done:
+		if r.err != nil {
+			t.Fatalf("PUB-2 (legacy): stalled publish failed with %v although CleanupPublisher emptied the publisher", r.err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("PUB-2 (legacy): stalled publish still parked 1s after CleanupPublisher")
+	}
+	select {
+	case <-r.paf.Ok():
+	case err := <-r.paf.Err():
+		t.Fatalf("publish woken by CleanupPublisher failed: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("PUB-6 (legacy): publish woken by CleanupPublisher was registered under the removed reply subscription and never resolved (pending=%d)", js.PublishAsyncPending())
+	}
+	if n := js.PublishAsyncPending(); n != 0 {
+		t.Fatalf("pending = %d", n)
 	}
 }
