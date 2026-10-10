@@ -200,7 +200,6 @@ func TestPULL2ConsumeStallsForeverAfterLostConnected(t *testing.T) {
 //
 // Trace: PullConsume_stopafter_bug.cfg (StopAfterRespected).
 func TestPULL3StopAfterExceededAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "PULL-3")
 	e := newEnv(t)
 	const stopAfter = 3
 	var calls atomic.Int64

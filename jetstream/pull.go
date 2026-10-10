@@ -283,6 +283,12 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 			}
 			return
 		}
+		// Messages already buffered when Stop was called, or when StopAfter
+		// was reached, are discarded rather than handed to the user.
+		// sub.delivered is only written on this goroutine.
+		if sub.stopped() || (sub.consumeOpts.StopAfter > 0 && sub.delivered >= sub.consumeOpts.StopAfter) {
+			return
+		}
 		if pinId := msg.Header.Get("Nats-Pin-Id"); pinId != "" {
 			p.setPinID(pinId)
 		}
@@ -370,9 +376,13 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							sub.errs <- errConnected
 						}
 
-						if sub.sendFetchNext(&pullRequest{
+						batchSize := sub.consumeOpts.MaxMessages
+						if sub.consumeOpts.StopAfter > 0 {
+							batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
+						}
+						if batchSize > 0 && sub.sendFetchNext(&pullRequest{
 							Expires:       sub.consumeOpts.Expires,
-							Batch:         sub.consumeOpts.MaxMessages,
+							Batch:         batchSize,
 							MaxBytes:      sub.consumeOpts.MaxBytes,
 							Heartbeat:     sub.consumeOpts.Heartbeat,
 							MinPending:    sub.consumeOpts.MinPending,
@@ -384,7 +394,7 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 							if sub.hbMonitor != nil {
 								sub.hbMonitor.Reset(2 * sub.consumeOpts.Heartbeat)
 							}
-							sub.resetPendingMsgs(sub.consumeOpts.MaxMessages)
+							sub.resetPendingMsgs(batchSize)
 						}
 					}
 					sub.Unlock()
@@ -399,7 +409,10 @@ func (p *pullConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt) (
 					if sub.consumeOpts.StopAfter > 0 {
 						batchSize = min(batchSize, sub.consumeOpts.StopAfter-sub.delivered)
 					}
-					if sub.sendFetchNext(&pullRequest{
+					// With StopAfter reached (the handler is about to
+					// call Stop), there is nothing left to pull; a batch
+					// of 0 would be rejected by pull() as invalid.
+					if batchSize > 0 && sub.sendFetchNext(&pullRequest{
 						Expires:       sub.consumeOpts.Expires,
 						Batch:         batchSize,
 						MaxBytes:      sub.consumeOpts.MaxBytes,
