@@ -525,7 +525,6 @@ func TestORD12MessagesStuckAfterSilentConsumerLoss(t *testing.T) {
 // after 30s instead of 10s. The test stalls every pull request in the relay
 // and measures how long Consume takes to start a reset.
 func TestORD13OrderedDefaultHeartbeatNotApplied(t *testing.T) {
-	harness.KnownBug(t, "ORD-13")
 	e := newEnv(t, envOpts{relay: true})
 	c := e.ordered(jetstream.OrderedConsumerConfig{})
 	_, stopHolding := e.rl.HoldAll("CONSUMER.MSG.NEXT.")

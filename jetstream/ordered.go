@@ -106,7 +106,10 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.userErrHandler = consumeOpts.ErrHandler
 	c.stopAfter = max(consumeOpts.StopAfter, 0)
 	c.deliveredMessages = 0
-	opts = append(opts, consumeReconnectNotify())
+	// The inner pull subscription parses the options again, with the
+	// defaults of a plain pull consumer; pass the ordered default
+	// heartbeat down explicitly.
+	opts = append(opts, consumeReconnectNotify(), orderedHeartbeat(consumeOpts.Heartbeat))
 	// innerOpts returns the options for the inner pull subscription of the
 	// current serial. Lock should be held when calling it.
 	innerOpts := func() []PullConsumeOpt {
@@ -270,9 +273,12 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidOption, err)
 	}
+	// As in Consume, pass the ordered default heartbeat down to the inner
+	// iterator, which parses the options with the plain pull defaults.
 	opts = append(opts,
 		WithMessagesErrOnMissingHeartbeat(true),
-		messagesReconnectNotify())
+		messagesReconnectNotify(),
+		orderedHeartbeat(consumeOpts.Heartbeat))
 	c.stopAfter = max(consumeOpts.StopAfter, 0)
 	c.deliveredMessages = 0
 	c.userErrHandler = consumeOpts.ErrHandler
@@ -717,6 +723,16 @@ func consumeReconnectNotify() PullConsumeOpt {
 func messagesReconnectNotify() PullMessagesOpt {
 	return pullOptFunc(func(opts *consumeOpts) error {
 		opts.notifyOnReconnect = true
+		return nil
+	})
+}
+
+// orderedHeartbeat sets the heartbeat of an inner pull subscription to
+// the one the ordered consumer resolved (the user's, or the ordered
+// default), which its own option parsing already validated.
+func orderedHeartbeat(hb time.Duration) pullOptFunc {
+	return pullOptFunc(func(opts *consumeOpts) error {
+		opts.Heartbeat = hb
 		return nil
 	})
 }

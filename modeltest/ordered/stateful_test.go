@@ -42,7 +42,9 @@ import (
 // The Messages machine still issues the first pull before any rule runs,
 // because a consumer lost while no pull waits is ORD-12 (open).
 
-const settleTimeout = 45 * time.Second // > 2 x 15s default heartbeat (ORD-13)
+// settleTimeout leaves room for two missed heartbeats (2 x 5s, the ordered
+// default since ORD-13 was fixed) plus the reset backoff.
+const settleTimeout = 45 * time.Second
 
 // ruleCounts counts rule applications per test, logged at the end so a run
 // shows what it exercised.
