@@ -23,6 +23,7 @@ package harness
 import (
 	"fmt"
 	"io"
+	"os"
 	"net"
 	"sync"
 	"testing"
@@ -235,5 +236,16 @@ func Eventually(timeout time.Duration, cond func() bool) bool {
 			return false
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// KnownBug marks a test that reproduces a bug found through a model and
+// documented in that model's README under the given id. Such tests assert
+// the correct behavior, so they fail until the bug is fixed; they are
+// skipped unless MODELTEST_KNOWN_BUGS=1 so that the default run stays green.
+func KnownBug(t testing.TB, id string) {
+	t.Helper()
+	if os.Getenv("MODELTEST_KNOWN_BUGS") != "1" {
+		t.Skipf("known bug %s (see the model README); run with MODELTEST_KNOWN_BUGS=1 to reproduce", id)
 	}
 }
