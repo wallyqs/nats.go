@@ -13,8 +13,10 @@
 (*   <<"cln", 0>>  a user goroutine running CleanupPublisher               *)
 (* PublishAsyncComplete / Err() are atomic critical sections (user steps). *)
 (*                                                                         *)
-(* The FIX_* constants switch in the minimal fixes proposed in README.md;  *)
-(* with all of them FALSE the spec is the code as it is today.             *)
+(* The FIX_* constants switch in the fixes described in README.md (all    *)
+(* but FIX_StatusProbe are on branch fix/pub, FIX_StatusProbe is the       *)
+(* nats.go change on fix/conn); with all of them FALSE the spec is the     *)
+(* code before those fixes, which the *_bug.cfg configs keep checking.    *)
 (* Line numbers refer to jetstream/publish.go unless noted (js.go = the    *)
 (* legacy API, nats.go = the core connection).                             *)
 (***************************************************************************)
@@ -42,7 +44,8 @@ CONSTANTS
                         \* and a sync failure is not reported twice
     FIX_RetryOwner,     \* PUB-4: retry error path resolves only if it still owned the future
     FIX_CloseResolves,  \* PUB-5: CLOSED fails pending futures
-    FIX_CleanupPrefix,  \* PUB-6: registerPAF re-creates a removed reply sub
+    FIX_CleanupPrefix,  \* PUB-6: cleanup clears the prefix; registerPAF then
+                        \* re-creates the reply sub
     FIX_StatusProbe     \* PUB-7: sendStatusEvent/RemoveStatusListener do not eat buffered events
 
 None == <<"none", 0>>
@@ -64,7 +67,7 @@ VARIABLES
     acks,       \* calls whose future is in js.publisher.acks
     pfx,        \* [Calls -> Nat] reply-prefix generation c registered under
     subGen,     \* generation of js.publisher.replySub (0 = nil)
-    prefixGen,  \* generation of js.publisher.replyPrefix (kept by cleanup)
+    prefixGen,  \* generation of js.publisher.replyPrefix (0 = cleared; kept by cleanup without FIX_CleanupPrefix)
     ngen,       \* generation counter (subs)
     stallCh,    \* id of js.publisher.stallCh (0 = nil)
     stallClosed,\* stall channel ids that have been closed
@@ -199,8 +202,9 @@ PubReg(c) ==
                     /\ UNCHANGED <<nids, stallCh>>
             /\ pc' = [pc EXCEPT ![Pub(c)] = "stall"]
             /\ UNCHANGED <<acks, pfx, tmo, ngen, subGen, prefixGen, nlsn, lsn, lreg>>
-       ELSE IF FIX_CleanupPrefix /\ subGen = 0
-       THEN \* fix: the reply sub vanished (CleanupPublisher) since newAsyncReply
+       ELSE IF FIX_CleanupPrefix /\ prefixGen = 0
+       THEN \* fix: CleanupPublisher cleared the prefix (and removed the reply
+            \* sub) since newAsyncReply: re-create both under the insert lock
             IF conn = "CLOSED"
             THEN /\ pc' = [pc EXCEPT ![Pub(c)] = "done_err"]
                  /\ UNCHANGED <<acks, pfx, tmo, nids, stallCh, waitOn, ngen,
@@ -270,19 +274,21 @@ CloseDoneIfEmpty(a) ==
     THEN /\ doneClosed' = doneClosed \cup {doneCh} /\ doneCh' = 0
     ELSE UNCHANGED <<doneClosed, doneCh>>
 
-\* With FIX_SyncFailDone clearPAF also closes doneCh, and reports whether it
-\* still owned the future: if a reconnect/timeout/cleanup already resolved
-\* (and reported) it, PublishMsgAsync returns that future instead of a
-\* second, synchronous error (PUB-8).
+\* With FIX_SyncFailDone (fix/pub: lock; clearPAF; unlock; close(dch)) the
+\* failure branch first checks that it still owns the future: if a
+\* reconnect/timeout/cleanup already resolved (and reported) it,
+\* PublishMsgAsync returns that future instead of a second, synchronous error
+\* (PUB-8); otherwise clearPAF also hands back doneCh to be closed (PUB-3).
 PubClear(c) ==
     /\ pc[Pub(c)] = "clear" /\ Free
-    /\ acks' = acks \ {c}
-    /\ Unstall(acks \ {c})
-    /\ IF FIX_SyncFailDone THEN CloseDoneIfEmpty(acks \ {c})
-                           ELSE UNCHANGED <<doneClosed, doneCh>>
     /\ IF FIX_SyncFailDone /\ c \notin acks
-       THEN /\ pc' = [pc EXCEPT ![Pub(c)] = "done_ok"] /\ UNCHANGED syncErr
-       ELSE /\ syncErr' = [syncErr EXCEPT ![c] = TRUE]
+       THEN /\ pc' = [pc EXCEPT ![Pub(c)] = "done_ok"]
+            /\ UNCHANGED <<acks, stallCh, stallClosed, doneClosed, doneCh, syncErr>>
+       ELSE /\ acks' = acks \ {c}
+            /\ Unstall(acks \ {c})
+            /\ IF FIX_SyncFailDone THEN CloseDoneIfEmpty(acks \ {c})
+                                   ELSE UNCHANGED <<doneClosed, doneCh>>
+            /\ syncErr' = [syncErr EXCEPT ![c] = TRUE]
             /\ pc' = [pc EXCEPT ![Pub(c)] = "done_err"]
     /\ UNCHANGED <<mu, pfx, subGen, prefixGen, ngen, waitOn, nids, dchOf, waiters,
                    res, aecbN, errMade, errBuf, hasErr, retries, tmo,
@@ -489,23 +495,26 @@ RtyPub(c) ==
                    collected, cur, conn, dq, lsn, lreg, lbuf, lclosed, nlsn,
                    discN, cleanN, complN>>
 
-\* clearPAF(id) (683-688). With FIX_RetryOwner the delete reports whether
-\* this attempt still owned the future, and the error is reported (and
-\* doneCh closed) only then.
+\* clearPAF(id) (683-688). With FIX_RetryOwner (fix/pub: the same failure
+\* branch as PubClear, lock held throughout) the delete happens only if this
+\* attempt still owns the future, and only then is the error reported
+\* (handleAsyncErrAndUnlock) and doneCh closed after it.
 RtyClear(c) ==
     /\ pc[Rty(c)] = "r_clear" /\ Free
-    /\ acks' = acks \ {c}
-    /\ Unstall(acks \ {c})
     /\ IF FIX_RetryOwner
        THEN IF c \in acks
-            THEN /\ mu' = Rty(c)
+            THEN /\ acks' = acks \ {c}
+                 /\ Unstall(acks \ {c})
+                 /\ mu' = Rty(c)
                  /\ IF doneCh # 0 /\ acks \ {c} = {}
                     THEN /\ dchOf' = [dchOf EXCEPT ![Rty(c)] = doneCh] /\ doneCh' = 0
                     ELSE UNCHANGED <<dchOf, doneCh>>
                  /\ pc' = [pc EXCEPT ![Rty(c)] = "r_send"]
             ELSE /\ pc' = [pc EXCEPT ![Rty(c)] = "r_idle"]
-                 /\ UNCHANGED <<mu, dchOf, doneCh>>
-       ELSE /\ pc' = [pc EXCEPT ![Rty(c)] = "r_elock"]
+                 /\ UNCHANGED <<acks, stallCh, stallClosed, mu, dchOf, doneCh>>
+       ELSE /\ acks' = acks \ {c}
+            /\ Unstall(acks \ {c})
+            /\ pc' = [pc EXCEPT ![Rty(c)] = "r_elock"]
             /\ UNCHANGED <<mu, dchOf, doneCh>>
     /\ UNCHANGED <<pfx, subGen, prefixGen, ngen, waitOn, doneClosed, nids, waiters,
                    res, aecbN, syncErr, errMade, errBuf, hasErr, retries,
@@ -644,10 +653,12 @@ ClnStart ==
 
 \* cleanupReplySub (jetstream.go:1317-1331): Unsubscribe; RemoveStatusListener
 \* (nats.go): select { case <-ch: default: close(ch) } -- a buffered event is
-\* consumed and the channel is left open.
+\* consumed and the channel is left open. With FIX_CleanupPrefix the prefix
+\* is cleared along with the subscription.
 ClnSub ==
     /\ pc[Cln] = "c_sub" /\ Free
     /\ subGen' = 0
+    /\ prefixGen' = IF FIX_CleanupPrefix THEN 0 ELSE prefixGen
     /\ IF lsn # 0
        THEN /\ IF lbuf[lsn] # <<>> /\ ~FIX_StatusProbe
                THEN /\ lbuf' = [lbuf EXCEPT ![lsn] = Tail(@)] /\ UNCHANGED lclosed
@@ -656,7 +667,7 @@ ClnSub ==
             /\ lsn' = 0
        ELSE UNCHANGED <<lbuf, lclosed, lreg, lsn>>
     /\ pc' = [pc EXCEPT ![Cln] = "c_lock"]
-    /\ UNCHANGED <<mu, acks, pfx, prefixGen, ngen, stallCh, stallClosed, waitOn,
+    /\ UNCHANGED <<mu, acks, pfx, ngen, stallCh, stallClosed, waitOn,
                    doneCh, doneClosed, nids, dchOf, waiters, res, aecbN, syncErr,
                    errMade, errBuf, hasErr, retries, tmo, collected, cur,
                    conn, srv, pend, dq, nlsn, discN, cleanN, complN>>
