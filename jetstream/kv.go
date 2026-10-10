@@ -1221,6 +1221,8 @@ type watcher struct {
 	initDone    bool
 	initPending uint64
 	received    uint64
+	// Consumer of the last message handled.
+	consumer string
 }
 
 // Updates returns the interior channel.
@@ -1304,6 +1306,7 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 			}
 		}
 		delta := parser.ParseNum(tokens[parser.AckNumPendingTokenPos])
+		consumer := tokens[parser.AckConsumerTokenPos]
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		if !o.ignoreDeletes || (op != KeyValueDelete && op != KeyValuePurge) {
@@ -1321,13 +1324,24 @@ func (kv *kvs) WatchFiltered(ctx context.Context, keys []string, opts ...WatchOp
 		// Check if done and initial values.
 		if !w.initDone {
 			w.received++
-			// Use the stable initPending value set at consumer creation.
+			// The ordered consumer is recreated after a lost message or
+			// heartbeat. In the last-per-subject phase that collapses
+			// what was written meanwhile into the last value per key, so
+			// what is still owed is what the new consumer has pending
+			// after this message. The first message also covers a consumer
+			// recreated before anything was delivered.
+			if w.consumer == "" {
+				w.initPending = max(w.initPending, w.received+delta)
+			} else if consumer != w.consumer {
+				w.initPending = w.received + delta
+			}
 			// We're done if we've received all expected messages OR there are no more pending.
 			if w.received >= w.initPending || delta == 0 {
 				w.initDone = true
 				w.updates <- nil
 			}
 		}
+		w.consumer = consumer
 	}
 
 	// Used ordered consumer to deliver results.

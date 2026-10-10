@@ -1446,6 +1446,19 @@ type jsSub struct {
 	// A reset waits for the buffer to drain, see tryResetOrderedConsumer.
 	resetPending bool
 
+	// Ordered consumers created with DeliverLastPerSubject. While lps is set
+	// the consumer may still be delivering the last message of each subject,
+	// and a reset recreates it with DeliverLastPerSubject again instead of
+	// resuming by stream sequence, which would replay superseded messages.
+	// Messages that the new consumer sends again (stream sequence up to
+	// lpsSkip) are dropped as already delivered. lpsLeft is an upper bound
+	// of what is left of that initial set, taken from the num_pending of
+	// the first message delivered by each consumer (lpsRebase).
+	lps       bool
+	lpsRebase bool
+	lpsLeft   uint64
+	lpsSkip   uint64
+
 	// Heartbeats and Flow Control handling from push consumers.
 	hbc    *time.Timer
 	hbi    time.Duration
@@ -1933,6 +1946,10 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 		ackNone:  o.cfg.AckPolicy == AckNonePolicy,
 		ctx:      o.ctx,
 	}
+	// Ordered consumers are always created here, so ccreq is set.
+	if o.ordered && ccreq != nil && ccreq.Config.DeliverPolicy == DeliverLastPerSubjectPolicy {
+		jsi.lps, jsi.lpsRebase = true, true
+	}
 
 	// Auto acknowledge unless manual ack is set or policy is set to AckNonePolicy
 	if cb != nil && !o.mack && o.cfg.AckPolicy != AckNonePolicy {
@@ -2040,6 +2057,10 @@ func (js *js) subscribe(subj, queue string, cb MsgHandler, ch chan *Msg, isSync,
 				// message, as before.
 				if info.Delivered.Consumer == 0 && sub.jsi.sseq == 0 {
 					sub.jsi.sseq = info.Delivered.Stream
+				}
+				// Nothing to deliver last per subject: only new messages follow.
+				if sub.jsi.pending == 0 && sub.jsi.lpsRebase {
+					sub.jsi.lps = false
 				}
 			}
 			// If this is an ephemeral, we did not have a consumer name, we get it from the info
@@ -2181,6 +2202,11 @@ func (sub *Subscription) trackSequences(reply string) {
 // but has not yet been handed off for delivery.
 type orderedSeqs struct {
 	dseq, sseq uint64
+	// The consumer's num_pending after this message.
+	pending uint64
+	// Already delivered before a DeliverLastPerSubject reset (see jsSub.lps):
+	// the tracker was advanced and the message must not be delivered.
+	skip bool
 }
 
 // Check to make sure messages are arriving in order.
@@ -2205,7 +2231,13 @@ func (sub *Subscription) checkOrderedMsgs(m *Msg) (bool, orderedSeqs) {
 	if dseq != jsi.dseq {
 		return true, orderedSeqs{}
 	}
-	return false, orderedSeqs{dseq: dseq, sseq: sseq}
+	if sseq <= jsi.lpsSkip {
+		// Sent again by a consumer recreated with DeliverLastPerSubject and
+		// delivered before the reset. It still takes its delivery sequence.
+		jsi.dseq++
+		return false, orderedSeqs{skip: true}
+	}
+	return false, orderedSeqs{dseq: dseq, sseq: sseq, pending: parser.ParseNum(tokens[parser.AckNumPendingTokenPos])}
 }
 
 // commitOrderedMsg advances the ordered consumer tracker for a message that has
@@ -2215,7 +2247,24 @@ func (sub *Subscription) commitOrderedMsg(seqs orderedSeqs) {
 	if seqs.dseq == 0 {
 		return
 	}
-	sub.jsi.dseq, sub.jsi.sseq = seqs.dseq+1, seqs.sseq
+	jsi := sub.jsi
+	jsi.dseq, jsi.sseq = seqs.dseq+1, seqs.sseq
+	if !jsi.lps {
+		return
+	}
+	// Track the end of the last per subject set. The consumer's num_pending
+	// counts what is left of it plus newer messages, and so does the count
+	// started from the first message: both only ever over-estimate it.
+	if jsi.lpsRebase {
+		jsi.lpsLeft, jsi.lpsRebase = seqs.pending, false
+	} else {
+		jsi.lpsLeft = min(max(jsi.lpsLeft, 1)-1, seqs.pending)
+	}
+	if jsi.lpsLeft == 0 {
+		// Every later message is newer than the initial set: resets resume
+		// by stream sequence from here on.
+		jsi.lps, jsi.lpsSkip = false, 0
+	}
 }
 
 // jsMsgAction tells processMsg what to do with a message once the ordered
@@ -2227,7 +2276,8 @@ const (
 	// Cannot be delivered. The caller's slow consumer path counts it and
 	// releases the pending accounting reserved for it.
 	jsMsgDrop
-	// Out of order and fully handled. The caller only unlocks and returns.
+	// Out of order, or already delivered before a reset, and fully handled.
+	// The caller only unlocks and returns.
 	jsMsgDropGap
 )
 
@@ -2245,13 +2295,17 @@ func (sub *Subscription) checkOrderedDelivery(m *Msg) (jsMsgAction, orderedSeqs)
 		sub.tryResetOrderedConsumer()
 		return jsMsgDrop, orderedSeqs{}
 	}
+	gap, seqs := sub.checkOrderedMsgs(m)
+	// Already delivered: needs no room and is not a gap.
+	if seqs.skip {
+		sub.releaseReserved(m)
+		return jsMsgDropGap, orderedSeqs{}
+	}
 	// A full channel would drop the message below anyway; checking first keeps
 	// the drop from reading as a gap.
 	if sub.mch != nil && cap(sub.mch) > 0 && len(sub.mch) == cap(sub.mch) {
 		return jsMsgDrop, orderedSeqs{}
 	}
-
-	gap, seqs := sub.checkOrderedMsgs(m)
 	if !gap {
 		return jsMsgDeliver, seqs
 	}
@@ -2390,8 +2444,20 @@ func (sub *Subscription) resetOrderedConsumer(sseq uint64) {
 		cfgCopy := *jsi.ccreq.Config
 		cfg := &cfgCopy
 		cfg.DeliverSubject = newDeliver
-		cfg.DeliverPolicy = DeliverByStartSequencePolicy
-		cfg.OptStartSeq = sseq
+		if jsi.lps {
+			// Still delivering the last message per subject. Resuming by
+			// sequence would replay every older message of the subjects not
+			// delivered yet, so ask for the last per subject again and drop
+			// what was already delivered. Messages stored meanwhile come as
+			// the last of their subject, as they would for a new consumer.
+			cfg.DeliverPolicy = DeliverLastPerSubjectPolicy
+			cfg.OptStartSeq = 0
+			jsi.lpsSkip = sseq - 1
+			jsi.lpsRebase = true
+		} else {
+			cfg.DeliverPolicy = DeliverByStartSequencePolicy
+			cfg.OptStartSeq = sseq
+		}
 		// In case the consumer was created with a start time, we need to clear it
 		// since we are now using a start sequence.
 		cfg.OptStartTime = nil
