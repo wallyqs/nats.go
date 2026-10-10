@@ -423,7 +423,6 @@ func TestConn9DoubleDisconnectCallback(t *testing.T) {
 // checkDrained, which calls removeSub even when the subscription is already
 // closed (nats.go:5503-5506).
 func TestConn10ClosedHandlerCalledTwice(t *testing.T) {
-	harness.KnownBug(t, "CONN-10")
 	s := harness.RunServer(t, false)
 	nc := connect(t, s.URL())
 	sub, err := nc.SubscribeSync("conn10")

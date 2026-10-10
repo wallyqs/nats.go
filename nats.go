@@ -5309,7 +5309,11 @@ func (nc *Conn) removeSub(s *Subscription) {
 		}
 	}
 
-	if s.typ != AsyncSubscription {
+	// Call the closed handler only the first time: checkDrained calls
+	// removeSub again on a subscription already removed while it was
+	// draining (Unsubscribe, or an AutoUnsubscribe max reached in NextMsg).
+	// Async subscriptions call it once, from waitForMsgs.
+	if s.typ != AsyncSubscription && !s.closed {
 		done := s.pDone
 		if done != nil {
 			done(s.Subject)
