@@ -139,7 +139,6 @@ type (
 		errs              chan error
 		pending           pendingMsgs
 		hbMonitor         *hbMonitor
-		fetchInProgress   atomic.Uint32
 		closed            atomic.Uint32
 		draining          atomic.Uint32
 		done              chan struct{}
@@ -497,9 +496,8 @@ func (s *pullSubscription) checkPending() {
 	// check if we went below any threshold
 	// we don't want to track bytes threshold if either it's not set or we used
 	// PullMaxMessagesWithBytesLimit
-	if (s.pending.msgCount < s.consumeOpts.ThresholdMessages ||
-		(s.pending.byteCount < s.consumeOpts.ThresholdBytes && s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize)) &&
-		s.fetchInProgress.Load() == 0 {
+	if s.pending.msgCount < s.consumeOpts.ThresholdMessages ||
+		(s.pending.byteCount < s.consumeOpts.ThresholdBytes && s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize) {
 
 		var batchSize, maxBytes int
 		batchSize = s.consumeOpts.MaxMessages - s.pending.msgCount
@@ -520,7 +518,15 @@ func (s *pullSubscription) checkPending() {
 			if s.consumer != nil {
 				pinID = s.consumer.getPinID()
 			}
-			if s.sendFetchNext(&pullRequest{
+			// The send never blocks. If the previous request is still
+			// queued (pullMessages has not picked it up yet), this check
+			// runs again on the next message or status, which that
+			// request brings. A request may be queued while pullMessages
+			// is still sending the previous one: skipping it then would
+			// lose the wake-up when the server answers the previous
+			// request in full before pullMessages gets back to fetchNext.
+			select {
+			case s.fetchNext <- &pullRequest{
 				Expires:       s.consumeOpts.Expires,
 				Batch:         batchSize,
 				MaxBytes:      maxBytes,
@@ -530,23 +536,24 @@ func (s *pullSubscription) checkPending() {
 				MinPending:    s.consumeOpts.MinPending,
 				MinAckPending: s.consumeOpts.MinAckPending,
 				Priority:      s.consumeOpts.Priority,
-			}) {
+			}:
 				// Count what was asked for: with StopAfter the batch can
 				// be smaller than the gap to MaxMessages. When only bytes
 				// are tracked the batch is MaxMessages, and so is the count.
 				s.pending.msgCount = min(s.pending.msgCount+batchSize, s.consumeOpts.MaxMessages)
 				s.pending.byteCount = s.consumeOpts.MaxBytes
+			default:
 			}
 		}
 	}
 }
 
-// sendFetchNext hands a pull request to pullMessages. It gives up, and
-// returns false, once Stop or Drain was called: pullMessages returns on
-// done without reading fetchNext again, and every caller holds the
-// subscription lock, so a blocking send would hang forever (and with it
-// everything else that needs the lock, including the subscription's closed
-// handler).
+// sendFetchNext hands a pull request to pullMessages, waiting for room in
+// fetchNext. It gives up, and returns false, once Stop or Drain was
+// called: pullMessages returns on done without reading fetchNext again,
+// and every caller holds the subscription lock, so a blocking send would
+// hang forever (and with it everything else that needs the lock,
+// including the subscription's closed handler).
 // lock should be held before calling this method
 func (s *pullSubscription) sendFetchNext(req *pullRequest) bool {
 	select {
@@ -1151,8 +1158,6 @@ func (s *pullSubscription) pullMessages(subject string) {
 	for {
 		select {
 		case req := <-s.fetchNext:
-			s.fetchInProgress.Store(1)
-
 			if err := s.pull(req, subject); err != nil {
 				if errors.Is(err, ErrMsgIteratorClosed) {
 					s.cleanup()
@@ -1165,7 +1170,6 @@ func (s *pullSubscription) pullMessages(subject string) {
 				case <-s.done:
 				}
 			}
-			s.fetchInProgress.Store(0)
 		case <-s.done:
 			s.cleanup()
 			return
