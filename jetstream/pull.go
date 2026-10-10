@@ -459,12 +459,18 @@ func (s *pullSubscription) resetPendingMsgs(batch int) {
 	s.pending.byteCount = s.consumeOpts.MaxBytes
 }
 
-// decrementPendingMsgs decrements pending message count and byte count
+// decrementPendingMsgs decrements pending message count and byte count.
+// Neither goes below 0, as in handleStatusMsg: a reset (on reconnect or a
+// missed heartbeat) forgets requests that may still be alive, and their
+// messages would otherwise drive the counts negative, making checkPending
+// ask for more than MaxMessages (or MaxBytes).
 // lock should be held before calling this method
 func (s *pullSubscription) decrementPendingMsgs(msg *nats.Msg) {
-	s.pending.msgCount--
+	if s.pending.msgCount > 0 {
+		s.pending.msgCount--
+	}
 	if s.consumeOpts.MaxBytes != 0 && !s.consumeOpts.LimitSize {
-		s.pending.byteCount -= msg.Size()
+		s.pending.byteCount = max(s.pending.byteCount-msg.Size(), 0)
 	}
 }
 
