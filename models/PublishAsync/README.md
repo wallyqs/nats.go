@@ -488,6 +488,9 @@ owns the outcome only if the future is still pending; the retry closure's
 
 ### PUB-7 — Status listeners eat buffered events: the publisher goes deaf to reconnects, or its worker leaks
 
+**Fixed** on branch `fix/conn` (the `sendStatusEvent` / `RemoveStatusListener` fix of CONN-1/CONN-2 in
+[`../ConnLifecycle/README.md`](../ConnLifecycle/README.md)); the reproducers below now run as regression tests.
+
 Root cause in core `nats.go`, observed through the publisher (sibling of
 #1993, which switched `cleanupReplySub` to `RemoveStatusListener`).
 

@@ -6800,17 +6800,17 @@ func (nc *Conn) RemoveStatusListener(ch chan (Status)) {
 	nc.mu.Lock()
 	defer nc.mu.Unlock()
 
-	select {
-	case <-ch:
-	default:
-		close(ch)
+	for _, listeners := range nc.statListeners {
+		delete(listeners, ch)
 	}
 
-	for _, listeners := range nc.statListeners {
-		for range listeners {
-			delete(listeners, ch)
-		}
-	}
+	// Close the channel even if it holds an event the listener has not read
+	// yet: the listener still receives that event, then sees the close.
+	// Receiving from the channel to find out whether it is closed would
+	// consume that event and leave the channel open. Tolerate a channel the
+	// caller has already closed.
+	defer func() { _ = recover() }()
+	close(ch)
 }
 
 // registerStatusChangeListener registers a channel waiting for a specific status change event.
@@ -6831,22 +6831,30 @@ func (nc *Conn) registerStatusChangeListener(status Status, ch chan Status) {
 // If channel is closed, or there is no listener, sendStatusEvent
 // will not block. Lock should be held entering.
 func (nc *Conn) sendStatusEvent(s Status) {
-Loop:
 	for ch := range nc.statListeners[s] {
-		// make sure channel is not closed
-		select {
-		case <-ch:
-			// if chan is closed, remove it
+		// Never receive from ch to find out whether it is closed: on an open
+		// channel that would consume an event the listener has not read yet
+		// (and unregister a live listener). Channels closed by their owner
+		// without RemoveStatusListener are detected by the send instead.
+		if !trySendStatus(ch, s) {
 			delete(nc.statListeners[s], ch)
-			continue Loop
-		default:
-		}
-		// only send event if someone's listening
-		select {
-		case ch <- s:
-		default:
 		}
 	}
+}
+
+// trySendStatus sends s on ch if there is room for it, without blocking.
+// It reports false if ch has been closed.
+func trySendStatus(ch chan Status, s Status) (open bool) {
+	defer func() {
+		if recover() != nil {
+			open = false
+		}
+	}()
+	select {
+	case ch <- s:
+	default:
+	}
+	return true
 }
 
 // changeConnStatus changes connections status and sends events

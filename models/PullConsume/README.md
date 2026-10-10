@@ -228,6 +228,9 @@ selects on `done`.
 
 ### PULL-2 — `StatusChanged` loses events and unregisters itself; Consume can go silent forever (High, confirmed; root cause in nats.go core)
 
+**Fixed** on branch `fix/conn` (the `sendStatusEvent` / `RemoveStatusListener` fix of CONN-1/CONN-2 in
+[`../ConnLifecycle/README.md`](../ConnLifecycle/README.md)); the reproducers below now run as regression tests.
+
 Same root cause as PUB-7 in `models/PublishAsync/README.md`, found
 independently by that model. This section covers what it does to pull
 consumers.

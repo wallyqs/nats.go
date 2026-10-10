@@ -114,7 +114,6 @@ func TestPULL1StopWhileRepullQueuedDeadlocks(t *testing.T) {
 // listener reads the first one lose both, and the listener never hears that
 // status again.
 func TestPULL2StatusChangedLosesEvents(t *testing.T) {
-	harness.KnownBug(t, "PULL-2")
 	e := newEnv(t)
 	ch := e.nc.StatusChanged(nats.CONNECTED, nats.RECONNECTING)
 	e.cutAndWaitReconnect() // RECONNECTING, CONNECTED, nobody reading yet
@@ -139,7 +138,6 @@ func TestPULL2StatusChangedLosesEvents(t *testing.T) {
 //
 // Trace: PullConsume_steal_bug.cfg (NoPermanentStall).
 func TestPULL2ConsumeStallsForeverAfterLostConnected(t *testing.T) {
-	harness.KnownBug(t, "PULL-2")
 	e := newEnv(t)
 	var dropStatus atomic.Bool
 	e.px.SetFilter(func(f *Frame) Verdict {

@@ -301,7 +301,6 @@ func TestPUB5CloseStrandsPendingFutures(t *testing.T) {
 // later reconnects no longer fail pending futures.
 // Model: PUB7_status_probe_deaf_bug.cfg (ListenerSubscribed).
 func TestPUB7PublisherGoesDeafToReconnects(t *testing.T) {
-	harness.KnownBug(t, "PUB-7")
 	h := newHandlerLog()
 	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncErrHandler(h.handler)})
 	e.warmUp()
@@ -338,7 +337,6 @@ func TestPUB7PublisherGoesDeafToReconnects(t *testing.T) {
 // blocks on it forever. Model: PUB7_remove_listener_leak_bug.cfg
 // (NoLeakedResetGoroutine).
 func TestPUB7CleanupLeaksReconnectWorker(t *testing.T) {
-	harness.KnownBug(t, "PUB-7")
 	h := newHandlerLog()
 	e := newEnv(t, []jetstream.JetStreamOpt{jetstream.WithPublishAsyncErrHandler(h.handler)})
 	worker := "resetPendingAcksOnReconnect"

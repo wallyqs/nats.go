@@ -30,7 +30,6 @@ import (
 // on the listener channel. When the channel holds an undelivered event, the
 // probe consumes it and unregisters the listener (nats.go:6833-6851).
 func TestConn1StatusListenerLosesEvents(t *testing.T) {
-	harness.KnownBug(t, "CONN-1")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	reconnected := make(chan struct{}, 4)
@@ -63,7 +62,6 @@ func TestConn1StatusListenerLosesEvents(t *testing.T) {
 // otherwise it receives one event and leaves the channel open
 // (nats.go:6799-6806), contradicting its doc comment.
 func TestConn2RemoveStatusListenerDoesNotClose(t *testing.T) {
-	harness.KnownBug(t, "CONN-2")
 	s := harness.RunServer(t, false)
 	p := harness.NewProxy(t, s.Addr())
 	nc := connect(t, p.URL(), nats.ReconnectWait(20*time.Millisecond))
