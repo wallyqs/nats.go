@@ -11,6 +11,10 @@
 (* cursor handling is the subject: Fetch copies the previous result's last *)
 (* stream sequence into the cursor before resetting (ordered.go:420-427);  *)
 (* FetchNoWait does neither that nor record its own result (495-513).     *)
+(*                                                                         *)
+(* Fixes (fix/ordered) are switched on by overriding the definition of    *)
+(* Fixes in a cfg (CONSTANT Fixes <- AllFixes); left alone, the spec is    *)
+(* the code at 31a3ee4, which the *_bug.cfg reproducers check.            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, TLC
 
@@ -33,6 +37,14 @@ VARIABLES
 
 vars == <<lock, curS, rf, fg, nG, upc, kind, calls, obs>>
 
+Fixes == {}                    \* the code at 31a3ee4
+AllFixes == {"ORD-1", "ORD-2"}
+\* ORD-1: the early return of Fetch/FetchBytes releases c.Mutex.
+\* ORD-2: FetchNoWait takes c.Mutex, copies the previous result's last
+\*        stream sequence into the cursor and records its own result, as
+\*        Fetch does.
+Fixed(id) == id \in Fixes
+
 Init ==
     /\ lock = "none" /\ curS = 0
     /\ rf = [set |-> FALSE, done |-> TRUE, sseq |-> 0, g |-> 0]
@@ -50,18 +62,21 @@ F1 ==
     /\ upc = "f1"
     /\ IF lock /= "none" THEN upc' = "blocked" /\ UNCHANGED <<lock, curS>>   \* c.Lock() blocks forever
        ELSE IF rf.set /\ ~rf.done
-          THEN lock' = "leaked" /\ upc' = "idle" /\ UNCHANGED curS   \* 421-423: returns, c.Mutex still held
+          THEN /\ lock' = IF Fixed("ORD-1") THEN "none" ELSE "leaked"   \* 421-423: returns, c.Mutex still held
+               /\ upc' = "idle" /\ UNCHANGED curS
           ELSE /\ curS' = IF rf.set /\ rf.sseq /= 0 THEN rf.sseq ELSE curS   \* 424-426
                /\ upc' = "reset" /\ UNCHANGED lock
     /\ UNCHANGED <<rf, fg, nG, kind, calls, obs>>
 
-\* FetchNoWait up to the reset (ordered.go:496-508): no lock, no cursor update
+\* FetchNoWait up to the reset (ordered.go:496-508): no lock, no cursor update.
+\* With ORD-2 fixed it is F1.
 NW ==
     /\ upc = "nw"
-    /\ IF rf.set /\ ~rf.done
-          THEN upc' = "idle"                                     \* 499-501
-          ELSE upc' = "reset"
-    /\ UNCHANGED <<lock, curS, rf, fg, nG, kind, calls, obs>>
+    /\ IF Fixed("ORD-2") THEN upc' = "f1" /\ UNCHANGED <<lock, curS>>
+       ELSE IF rf.set /\ ~rf.done
+          THEN upc' = "idle" /\ UNCHANGED <<lock, curS>>           \* 499-501
+          ELSE upc' = "reset" /\ UNCHANGED <<lock, curS>>
+    /\ UNCHANGED <<rf, fg, nG, kind, calls, obs>>
 
 \* reset() takes c.Mutex (ordered.go:553) and creates a consumer starting at
 \* curS + 1; the fetch then starts its goroutine. Fetch records the result
@@ -71,7 +86,8 @@ Reset ==
     /\ IF lock /= "none" THEN upc' = "blocked" /\ UNCHANGED <<rf, fg, nG>>
        ELSE /\ nG' = nG + 1
             /\ fg' = [fg EXCEPT ![nG + 1] = [nS |-> curS + 1, got |-> 0, done |-> FALSE]]
-            /\ rf' = IF kind = "Fetch" THEN [set |-> TRUE, done |-> FALSE, sseq |-> 0, g |-> nG + 1]
+            /\ rf' = IF kind = "Fetch" \/ Fixed("ORD-2")
+                        THEN [set |-> TRUE, done |-> FALSE, sseq |-> 0, g |-> nG + 1]
                      ELSE rf
             /\ upc' = "idle"
     /\ UNCHANGED <<lock, curS, kind, calls, obs>>

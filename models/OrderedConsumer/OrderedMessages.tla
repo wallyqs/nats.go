@@ -11,6 +11,10 @@
 (* OrderedConsumer.tla plus pull expiry (408) and "silent" consumer loss   *)
 (* (deleted while no pull request waits: no 409 is sent, e.g. the server  *)
 (* removed it after InactiveThreshold).                                    *)
+(*                                                                         *)
+(* Fixes (fix/ordered) are switched on by overriding the definition of    *)
+(* Fixes in a cfg (CONSTANT Fixes <- AllFixes); left alone, the spec is    *)
+(* the code at 31a3ee4, which the *_bug.cfg reproducers check.            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -29,6 +33,17 @@ CONSTANTS
 
 ASSUME Deadline \/ ~ShortDeadline
 
+Fixes == {}                    \* the code at 31a3ee4
+AllFixes == {"ORD-5", "ORD-7", "ORD-8"}
+\* ORD-5: resetMessages does not install the new iterator once closed; it
+\*        stops it and Next returns ErrMsgIteratorClosed.
+\* ORD-7: a closed connection ends reset() (and a failing inner Messages)
+\*        with ErrConnectionClosed: Next stops the iterator and returns.
+\* ORD-8: the call's deadline bounds reset(): it returns when the deadline
+\*        passed, leaving the reset pending for the next call (nx.pend), and
+\*        it is not restarted for the inner Next calls after a reset.
+Fixed(id) == id \in Fixes
+
 NullSub == [cons |-> 0, ser |-> 0, lim |-> 0, idel |-> 0, closed |-> TRUE,
             unsub |-> TRUE, ch |-> <<>>, errs |-> <<>>, ev |-> <<>>,
             st |-> "exit", isConn |-> TRUE, pull |-> FALSE, born |-> FALSE]
@@ -37,7 +52,8 @@ VARIABLES
     lock, serial, curD, curS, delivered, oclosed, odone, curSub, curCons,
     cons, nCons, pendDel, conn,
     subs, nSubs,
-    nx,       \* Next goroutine: [pc, item, err, hb (per-call timer armed), tmo (deadline passed), after (call began after Stop returned), att, nw]
+    nx,       \* Next goroutine: [pc, item, err, hb (per-call timer armed), tmo (deadline passed), after (call began after Stop returned), att, nw,
+              \*                  pend (a reset interrupted by the deadline, ORD-8 fix)]
     usr,
     obs,      \* stream seqs returned by Next
     stopRet,  \* Stop() returned
@@ -73,7 +89,8 @@ Init ==
     /\ subs = [i \in 1..MaxSubs |-> IF i = 1 THEN NewSub(1, 1, SA, FALSE) ELSE NullSub]
     /\ nSubs = 1
     /\ nx = [pc |-> "idle", item |-> [k |-> "none", d |-> 0, s |-> 0, ser |-> 0],
-             err |-> "none", hb |-> FALSE, tmo |-> FALSE, after |-> FALSE, att |-> 0, nw |-> 0]
+             err |-> "none", hb |-> FALSE, tmo |-> FALSE, after |-> FALSE, att |-> 0, nw |-> 0,
+             pend |-> FALSE]
     /\ usr = "idle"
     /\ obs = <<>> /\ stopRet = FALSE /\ lateMsg = FALSE /\ errsRet = {}
     /\ gaps = 0 /\ hbs = 0 /\ extDels = 0 /\ silents = 0 /\ discs = 0
@@ -88,7 +105,8 @@ Ret(err) ==   \* Next returns an error
 \* ===========================================================================
 NCall ==   \* the user calls Next (again); the call's timer starts (pull.go:659)
     /\ nx.pc = "idle" /\ Len(obs) < N
-    /\ SetNx([nx EXCEPT !.pc = "inner", !.hb = ~ShortDeadline, !.after = stopRet])
+    /\ SetNx([nx EXCEPT !.pc = IF nx.pend THEN "reset" ELSE "inner",
+                        !.hb = ~ShortDeadline, !.after = stopRet])
     /\ UNCHANGED <<cvars, evars, subs, nSubs, usr, ovars, bvars>>
 
 \* inner pullSubscription.Next on c.currentSub (ordered.go:282; pull.go:648-746)
@@ -150,7 +168,7 @@ NMeta ==
     LET m == nx.item IN
     /\ nx.pc = "meta"
     /\ IF m.ser /= serial THEN    \* `continue`: new inner Next call
-          SetNx([nx EXCEPT !.pc = "inner", !.hb = ~ShortDeadline, !.tmo = FALSE])
+          SetNx([nx EXCEPT !.pc = "inner", !.hb = ~ShortDeadline, !.tmo = Fixed("ORD-8") /\ nx.tmo])
           /\ UNCHANGED <<curD, curS, delivered, ovars>>
        ELSE IF m.d /= curD + 1 THEN
           SetNx([nx EXCEPT !.pc = "reset", !.err = "mismatch"]) /\ UNCHANGED <<curD, curS, delivered, ovars>>
@@ -183,12 +201,17 @@ NReset ==
           THEN SetNx([nx EXCEPT !.pc = "cst1"])            \* ordered.go:334-339
           ELSE SetNx([nx EXCEPT !.pc = "r1"])
     /\ UNCHANGED <<cvars, evars, subs, nSubs, usr, ovars, bvars>>
+\* A reset retried after the deadline interrupted it (nx.pend, ORD-8 fix)
+\* reuses the serial: the code takes the next one, but the interrupted
+\* reset created no consumer here (creates are atomic in NR3), so the label
+\* is unused, and reusing it keeps the state space finite when the
+\* connection stays down and every Next call times out.
 NR1 ==
     /\ nx.pc = "r1" /\ Free
     /\ lock' = "nx"
     /\ subs' = StopInner(subs, curSub)
     /\ pendDel' = pendDel \cup {curCons}
-    /\ curD' = 0 /\ serial' = serial + 1
+    /\ curD' = 0 /\ serial' = IF nx.pend THEN serial ELSE serial + 1
     /\ SetNx([nx EXCEPT !.pc = "r2", !.att = 0])
     /\ UNCHANGED <<curS, delivered, oclosed, odone, curSub, curCons, cons, nCons, conn,
                    nSubs, usr, ovars, bvars>>
@@ -196,6 +219,13 @@ NR2 ==
     /\ nx.pc = "r2"
     /\ IF oclosed
           THEN lock' = "none" /\ Ret("closed")              \* ordered.go:343-345
+       ELSE IF Fixed("ORD-7") /\ conn = "closed"            \* ErrConnectionClosed: Stop, return
+          THEN lock' = "none" /\ SetNx([nx EXCEPT !.pc = "cst1", !.err = "closed"])
+               /\ UNCHANGED errsRet
+       ELSE IF Fixed("ORD-8") /\ nx.tmo                     \* ctx done: return, reset pending
+          THEN /\ lock' = "none"
+               /\ SetNx([nx EXCEPT !.pc = "idle", !.hb = FALSE, !.tmo = FALSE, !.pend = TRUE])
+               /\ errsRet' = errsRet \cup {"timeout"}
           ELSE UNCHANGED <<lock, errsRet>> /\ SetNx([nx EXCEPT !.pc = "r3"])
     /\ UNCHANGED <<serial, curD, curS, delivered, oclosed, odone, curSub, curCons,
                    evars, subs, nSubs, usr, obs, stopRet, lateMsg, bvars>>
@@ -205,11 +235,14 @@ NR3 ==
           /\ nCons' = nCons + 1
           /\ cons' = [cons EXCEPT ![nCons + 1] = [exists |-> TRUE, nD |-> 1, nS |-> curS + 1]]
           /\ curCons' = nCons + 1 /\ lock' = "none"
-          /\ SetNx([nx EXCEPT !.pc = "msgs"])
+          /\ SetNx([nx EXCEPT !.pc = "msgs", !.pend = FALSE])
           /\ UNCHANGED errsRet
        \/ /\ conn /= "up"
           /\ UNCHANGED <<cons, nCons, curCons>>
-          /\ IF MaxReset > 0 /\ nx.att + 1 >= MaxReset
+          /\ IF Fixed("ORD-7") /\ conn = "closed"
+                THEN lock' = "none" /\ SetNx([nx EXCEPT !.pc = "cst1", !.err = "closed"])
+                     /\ UNCHANGED errsRet
+             ELSE IF MaxReset > 0 /\ nx.att + 1 >= MaxReset
                 THEN lock' = "none" /\ Ret("createfail")
                 ELSE UNCHANGED <<lock, errsRet>>
                      /\ SetNx([nx EXCEPT !.pc = "r2", !.att = IF MaxReset > 0 THEN @ + 1 ELSE 0])
@@ -217,7 +250,9 @@ NR3 ==
                    pendDel, conn, subs, nSubs, usr, obs, stopRet, lateMsg, bvars>>
 NMsgs ==   \* currentConsumer.Messages(opts...) (ordered.go:348), no c.Mutex, no closed check
     /\ nx.pc = "msgs" /\ conn = "closed"     \* ChanSubscribe fails: Next returns the error
-    /\ Ret("connclosed")
+    /\ IF Fixed("ORD-7")                     \* ... after stopping the iterator
+          THEN SetNx([nx EXCEPT !.pc = "cst1", !.err = "closed"]) /\ UNCHANGED errsRet
+          ELSE Ret("connclosed")
     /\ UNCHANGED <<cvars, evars, subs, nSubs, usr, obs, stopRet, lateMsg, bvars>>
 NMsgsOK ==
     /\ nx.pc = "msgs" /\ conn /= "closed" /\ nSubs < MaxSubs
@@ -229,10 +264,15 @@ NMsgsOK ==
 NAsg ==    \* ordered.go:352-354, then `continue`: a new inner Next call, with a new
            \* heartbeat timer and a new NextMaxWait timer (pull.go:635-664)
     /\ nx.pc = "asg" /\ Free
-    /\ curSub' = nx.nw
-    /\ SetNx([nx EXCEPT !.pc = "inner", !.hb = ~ShortDeadline, !.tmo = FALSE])
+    /\ IF Fixed("ORD-5") /\ oclosed
+          THEN \* cc.Stop(); return ErrMsgIteratorClosed
+               /\ subs' = StopInner(subs, nx.nw) /\ UNCHANGED curSub
+               /\ Ret("closed")
+          ELSE /\ curSub' = nx.nw /\ UNCHANGED <<subs, errsRet>>
+               /\ SetNx([nx EXCEPT !.pc = "inner", !.hb = ~ShortDeadline,
+                                   !.tmo = Fixed("ORD-8") /\ nx.tmo])
     /\ UNCHANGED <<lock, serial, curD, curS, delivered, oclosed, odone, curCons,
-                   evars, subs, nSubs, usr, ovars, bvars>>
+                   evars, nSubs, usr, obs, stopRet, lateMsg, bvars>>
 
 NextG == NCall \/ NInner \/ NTimeout \/ NMeta \/ NCst1 \/ NCst2 \/ NReset \/ NR1 \/ NR2 \/ NR3
          \/ NMsgs \/ NMsgsOK \/ NAsg

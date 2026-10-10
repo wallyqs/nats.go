@@ -29,8 +29,9 @@ import (
 
 // Reproducers for the findings in models/OrderedConsumer/README.md. Each one
 // replays the counterexample of the matching *_bug.cfg against the real
-// library and asserts the correct behavior, so it fails until the bug is
-// fixed; harness.KnownBug skips it by default.
+// library and asserts the correct behavior. Fixed findings run as regression
+// tests; harness.KnownBug skips the ones that are still open (ORD-12) by
+// default.
 //
 // Interleavings are forced, not waited for: the JetStream API relay holds
 // the consumer create of reset() (the model's "create in flight" step), and
@@ -42,7 +43,6 @@ import (
 // FetchBytes at 460-463). Every later call that takes the mutex blocks
 // forever. Trace: OrderedFetch_locked_bug.cfg.
 func TestORD1FetchConcurrentRequestsLeaksLock(t *testing.T) {
-	harness.KnownBug(t, "ORD-1")
 	for _, name := range []string{"Fetch", "FetchBytes"} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t, envOpts{})
@@ -79,7 +79,6 @@ func TestORD1FetchConcurrentRequestsLeaksLock(t *testing.T) {
 // new consumer at the old cursor and hands out the same messages again.
 // Trace: OrderedFetch_nowait_bug.cfg.
 func TestORD2FetchNoWaitRedelivers(t *testing.T) {
-	harness.KnownBug(t, "ORD-2")
 	cases := []struct {
 		name  string
 		first func(jetstream.Consumer) (jetstream.MessageBatch, error)
@@ -124,7 +123,6 @@ func TestORD2FetchNoWaitRedelivers(t *testing.T) {
 // handler deadlocks the handler and, with it, the consume.
 // Trace: ErrHandlerStop_bug.cfg.
 func TestORD3ErrHandlerCallingStopDeadlocks(t *testing.T) {
-	harness.KnownBug(t, "ORD-3")
 	for _, call := range []string{"Stop", "CachedInfo"} {
 		t.Run(call, func(t *testing.T) {
 			e := newEnv(t, envOpts{})
@@ -166,7 +164,6 @@ func TestORD3ErrHandlerCallingStopDeadlocks(t *testing.T) {
 // still running, and can finish first. Trace: ConcurrentHandler_bug.cfg,
 // OutOfOrder_bug.cfg.
 func TestORD4HandlerRunsConcurrentlyAcrossReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-4")
 	e := newEnv(t, envOpts{proxy: true})
 	e.publish(3)
 	c := e.ordered(jetstream.OrderedConsumerConfig{})
@@ -231,7 +228,6 @@ func TestORD4HandlerRunsConcurrentlyAcrossReset(t *testing.T) {
 // attempts here), so the test repeats the forced part of the trace.
 // Trace: OrderedMessages_resurrect_bug.cfg.
 func TestORD5MessagesNextAfterStopDuringReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-5")
 	e := newEnv(t, envOpts{relay: true})
 	for i := 0; i < 600; i++ {
 		if seq, ok := ord5Attempt(t, e); !ok {
@@ -295,7 +291,6 @@ func ord5Attempt(t *testing.T, e *env) (uint64, bool) {
 // logs late handler calls (their number depends on scheduling).
 // Trace: StopResurrect_bug.cfg.
 func TestORD6ConsumeSubscribesAfterStop(t *testing.T) {
-	harness.KnownBug(t, "ORD-6")
 	e := newEnv(t, envOpts{relay: true})
 	e.publish(1)
 	c := e.ordered(jetstream.OrderedConsumerConfig{})
@@ -354,7 +349,6 @@ func TestORD6ConsumeSubscribesAfterStop(t *testing.T) {
 // reports ErrConnectionClosed or closes, and Messages' Next never returns.
 // Trace: CloseDuringReset_bug.cfg, OrderedMessages_close_bug.cfg.
 func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
-	harness.KnownBug(t, "ORD-7")
 	t.Run("Consume", func(t *testing.T) {
 		e := newEnv(t, envOpts{relay: true})
 		c := e.ordered(jetstream.OrderedConsumerConfig{})
@@ -402,8 +396,11 @@ func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
 		if !ok {
 			t.Fatal("Next did not return after the connection closed during a reset")
 		}
-		if !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
-			t.Errorf("Next: %v, want ErrMsgIteratorClosed", err)
+		if !errors.Is(err, jetstream.ErrMsgIteratorClosed) || !errors.Is(err, jetstream.ErrConnectionClosed) {
+			t.Errorf("Next: %v, want ErrMsgIteratorClosed and ErrConnectionClosed", err)
+		}
+		if _, err := it.Next(jetstream.NextMaxWait(time.Second)); !errors.Is(err, jetstream.ErrMsgIteratorClosed) {
+			t.Errorf("second Next: %v, want ErrMsgIteratorClosed", err)
 		}
 	})
 }
@@ -411,9 +408,9 @@ func TestORD7CloseDuringResetNeverEnds(t *testing.T) {
 // ORD-8: Next(NextMaxWait / NextContext) does not bound the time spent in
 // resetMessages: reset() holds the ordered consumer's mutex across
 // CreateOrUpdateConsumer and its backoff (ordered.go:583-595), ignoring the
-// caller's deadline. Trace: OrderedMessages_timeout_bug.cfg.
+// caller's deadline. Trace: OrderedMessages_timeout_bug.cfg. With the fix,
+// the interrupted reset is left pending and the next Next completes it.
 func TestORD8NextDeadlineIgnoredDuringReset(t *testing.T) {
-	harness.KnownBug(t, "ORD-8")
 	for _, kind := range []string{"NextMaxWait", "NextContext"} {
 		t.Run(kind, func(t *testing.T) {
 			e := newEnv(t, envOpts{relay: true})
@@ -451,6 +448,23 @@ func TestORD8NextDeadlineIgnoredDuringReset(t *testing.T) {
 			if !ok {
 				err = <-done
 				t.Fatalf("Next with a 1s deadline returned after %v (%v)", time.Since(start).Round(time.Millisecond), err)
+			}
+			want := nats.ErrTimeout
+			if kind == "NextContext" {
+				want = context.DeadlineExceeded
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("Next: %v, want %v", err, want)
+			}
+			// The reset the deadline interrupted is retried by the next
+			// call, which then delivers from where the iterator was.
+			e.publish(1)
+			m, err := it.Next(jetstream.NextMaxWait(10 * time.Second))
+			if err != nil {
+				t.Fatalf("Next after the interrupted reset: %v", err)
+			}
+			if s := streamSeq(t, m); s != 1 {
+				t.Fatalf("Next after the interrupted reset: stream seq %d, want 1", s)
 			}
 		})
 	}
@@ -529,7 +543,6 @@ func TestORD12MessagesStuckAfterSilentConsumerLoss(t *testing.T) {
 // after 30s instead of 10s. The test stalls every pull request in the relay
 // and measures how long Consume takes to start a reset.
 func TestORD13OrderedDefaultHeartbeatNotApplied(t *testing.T) {
-	harness.KnownBug(t, "ORD-13")
 	e := newEnv(t, envOpts{relay: true})
 	c := e.ordered(jetstream.OrderedConsumerConfig{})
 	_, stopHolding := e.rl.HoldAll("CONSUMER.MSG.NEXT.")

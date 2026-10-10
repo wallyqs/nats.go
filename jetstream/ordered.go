@@ -45,6 +45,11 @@ type (
 		deliveredMessages int // messages handed to the caller, across resets
 		runningFetch      *fetchResult
 		subscription      *orderedSubscription
+		// handlerMu serializes the Consume handler across inner
+		// subscriptions: after a reset, the new inner subscription's
+		// messages are dispatched on another goroutine than the old one's.
+		// It is taken before the consumer's mutex.
+		handlerMu sync.Mutex
 		sync.Mutex
 	}
 
@@ -53,6 +58,13 @@ type (
 		opts     []PullMessagesOpt
 		done     chan struct{}
 		closed   atomic.Uint32
+		// stopped is set by Stop (not by Drain) under the consumer's
+		// mutex; no message reaches the Consume handler after it is set.
+		stopped bool
+		// resetPending is set when Next's deadline expired during a
+		// reset; the next call to Next retries the reset. It is only
+		// accessed by Next.
+		resetPending bool
 	}
 
 	cursor struct {
@@ -83,7 +95,7 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.Lock()
 	defer c.Unlock()
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
+		err := c.reset(context.Background())
 		if err != nil {
 			return nil, err
 		}
@@ -101,7 +113,10 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.userErrHandler = consumeOpts.ErrHandler
 	c.stopAfter = max(consumeOpts.StopAfter, 0)
 	c.deliveredMessages = 0
-	opts = append(opts, consumeReconnectNotify())
+	// The inner pull subscription parses the options again, with the
+	// defaults of a plain pull consumer; pass the ordered default
+	// heartbeat down explicitly.
+	opts = append(opts, consumeReconnectNotify(), orderedHeartbeat(consumeOpts.Heartbeat))
 	// innerOpts returns the options for the inner pull subscription of the
 	// current serial. Lock should be held when calling it.
 	innerOpts := func() []PullConsumeOpt {
@@ -118,9 +133,16 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 	c.subscription = sub
 	internalHandler := func(serial int) func(msg Msg) {
 		return func(msg Msg) {
+			// Hold handlerMu across the checks and the handler call, so
+			// that a message of the next inner subscription waits for the
+			// running handler and only then sees the new cursor.
+			c.handlerMu.Lock()
+			defer c.handlerMu.Unlock()
 			c.Lock()
-			// handler is a noop if message was delivered for a consumer with different serial
-			if serial != c.serial {
+			// handler is a noop if message was delivered for a consumer with different serial,
+			// or if the consume was stopped (the inner subscription may still
+			// dispatch messages it dequeued before it was unsubscribed)
+			if serial != c.serial || sub.stopped {
 				c.Unlock()
 				return
 			}
@@ -170,30 +192,59 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 					sub.Stop()
 					return
 				}
-				if err := c.reset(); err != nil {
+				if err := c.reset(context.Background()); err != nil {
 					if errors.Is(err, errOrderedConsumerClosed) {
 						continue
 					}
-					c.errHandler(c.serial)(c.currentSub, err)
+					c.errHandler(c.serial)(sub, err)
+					if errors.Is(err, ErrConnectionClosed) {
+						// errHandler stopped the subscription; do not
+						// subscribe on the closed connection.
+						continue
+					}
 				}
 				c.Lock()
+				if sub.closed.Load() == 1 {
+					// Stopped or drained while resetting: done is closed,
+					// or about to be (Stop waits for the mutex), and the
+					// select returns.
+					c.Unlock()
+					continue
+				}
+				if c.stopAfter > 0 && c.deliveredMessages >= c.stopAfter {
+					// The old inner subscription delivered the last
+					// message after the check above and before reset()
+					// changed the serial; there is nothing left to consume.
+					c.Unlock()
+					sub.Stop()
+					return
+				}
 				serial := c.serial
 				consumeOpts := innerOpts()
 				c.Unlock()
 				if cc, err := c.currentConsumer.Consume(internalHandler(serial), consumeOpts...); err != nil {
-					c.errHandler(serial)(cc, err)
+					if c.js.conn.IsClosed() {
+						err = ErrConnectionClosed
+					}
+					c.errHandler(serial)(sub, err)
 				} else {
 					c.Lock()
+					if sub.closed.Load() == 1 {
+						// Stop or Drain ran while the inner subscription was
+						// created and stopped the previous one.
+						c.Unlock()
+						cc.Stop()
+						continue
+					}
 					c.currentSub = cc.(*pullSubscription)
 					c.Unlock()
 				}
 			case <-sub.done:
-				s := sub.consumer.currentSub
-				if s != nil {
-					sub.consumer.Lock()
+				sub.consumer.Lock()
+				if s := sub.consumer.currentSub; s != nil {
 					s.Stop()
-					sub.consumer.Unlock()
 				}
+				sub.consumer.Unlock()
 				return
 			}
 		}
@@ -204,10 +255,15 @@ func (c *orderedConsumer) Consume(handler MessageHandler, opts ...PullConsumeOpt
 func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err error) {
 	return func(cc ConsumeContext, err error) {
 		c.Lock()
-
-		if c.userErrHandler != nil && !errors.Is(err, errOrderedSequenceMismatch) && !errors.Is(err, errConnected) {
-			c.userErrHandler(cc, err)
+		userErrHandler := c.userErrHandler
+		c.Unlock()
+		// Call the user's handler without holding the lock: it may call
+		// Stop or Drain on the ConsumeContext, or Info/CachedInfo.
+		if userErrHandler != nil && !errors.Is(err, errOrderedSequenceMismatch) && !errors.Is(err, errConnected) {
+			userErrHandler(cc, err)
 		}
+
+		c.Lock()
 		if errors.Is(err, ErrConnectionClosed) {
 			if c.subscription != nil {
 				c.Unlock()
@@ -240,7 +296,7 @@ func (c *orderedConsumer) errHandler(serial int) func(cc ConsumeContext, err err
 // See [Consumer.Messages] for more details.
 func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error) {
 	if (c.consumerType == consumerTypeNotSet || c.consumerType == consumerTypeConsume) && c.currentConsumer == nil {
-		err := c.reset()
+		err := c.reset(context.Background())
 		if err != nil {
 			return nil, err
 		}
@@ -255,9 +311,12 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrInvalidOption, err)
 	}
+	// As in Consume, pass the ordered default heartbeat down to the inner
+	// iterator, which parses the options with the plain pull defaults.
 	opts = append(opts,
 		WithMessagesErrOnMissingHeartbeat(true),
-		messagesReconnectNotify())
+		messagesReconnectNotify(),
+		orderedHeartbeat(consumeOpts.Heartbeat))
 	c.stopAfter = max(consumeOpts.StopAfter, 0)
 	c.deliveredMessages = 0
 	c.userErrHandler = consumeOpts.ErrHandler
@@ -278,8 +337,48 @@ func (c *orderedConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, er
 }
 
 func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
+	var nextOpts nextOpts
+	for _, opt := range opts {
+		opt.configureNext(&nextOpts)
+	}
+	if nextOpts.timeout > 0 && nextOpts.ctx != nil {
+		return nil, fmt.Errorf("%w: cannot specify both NextMaxWait and NextContext", ErrInvalidOption)
+	}
+	// The deadline of the call bounds the inner Next calls and the resets
+	// in between: a reset is not tied to the inner iterator, and each inner
+	// Next would otherwise start the full NextMaxWait again.
+	ctx := context.Background()
+	var deadline time.Time
+	if nextOpts.timeout > 0 {
+		deadline = time.Now().Add(nextOpts.timeout)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	} else if nextOpts.ctx != nil {
+		ctx = nextOpts.ctx
+	}
+	resetErr := func(err error) error {
+		if !deadline.IsZero() && errors.Is(err, context.DeadlineExceeded) {
+			return nats.ErrTimeout
+		}
+		return err
+	}
 	for {
-		msg, err := s.consumer.currentSub.Next(opts...)
+		if s.resetPending {
+			// The previous call's deadline expired during a reset.
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
+			}
+		}
+		innerOpts := opts
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, nats.ErrTimeout
+			}
+			innerOpts = []NextOpt{NextMaxWait(remaining)}
+		}
+		msg, err := s.consumer.currentSub.Next(innerOpts...)
 		if err != nil {
 			// Check for errors which should be returned directly
 			// without resetting the consumer
@@ -296,8 +395,8 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 				s.Stop()
 				return nil, err
 			}
-			if err := s.resetMessages(); err != nil {
-				return nil, err
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
 			}
 			continue
 		}
@@ -312,8 +411,8 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 		}
 		dseq := meta.Sequence.Consumer
 		if dseq != s.consumer.cursor.deliverSeq+1 {
-			if err := s.resetMessages(); err != nil {
-				return nil, err
+			if err := s.resetMessages(ctx); err != nil {
+				return nil, resetErr(err)
 			}
 			continue
 		}
@@ -327,8 +426,9 @@ func (s *orderedSubscription) Next(opts ...NextOpt) (Msg, error) {
 // resetMessages replaces the inner iterator with a new one, created on a
 // new consumer which resumes after the last message returned by Next.
 // With StopAfter set, the new iterator is limited to the messages that
-// are left to deliver.
-func (s *orderedSubscription) resetMessages() error {
+// are left to deliver. If ctx expires before the new consumer is created,
+// the reset is left pending for the next call to Next.
+func (s *orderedSubscription) resetMessages(ctx context.Context) error {
 	c := s.consumer
 	opts := s.opts
 	if c.stopAfter > 0 {
@@ -339,17 +439,37 @@ func (s *orderedSubscription) resetMessages() error {
 		}
 		opts = append(slices.Clip(opts), StopAfter(remaining))
 	}
-	if err := c.reset(); err != nil {
+	if err := c.reset(ctx); err != nil {
 		if errors.Is(err, errOrderedConsumerClosed) {
 			return ErrMsgIteratorClosed
 		}
+		if errors.Is(err, ErrConnectionClosed) {
+			s.Stop()
+			return fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+		}
+		if ctx.Err() != nil {
+			// reset() stopped the inner iterator; retry on the next call
+			s.resetPending = true
+		}
 		return err
 	}
+	s.resetPending = false
 	cc, err := c.currentConsumer.Messages(opts...)
 	if err != nil {
+		if c.js.conn.IsClosed() {
+			s.Stop()
+			return fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
+		}
 		return err
 	}
 	c.Lock()
+	if s.closed.Load() == 1 {
+		// Stop or Drain ran during the reset and stopped the previous
+		// iterator; do not install the new one.
+		c.Unlock()
+		cc.Stop()
+		return ErrMsgIteratorClosed
+	}
 	c.currentSub = cc.(*pullSubscription)
 	c.Unlock()
 	return nil
@@ -361,6 +481,7 @@ func (s *orderedSubscription) Stop() {
 	}
 	s.consumer.Lock()
 	defer s.consumer.Unlock()
+	s.stopped = true
 	if s.consumer.currentSub != nil {
 		s.consumer.currentSub.Stop()
 	}
@@ -419,6 +540,7 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	}
 	if c.runningFetch != nil {
 		if !c.runningFetch.closed() {
+			c.Unlock()
 			return nil, ErrOrderedConsumerConcurrentRequests
 		}
 		if c.runningFetch.sseq != 0 {
@@ -432,7 +554,7 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	}
 	c.subscription = &sub
 	c.Unlock()
-	err := c.reset()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +562,9 @@ func (c *orderedConsumer) Fetch(batch int, opts ...FetchOpt) (MessageBatch, erro
 	if err != nil {
 		return nil, err
 	}
+	c.Lock()
 	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
 	return msgs, nil
 }
 
@@ -459,6 +583,7 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	}
 	if c.runningFetch != nil {
 		if !c.runningFetch.closed() {
+			c.Unlock()
 			return nil, ErrOrderedConsumerConcurrentRequests
 		}
 		if c.runningFetch.sseq != 0 {
@@ -472,7 +597,7 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	}
 	c.subscription = &sub
 	c.Unlock()
-	err := c.reset()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -480,7 +605,9 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 	if err != nil {
 		return nil, err
 	}
+	c.Lock()
 	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
 	return msgs, nil
 }
 
@@ -493,11 +620,21 @@ func (c *orderedConsumer) FetchBytes(maxBytes int, opts ...FetchOpt) (MessageBat
 // reset the consumer for each subsequent Fetch call.
 // Consider using [Consumer.Consume] or [Consumer.Messages] instead.
 func (c *orderedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
+	c.Lock()
 	if c.consumerType == consumerTypeConsume {
+		c.Unlock()
 		return nil, ErrOrderConsumerUsedAsConsume
 	}
-	if c.runningFetch != nil && !c.runningFetch.done {
-		return nil, ErrOrderedConsumerConcurrentRequests
+	// Same cursor hand-over as Fetch: resume after the last message
+	// delivered by the previous fetch, and record this one.
+	if c.runningFetch != nil {
+		if !c.runningFetch.closed() {
+			c.Unlock()
+			return nil, ErrOrderedConsumerConcurrentRequests
+		}
+		if c.runningFetch.sseq != 0 {
+			c.cursor.streamSeq = c.runningFetch.sseq
+		}
 	}
 	c.consumerType = consumerTypeFetch
 	sub := orderedSubscription{
@@ -505,11 +642,19 @@ func (c *orderedConsumer) FetchNoWait(batch int) (MessageBatch, error) {
 		done:     make(chan struct{}),
 	}
 	c.subscription = &sub
-	err := c.reset()
+	c.Unlock()
+	err := c.reset(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return c.currentConsumer.FetchNoWait(batch)
+	msgs, err := c.currentConsumer.FetchNoWait(batch)
+	if err != nil {
+		return nil, err
+	}
+	c.Lock()
+	c.runningFetch = msgs.(*fetchResult)
+	c.Unlock()
+	return msgs, nil
 }
 
 // Next is used to retrieve the next message from the stream. This
@@ -549,7 +694,11 @@ func serialNumberFromConsumer(name string) int {
 	return serial
 }
 
-func (c *orderedConsumer) reset() error {
+// reset stops the current inner subscription and replaces the server-side
+// consumer with a new one that resumes after the cursor. It retries the
+// consumer creation (up to MaxResetAttempts) until ctx is done; a closed
+// connection ends it with ErrConnectionClosed.
+func (c *orderedConsumer) reset(ctx context.Context) error {
 	c.Lock()
 	defer c.Unlock()
 	defer c.resetInProgress.Store(0)
@@ -578,21 +727,43 @@ func (c *orderedConsumer) reset() error {
 		initialInterval: time.Second,
 		factor:          2,
 		maxInterval:     10 * time.Second,
-		cancel:          c.subscription.done,
+		// Stop and Drain cannot close the subscription's done channel
+		// while the lock is held; closed is checked before each attempt
+		// instead.
+		cancel: ctx.Done(),
 	}
 	err = retryWithBackoff(func(attempt int) (bool, error) {
 		isClosed := c.subscription.closed.Load() == 1
 		if isClosed {
 			return false, errOrderedConsumerClosed
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// A closed connection does not come back: give up instead of
+		// retrying forever. reset() has already stopped the inner
+		// subscription, which would otherwise have reported the close.
+		if c.js.conn.IsClosed() {
+			return false, ErrConnectionClosed
+		}
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		cons, err = c.js.CreateOrUpdateConsumer(ctx, c.stream, *consumerConfig)
+		cons, err = c.js.CreateOrUpdateConsumer(reqCtx, c.stream, *consumerConfig)
 		if err != nil {
+			if errors.Is(err, nats.ErrConnectionClosed) || c.js.conn.IsClosed() {
+				return false, ErrConnectionClosed
+			}
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			return true, err
 		}
 		return false, nil
 	}, backoffOpts)
+	if err == nil && cons == nil {
+		// retryWithBackoff returns no error when canceled during a backoff
+		err = ctx.Err()
+	}
 	if err != nil {
 		return err
 	}
@@ -678,6 +849,16 @@ func consumeReconnectNotify() PullConsumeOpt {
 func messagesReconnectNotify() PullMessagesOpt {
 	return pullOptFunc(func(opts *consumeOpts) error {
 		opts.notifyOnReconnect = true
+		return nil
+	})
+}
+
+// orderedHeartbeat sets the heartbeat of an inner pull subscription to
+// the one the ordered consumer resolved (the user's, or the ordered
+// default), which its own option parsing already validated.
+func orderedHeartbeat(hb time.Duration) pullOptFunc {
+	return pullOptFunc(func(opts *consumeOpts) error {
+		opts.Heartbeat = hb
 		return nil
 	})
 }
