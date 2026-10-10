@@ -23,8 +23,8 @@ package harness
 import (
 	"fmt"
 	"io"
-	"os"
 	"net"
+	"os"
 	"sync"
 	"testing"
 	"time"
