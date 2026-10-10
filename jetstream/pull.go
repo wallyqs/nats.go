@@ -134,8 +134,8 @@ type (
 		id                string
 		consumer          *pullConsumer
 		subscription      *nats.Subscription
-		msgs              chan *nats.Msg
-		msgsClosed        atomic.Uint32
+		msgs              chan *nats.Msg // Fetch
+		queue             *msgQueue      // Messages
 		errs              chan error
 		pending           pendingMsgs
 		hbMonitor         *hbMonitor
@@ -155,6 +155,19 @@ type (
 	pendingMsgs struct {
 		msgCount  int
 		byteCount int
+	}
+
+	// msgQueue holds what the subscription of a Messages() iterator
+	// received until Next takes it. It is unbounded: nats.go drops what
+	// does not fit into a channel subscription (slow consumer), and pull
+	// requests that survive a reconnect or a missed heartbeat at the
+	// server, or in the reconnect buffer, are invisible to the client, so
+	// the iterator cannot keep what it asks for within a fixed capacity.
+	msgQueue struct {
+		mu     sync.Mutex
+		msgs   []*nats.Msg
+		closed bool
+		ready  chan struct{} // capacity 1, signaled on push and close
 	}
 
 	MessageBatch interface {
@@ -592,21 +605,19 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 	p.Lock()
 	subject := p.js.apiSubject(fmt.Sprintf(apiRequestNextT, p.stream, p.name))
 
-	msgs := make(chan *nats.Msg, consumeOpts.MaxMessages)
-
 	consumeID := nuid.Next()
 	sub := &pullSubscription{
 		id:          consumeID,
 		consumer:    p,
 		done:        make(chan struct{}, 1),
-		msgs:        msgs,
+		queue:       &msgQueue{ready: make(chan struct{}, 1)},
 		errs:        make(chan error, 10),
 		fetchNext:   make(chan *pullRequest, 1),
 		consumeOpts: consumeOpts,
 	}
 	sub.connStatusChanged = p.js.conn.StatusChanged(nats.CONNECTED, nats.RECONNECTING)
 	inbox := p.js.conn.NewInbox()
-	sub.subscription, err = p.js.conn.ChanSubscribe(inbox, sub.msgs)
+	sub.subscription, err = p.js.conn.Subscribe(inbox, sub.queue.push)
 	if err != nil {
 		p.Unlock()
 		p.js.conn.RemoveStatusListener(sub.connStatusChanged)
@@ -622,7 +633,7 @@ func (p *pullConsumer) Messages(opts ...PullMessagesOpt) (MessagesContext, error
 				p.subs.Delete(sid)
 			}
 			sub.handlerDone.Store(true)
-			sub.closeMsgs()
+			sub.queue.close()
 		}
 	}(sub.id)
 	sub.subscription.SetClosedHandler(closedHandler)
@@ -737,22 +748,22 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 
 	for {
 		s.checkPending()
-		select {
-		case msg, ok := <-s.msgs:
-			if !ok {
-				// if msgs channel is closed, it means that subscription was either drained or stopped
-				// or that the connection was closed. In the latter case
-				// nothing called Stop, so stop here to let pullMessages
-				// and the status goroutine exit. It is a no-op otherwise.
-				s.Stop()
-				s.consumer.subs.Delete(s.id)
-				s.draining.CompareAndSwap(1, 0)
-				// Check if iterator was closed due to connection closure
-				if s.consumer.js.conn.IsClosed() {
-					return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
-				}
-				return nil, ErrMsgIteratorClosed
+		msg, open := s.queue.pop()
+		if msg == nil && !open {
+			// if the queue is closed, it means that subscription was either drained or stopped
+			// or that the connection was closed. In the latter case
+			// nothing called Stop, so stop here to let pullMessages
+			// and the status goroutine exit. It is a no-op otherwise.
+			s.Stop()
+			s.consumer.subs.Delete(s.id)
+			s.draining.CompareAndSwap(1, 0)
+			// Check if iterator was closed due to connection closure
+			if s.consumer.js.conn.IsClosed() {
+				return nil, fmt.Errorf("%w: %w", ErrMsgIteratorClosed, ErrConnectionClosed)
 			}
+			return nil, ErrMsgIteratorClosed
+		}
+		if msg != nil {
 			if hbMonitor != nil {
 				hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
 			}
@@ -774,9 +785,14 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 			s.decrementPendingMsgs(msg)
 			s.incrementDeliveredMsgs()
 			return s.consumer.js.toJSMsg(msg), nil
+		}
+		select {
+		case <-s.queue.ready:
 		case err := <-s.errs:
+			// The pending count is reset to what is still queued: those
+			// messages were pulled already.
 			if errors.Is(err, ErrNoHeartbeat) {
-				s.pending.msgCount = 0
+				s.pending.msgCount = s.queue.len()
 				s.pending.byteCount = 0
 				if s.consumeOpts.ReportMissingHeartbeats {
 					return nil, err
@@ -793,7 +809,7 @@ func (s *pullSubscription) Next(opts ...NextOpt) (Msg, error) {
 				if s.consumeOpts.notifyOnReconnect {
 					return nil, errConnected
 				}
-				s.pending.msgCount = 0
+				s.pending.msgCount = s.queue.len()
 				s.pending.byteCount = 0
 				if hbMonitor != nil {
 					hbMonitor.Reset(2 * s.consumeOpts.Heartbeat)
@@ -1177,10 +1193,49 @@ func (s *pullSubscription) pullMessages(subject string) {
 	}
 }
 
-func (s *pullSubscription) closeMsgs() {
-	if s.msgsClosed.CompareAndSwap(0, 1) {
-		close(s.msgs)
+// push appends msg and wakes Next up. It never blocks, so the nats.go
+// subscription delivering into it never accumulates messages either.
+func (q *msgQueue) push(msg *nats.Msg) {
+	q.mu.Lock()
+	q.msgs = append(q.msgs, msg)
+	q.mu.Unlock()
+	q.signal()
+}
+
+// close marks the end of the messages; Next still returns the ones
+// queued.
+func (q *msgQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.signal()
+}
+
+func (q *msgQueue) signal() {
+	select {
+	case q.ready <- struct{}{}:
+	default:
 	}
+}
+
+// pop removes and returns the oldest message, or nil if there is none;
+// open reports whether more can still arrive.
+func (q *msgQueue) pop() (msg *nats.Msg, open bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.msgs) == 0 {
+		return nil, !q.closed
+	}
+	msg = q.msgs[0]
+	q.msgs[0] = nil
+	q.msgs = q.msgs[1:]
+	return msg, true
+}
+
+func (q *msgQueue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.msgs)
 }
 
 func (s *pullSubscription) scheduleHeartbeatCheck(dur time.Duration) *hbMonitor {

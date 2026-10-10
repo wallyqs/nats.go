@@ -344,7 +344,6 @@ func TestPULL7ClosedBeforeHandlerReturns(t *testing.T) {
 //
 // Trace: PullMessages_overflow_bug.cfg (NoSlowConsumerDrop).
 func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
-	harness.KnownBug(t, "PULL-5")
 	e := newEnv(t)
 	var slow atomic.Int64
 	e.nc.SetErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
@@ -381,6 +380,9 @@ func TestPULL5MessagesOverflowAfterReconnect(t *testing.T) {
 	if n := slow.Load(); n > 0 {
 		t.Fatalf("%d slow consumer drop(s) on the iterator after a reconnect (pulls on the wire: %v, received %d of %d)",
 			n, e.px.PullBatches(), got, 3*max)
+	}
+	if got != 3*max {
+		t.Fatalf("received %d of %d messages (pulls on the wire: %v)", got, 3*max, e.px.PullBatches())
 	}
 }
 
