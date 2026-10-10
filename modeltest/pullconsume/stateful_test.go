@@ -48,10 +48,13 @@ import (
 // on teardown NoDeadlock (every consume goroutine returns, Closed fires)
 // and DrainKeepsBuffered.
 //
-// By default the draws stay clear of the known bugs (no StopAfter, no
-// reconnect with an iterator backlog, ...), so the test guards the rest of
-// the state space. With MODELTEST_KNOWN_BUGS=1 the whole space is explored
-// and the run is expected to fail on one of the README findings.
+// The findings fixed on fix/pull (PULL-1, 3, 4, 5, 6, 10) are part of the
+// default run: Consume draws StopAfter, and Messages reconnects and misses
+// heartbeats. By default the draws stay clear of the one finding still
+// open, PULL-2 (nats.go's StatusChanged losing events, fixed separately in
+// nats.go): Messages makes at most maxCutsBetweenNext reconnects in a row
+// without Next, so its status goroutine never fills errs and stops
+// reading. With MODELTEST_KNOWN_BUGS=1 that limit is lifted.
 
 const (
 	stExpiry    = time.Second
@@ -121,6 +124,23 @@ func checkWire(e *env, maxMsgs, stopAfter int) error {
 	return nil
 }
 
+// maxCutsBetweenNext keeps Messages' status goroutine from blocking on a
+// full errs channel (capacity 10, two notifications per reconnect) while
+// nobody calls Next, which with the unfixed nats.go StatusChanged (PULL-2)
+// loses status events. Only lifted with MODELTEST_KNOWN_BUGS=1.
+const maxCutsBetweenNext = 4
+
+// settleBeforeCut gives messages already on their way to the client time
+// to arrive before the connection is cut: the proxy loses what is in
+// flight, and the server only redelivers it after AckWait (30s). That loss
+// is the environment's, not the library's, and would otherwise show up as
+// a spurious NoSilentStall. delivered reports whether everything arrived;
+// it is not an assertion, since a bug may well keep messages from coming.
+func settleBeforeCut(delivered func() bool) {
+	harness.Eventually(500*time.Millisecond, delivered)
+	time.Sleep(20 * time.Millisecond)
+}
+
 // lateHeartbeats drops idle heartbeats (and 408s) for a little more than
 // 2x the heartbeat, so the client's heartbeat timer runs out while the
 // server still holds its pull.
@@ -169,6 +189,7 @@ func (s *consumeState) publish(tc *zizek.TestCase) error {
 }
 
 func (s *consumeState) cut(tc *zizek.TestCase) error {
+	settleBeforeCut(func() bool { return s.calls.Load() >= s.expected() })
 	pulls := len(s.e.px.PullBatches())
 	s.e.cutAndWaitReconnect()
 	s.faults = true
@@ -251,17 +272,15 @@ func (s *consumeState) teardown(tc *zizek.TestCase) error {
 
 func TestModelConsume(t *testing.T) {
 	shared := &sharedServer{srv: harness.RunServer(t, true)}
-	known := knownBugsMode()
 	property := func(tc *zizek.TestCase) error {
 		maxMsgs, err := draw(tc, 2, 6)
 		if err != nil {
 			return err
 		}
-		stopAfter := 0
-		if known { // PULL-3, PULL-4
-			if stopAfter, err = draw(tc, 0, int64(maxMsgs)); err != nil {
-				return err
-			}
+		// StopAfter (0 = unset) up to MaxMessages: PULL-3, PULL-4.
+		stopAfter, err := draw(tc, 0, int64(maxMsgs))
+		if err != nil {
+			return err
 		}
 		tc.Note(fmt.Sprintf("Consume MaxMessages=%d StopAfter=%d", maxMsgs, stopAfter))
 		e := shared.env(t)
@@ -333,6 +352,7 @@ type messagesState struct {
 	published int
 	returned  int
 	faults    bool
+	cuts      int // reconnects since the last Next
 }
 
 // buffered is what the server delivered to the iterator (seen on the
@@ -358,6 +378,7 @@ func (s *messagesState) next(tc *zizek.TestCase) error {
 		return err
 	}
 	tc.Assume(s.returned < s.published)
+	s.cuts = 0
 	got := 0
 	for got < k && s.returned < s.published {
 		_, err := s.it.Next(jetstream.NextMaxWait(time.Second))
@@ -375,11 +396,13 @@ func (s *messagesState) next(tc *zizek.TestCase) error {
 }
 
 func (s *messagesState) cut(tc *zizek.TestCase) error {
-	// PULL-5: every reset of the pending count on a reconnect can over-pull
-	// and overflow the channel (even with no backlog: the errConnected is
-	// stale once Next has pulled again), and two unread reconnects before a
-	// Drain trigger PULL-1. Only explored with MODELTEST_KNOWN_BUGS=1.
-	tc.Assume(s.known)
+	// Reconnects reset the pending count, which over-pulled into a
+	// fixed-size channel (PULL-5), and two unread reconnects before a
+	// Drain hung Next (PULL-1). PULL-2 is still open, see
+	// maxCutsBetweenNext.
+	tc.Assume(s.known || s.cuts < maxCutsBetweenNext)
+	settleBeforeCut(func() bool { return len(s.e.px.Frames(isStreamMsg)) >= s.published })
+	s.cuts++
 	s.e.cutAndWaitReconnect()
 	s.faults = true
 	tc.Note("cut + reconnect")
@@ -388,8 +411,8 @@ func (s *messagesState) cut(tc *zizek.TestCase) error {
 
 func (s *messagesState) late(tc *zizek.TestCase) error {
 	// A missed heartbeat resets the pending count like a reconnect does
-	// (PULL-5, PULL-6). Only explored with MODELTEST_KNOWN_BUGS=1.
-	tc.Assume(s.known)
+	// (PULL-5, PULL-6).
+	s.cuts = 0
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -411,6 +434,7 @@ func (s *messagesState) wait(tc *zizek.TestCase) error {
 }
 
 func (s *messagesState) settle(tc *zizek.TestCase) error {
+	s.cuts = 0
 	s.e.publish(1)
 	s.published++
 	tc.Note("settle")
