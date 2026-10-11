@@ -101,6 +101,10 @@ modeltest/run.sh                 # the model-derived Go tests (-race)
 MODELTEST_KNOWN_BUGS=1 modeltest/run.sh   # plus the bug reproducers
 ```
 
+The Go tests need a zizek checkout at or after `12359a5` (wallyqs/zizek),
+which reports a non-replayable failure as `*zizek.Flaky` with its original
+cause instead of an internal error; they were last run against `8b4c7be`.
+
 `tlc.sh` downloads `tla2tools.jar` into `models/.tools/` on first use (or set
 `TLA2TOOLS`). Configs named `*_bug.cfg` are counterexample reproducers: they
 encode the code as it is today and TLC must report a violation for them; the

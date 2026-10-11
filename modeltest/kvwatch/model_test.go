@@ -731,8 +731,8 @@ const errCodeStreamStoreFailed jetstream.ErrorCode = 10049
 // its file store. Under CPU load the embedded nats-server intermittently
 // answers 10049 for a fresh, uniquely named bucket; that is the
 // environment, not the client under test, and reporting it failed about one
-// run in ten of TestKVWatchModel on loaded machines (and the shrinker then
-// discarded the cause as "shrunk example no longer fails").
+// run in ten of TestKVWatchModel on loaded machines (zizek reports it as
+// *zizek.Flaky, since the replay creates a bucket that the server accepts).
 func (f *kvFixture) createBucket(ctx context.Context, cfg jetstream.KeyValueConfig) (jetstream.KeyValue, error) {
 	for attempt := 0; ; attempt++ {
 		kv, err := f.js.CreateKeyValue(ctx, cfg)

@@ -761,11 +761,11 @@ Verification of the fixes (measured on `fix/pull`):
 Notes on zizek:
 
 * These properties run against a real server and are not perfectly
-  replayable. When a shrunk replay stops failing, zizek reports
-  `internal error: shrunk example no longer fails` and keeps only the
-  shrunk trace, not the original cause. The tests therefore log the first
-  failure themselves (`logFirst`). A "flaky" verdict that carries the
-  original failure would be more useful.
+  replayable. When a failing example stops failing on replay, zizek since
+  `12359a5` (wallyqs/zizek) returns `*zizek.Flaky` with the original error
+  and blob (before that it reported `internal error: shrunk example no
+  longer fails` and dropped the cause). The tests also log the first
+  failure's notes themselves (`logFirst`), which `Flaky` does not carry.
 * Shrinking is expensive here (each example takes seconds), so
   `MaxShrinks`/`MaxStall` are kept small. Even so, the Messages failure in
   known-bugs mode is reported long-ish (~16 steps).

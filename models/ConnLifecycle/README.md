@@ -788,12 +788,13 @@ handler-count property.
   deterministic in practice: they use read holds, write faults, and a
   scripted server rather than sleeps. The zizek machines settle state with
   bounded waits (≤ 2–3s) and can still be timing sensitive.
-* **zizek limitation.** With a property that is not perfectly deterministic,
-  a shrunk candidate may no longer fail. `Check` then returns
-  `internal error: shrunk example no longer fails` with the candidate's blob,
-  and the original failure and its cause are dropped (Hypothesis would report
-  a "Flaky" error carrying the original). I worked around it by settling the
-  machines more carefully and by logging the unshrunk failing example with
+* **Non-deterministic properties and zizek.** With a property that is not
+  perfectly deterministic, a failing example may not fail again on replay.
+  zizek used to return `internal error: shrunk example no longer fails` and
+  drop the original failure; since zizek `12359a5` (wallyqs/zizek) it returns
+  a typed `*zizek.Flaky` carrying the original error and the blob of the
+  stream that produced it. It does not carry the notes, so the unshrunk
+  failing example's rule trace is still logged with
   `MODELTEST_LOG_FAILURES=1`.
 * **TLC trace files.** TLC writes `*_TTrace_*.tla/.bin` files next to the
   spec whenever a bug config runs. They are generated output and should be

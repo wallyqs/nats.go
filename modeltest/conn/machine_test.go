@@ -500,9 +500,9 @@ func (m *lcMachine) lazyListener(tc *zizek.TestCase) error {
 }
 
 // logFailure logs a failing example as it happened (before shrinking) when
-// MODELTEST_LOG_FAILURES=1: with real concurrency a shrunk candidate may not
-// fail again, and zizek then reports only that the shrunk example no longer
-// fails.
+// MODELTEST_LOG_FAILURES=1: with real concurrency a failing example may not
+// fail again on replay, and zizek's *zizek.Flaky then carries the original
+// error and blob but not the notes (the rule trace) logged here.
 func logFailure(t testing.TB, tc *zizek.TestCase, err error) {
 	if os.Getenv("MODELTEST_LOG_FAILURES") != "1" {
 		return

@@ -62,9 +62,9 @@ func knownBugsMode() bool { return os.Getenv("MODELTEST_KNOWN_BUGS") == "1" }
 
 // logFirst wraps a property so that the first failure is logged with its
 // notes as soon as it happens. These properties run against a real server
-// and are not perfectly replayable: when a shrunk replay stops failing,
-// zizek reports "shrunk example no longer fails" without the original
-// cause, so the cause is kept here.
+// and are not perfectly replayable: when a failing example does not fail
+// again on replay, zizek returns *zizek.Flaky with the original error and
+// blob, but not the notes (the rule trace), so those are kept here.
 func logFirst(t testing.TB, property func(*zizek.TestCase) error) func(*zizek.TestCase) error {
 	var once sync.Once
 	return func(tc *zizek.TestCase) error {
