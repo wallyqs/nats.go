@@ -175,7 +175,18 @@ func (m *lcMachine) teardown() {
 // and then Flush: a Flush goroutine that is scheduled late, after later
 // steps, would otherwise queue its PING behind a reconnect that the split
 // check above did not see.
+//
+// On a connected client the step first waits (briefly) for the PINGs already
+// written on the socket to be answered. A reconnect ends with doReconnect's
+// own Flush; a Publish that races it can travel in that Flush's write, and if
+// the write then fails, the PING behind the message is not this step's
+// (whose Flush runs after the disconnect, on the next connection), but
+// pingElsewhere cannot tell PINGs apart and would report the at-most-once
+// loss as a broken Flush.
 func (m *lcMachine) publishFlush(tc *zizek.TestCase) error {
+	if m.nc.Status() == nats.CONNECTED {
+		harness.Eventually(250*time.Millisecond, m.d.pingsAnswered)
+	}
 	id := m.next
 	m.next++
 	st0, ch0 := m.nc.Status(), m.changes.Load()

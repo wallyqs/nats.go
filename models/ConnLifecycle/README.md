@@ -721,6 +721,20 @@ Callbacks: `[closed]`.
     the invariant skips a message after a status change when no PING followed
     it on its socket. 10 of 10 runs pass; against the unfixed library the
     focused subtest still fails (CONN-5b).
+  * Under CPU load it still failed about one run in six, which zizek's
+    typed `Flaky` outcome made diagnosable: after a reconnect, doReconnect
+    issues its own `Flush` (nats.go `doReconnect`, after unlocking). A
+    `publishFlush` racing it put its message in that Flush's write; when the
+    armed write fault hit that write, the message was lost, the step's own
+    Flush ran after the disconnect and was answered on the next connection
+    (at-most-once again), and the PING that the invariant saw behind the
+    message was doReconnect's, not the step's. `publishFlush` now first
+    waits (up to 250ms) until the newest socket has settled: its PINGs,
+    including doReconnect's Flush on a reconnected socket, are all answered.
+    Measured with two copies running in parallel: 3 of 80 runs failed with
+    only the "answered" wait, 0 of 80 with the full wait; with the CONN-5
+    and CONN-6 fixes reverted the focused subtest still fails 5 of 5, as a
+    shrunk failure rather than a flaky one.
 
 Measured on the unfixed code (60 examples, seed 7, ≤ 10 shrinks):
 

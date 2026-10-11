@@ -109,8 +109,28 @@ func (d *faultDialer) armRead(marker string) *readHold {
 
 type faultConn struct {
 	net.Conn
-	d       *faultDialer
-	written []byte // every write attempted on this socket, failed ones included (d.mu)
+	d         *faultDialer
+	written   []byte // every write attempted on this socket, failed ones included (d.mu)
+	pongsRead int    // PONGs read from this socket (d.mu)
+}
+
+// pingsAnswered reports whether the newest socket has settled: every PING
+// written on it has been answered by a PONG read from it, and on a socket
+// that a reconnect opened (any but the first), doReconnect's closing Flush
+// has been written too, so that there are at least two PINGs (the
+// handshake's and that Flush's).
+func (d *faultDialer) pingsAnswered() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.conns) == 0 {
+		return true
+	}
+	c := d.conns[len(d.conns)-1]
+	pings := bytes.Count(c.written, []byte("PING\r\n"))
+	if len(d.conns) > 1 && pings < 2 {
+		return false
+	}
+	return pings <= c.pongsRead
 }
 
 // pingFollows reports whether b was written (or attempted) on some socket
@@ -163,6 +183,7 @@ func (c *faultConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.d.mu.Lock()
+		c.pongsRead += bytes.Count(p[:n], []byte("PONG\r\n"))
 		h := c.d.rhold
 		if h != nil && h.conn == c && bytes.Contains(p[:n], []byte(h.marker)) {
 			c.d.rhold = nil
